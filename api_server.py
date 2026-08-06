@@ -12,11 +12,14 @@ import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
+import hybrid_engine as hybrid
+import report_engine as reports
 
 # Klucz: najpierw ENV (produkcja), potem stała z core
 if os.environ.get("POLYGON_API_KEY"):
@@ -313,6 +316,102 @@ def perspective_3y(ticker: str):
     return clean
 
 
+
+@app.get("/backtest/forecast/{ticker}")
+def forecast_backtest(
+    ticker: str,
+    horizon: str = Query("1M"),
+):
+    """Walk-forward Hit%% / MAE jak w desktopie."""
+    try:
+        return reports.forecast_quality_backtest(ticker, horizon=horizon)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/backtest/strategy/{ticker}")
+def strategy_backtest(
+    ticker: str,
+    capital: float = Query(10000, ge=100, le=1_000_000),
+):
+    """Backtest strategii MACD/RSI/ADX + SL/TP."""
+    try:
+        return reports.strategy_backtest(ticker, initial_capital=capital)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/report/{ticker}")
+def report_json(ticker: str):
+    """Pelny raport jako JSON (pod UI / eksport)."""
+    try:
+        return reports.build_report_payload(ticker)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/report/{ticker}/pdf")
+def report_pdf(ticker: str):
+    try:
+        data = reports.report_pdf_bytes(ticker)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="findash_{ticker.upper()}.pdf"'},
+    )
+
+
+@app.get("/report/{ticker}/xlsx")
+def report_xlsx(ticker: str):
+    try:
+        data = reports.report_excel_bytes(ticker)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="findash_{ticker.upper()}.xlsx"'},
+    )
+
+
+@app.get("/hybrid/{ticker}")
+def hybrid_analyze(
+    ticker: str,
+    mode: str = Query("Zrównoważony", description="Agresywny | Zrównoważony | Bezpieczny"),
+):
+    """Hybrid Analyzer – score, próg, sygnał KUPNO/SPRZEDAŻ (plan Pro)."""
+    try:
+        return hybrid.analyze_hybrid(ticker, mode=mode)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/signals")
+def signals(
+    mode: str = Query("Zrównoważony"),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Skaner sygnałów Hybrid po domyślnej liście tickerów (plan Pro)."""
+    tickers = list(getattr(core, "tickers", []))[:limit]
+    items = hybrid.scan_signals(tickers=tickers, mode=mode)
+    return {
+        "mode": mode,
+        "count": len(items),
+        "items": items,
+        "disclaimer": (
+            "Sygnały hybrydowe to narzędzie techniczne, nie rekomendacja inwestycyjna."
+        ),
+    }
+
+
 @app.get("/")
 def root():
     return {
@@ -325,5 +424,12 @@ def root():
             "GET /rankings?horizon=1M&limit=12",
             "GET /fundamentals/{ticker}",
             "GET /perspective-3y/{ticker}",
+            "GET /hybrid/{ticker}?mode=Zrównoważony",
+            "GET /signals?mode=Zrównoważony&limit=20",
+            "GET /backtest/forecast/{ticker}?horizon=1M|3M",
+            "GET /backtest/strategy/{ticker}?capital=10000",
+            "GET /report/{ticker}",
+            "GET /report/{ticker}/pdf",
+            "GET /report/{ticker}/xlsx",
         ],
     }
