@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "full-hit-v4-timeout-fix"
+API_BUILD = "price-asof-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -61,6 +61,7 @@ class AnalyzeResponse(BaseModel):
     horizon: str
     days_forward: int
     current_price: Optional[float] = None
+    price_as_of: Optional[str] = None  # data ostatniego zamknięcia (Polygon daily)
     predicted_price: Optional[float] = None
     predicted_change_pct: Optional[float] = None
     direction: str = "NEUTRALNY"
@@ -71,6 +72,7 @@ class AnalyzeResponse(BaseModel):
     hit_rate: Optional[float] = None
     mae: Optional[float] = None
     n_significant: Optional[int] = None
+    cached: Optional[bool] = None
     disclaimer: str = (
         "To narzędzie analityczne, nie rekomendacja inwestycyjna. "
         "Prognozy oparte na modelu historycznym; nie uwzględniają zdarzeń losowych."
@@ -133,19 +135,21 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
-    # cache rozróżnia quality (więcej punktów backtestu)
+    # cache rozróżnia quality; data kalendarzowa – po nowej sesji nie serwuj wczorajszego %
     mode = "q" if quality else "std"
-    cache_key = f"v5|{ticker}|{horizon_label}|{mode}|fullhit"
+    day_key = time.strftime("%Y-%m-%d")
+    cache_key = f"v6|{ticker}|{horizon_label}|{mode}|{day_key}"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
-        return hit["data"]
+        data = dict(hit["data"])
+        data["cached"] = True
+        return data
 
     sector = core.sector_mapping.get(ticker, "Unknown")
 
-    # 400 dni wystarcza na 1M/3M backtest; 500 przy quality
-    hist_days = 500 if quality else 400
-    df = core.get_historical_prices(ticker, days=hist_days)
+    # zawsze 500 dni jak desktop
+    df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
 
@@ -155,6 +159,12 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     current_price = _safe_float(df["Close"].iloc[-1])
     rsi = _safe_float(df["RSI"].iloc[-1]) if "RSI" in df.columns else None
+    # data ostatniej świecy (Polygon daily = ostatnie zamknięcie sesji)
+    try:
+        last_idx = df.index[-1]
+        as_of = last_idx.strftime("%Y-%m-%d") if hasattr(last_idx, "strftime") else str(last_idx)[:10]
+    except Exception:
+        as_of = None
 
     fa = None
     fund_rating = None
@@ -212,6 +222,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         "horizon": horizon_label,
         "days_forward": days,
         "current_price": round(current_price, 4) if current_price is not None else None,
+        "price_as_of": as_of,  # data zamknięcia z Polygon (nie „live tick”)
         "predicted_price": round(pred_price, 4) if pred_price is not None else None,
         "predicted_change_pct": round(chg, 2) if chg is not None else None,
         "direction": direction or "NEUTRALNY",
@@ -222,7 +233,8 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
-        "fast_mode": False,  # Hit zawsze włączony
+        "fast_mode": False,
+        "cached": False,
     }
     _ANALYZE_CACHE[cache_key] = {"ts": now, "data": data}
     if len(_ANALYZE_CACHE) > 300:
@@ -268,13 +280,31 @@ def list_tickers():
 def analyze(
     ticker: str,
     horizon: str = Query("1M", description="1M lub 3M"),
-    fast: int = Query(1, description="1=szybko bez pełnego Hit% backtestu (domyślne)"),
-    quality: int = Query(0, description="1=pełniejsze fundamenty + lekki Hit%/MAE"),
+    fast: int = Query(1, description="kompatybilność"),
+    quality: int = Query(0, description="1=więcej punktów Hit% backtestu"),
+    refresh: int = Query(0, description="1=pomiń cache API, przelicz teraz"),
 ):
+    if refresh:
+        # wyczyść cache tego tickera (wszystkie horyzonty / tryby)
+        t = ticker.upper().strip()
+        for k in list(_ANALYZE_CACHE.keys()):
+            if f"|{t}|" in k or k.startswith(f"v6|{t}|"):
+                _ANALYZE_CACHE.pop(k, None)
+        # oraz krótki cache plików Polygon dla ceny/historii (jeśli core ma)
+        try:
+            import glob
+            for p in glob.glob(os.path.join(getattr(core, "_CACHE_DIR", "polygon_cache"), "*.json")):
+                # nie kasuj całego cache makro – tylko przy twardym refresh opcjonalnie
+                pass
+        except Exception:
+            pass
     data = _analyze_one(ticker, horizon, fast=bool(fast), quality=bool(quality))
-    # model może nie mieć fast_mode – wytnij przed response_model
+    # pola spoza modelu response – odetnij
+    extra = {k: data.get(k) for k in ("price_as_of", "cached") if k in data}
     data.pop("fast_mode", None)
-    return AnalyzeResponse(**data)
+    # AnalyzeResponse bez price_as_of – dodaj do modelu lub zwróć dict
+    payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields}
+    return AnalyzeResponse(**payload)
 
 
 @app.get("/rankings", response_model=RankingsResponse)
