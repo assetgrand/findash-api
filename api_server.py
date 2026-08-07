@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import time
-import threading
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -20,7 +19,7 @@ from pydantic import BaseModel, Field
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "precompute-v1-full-hit"
+API_BUILD = "full-hit-v3-2026-08-07"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -113,100 +112,15 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-# Cache (TTL sekundy). Bez tego Free tier Render często timeoutuje.
+# Prosty cache odpowiedzi analyze (TTL sekundy) – mniej powtórek na Free tier
 _ANALYZE_CACHE: Dict[str, Any] = {}
-
-_ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
-
-# ============================================================
-# PRECOMPUTE – serwer liczy w tle, Lovable tylko czyta
-# ============================================================
-# Co PRECOMPUTE_INTERVAL sekund odświeża 1M+3M dla listy tickerów.
-# GET /analyze/{t} najpierw bierze gotowy wynik (ms), nie liczy od zera.
-
-_PRECOMPUTE: Dict[str, Any] = {}  # key "AAPL|1M" -> {"ts": ..., "data": {...}}
-_PRECOMPUTE_STATUS: Dict[str, Any] = {
-    "running": False,
-    "last_full_run_ts": None,
-    "last_ticker": None,
-    "last_error": None,
-    "tickers_done": 0,
-    "tickers_total": 0,
-}
-_PRECOMPUTE_LOCK = threading.Lock()
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "900"))  # 15 min
-_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-
-
-def _precompute_key(ticker: str, horizon_label: str) -> str:
-    return f"{ticker.upper()}|{horizon_label}"
-
-
-def _store_precompute(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
-    with _PRECOMPUTE_LOCK:
-        _PRECOMPUTE[_precompute_key(ticker, horizon_label)] = {
-            "ts": time.time(),
-            "data": data,
-        }
-
-
-def _get_precompute(ticker: str, horizon_label: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    max_age = _PRECOMPUTE_INTERVAL * 2 if max_age is None else max_age
-    with _PRECOMPUTE_LOCK:
-        row = _PRECOMPUTE.get(_precompute_key(ticker, horizon_label))
-    if not row:
-        return None
-    if time.time() - row["ts"] > max_age:
-        return None
-    return row["data"]
-
-
-def _precompute_worker() -> None:
-    """W tle: liczy analyze (z Hit%) dla wszystkich tickerów, 1M i 3M."""
-    # krótki start delay – API najpierw wstanie
-    time.sleep(3)
-    while True:
-        if not _PRECOMPUTE_ENABLED:
-            time.sleep(30)
-            continue
-        tickers = list(getattr(core, "tickers", []) or [])
-        if not tickers:
-            tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "JPM", "JNJ"]
-        _PRECOMPUTE_STATUS["running"] = True
-        _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
-        _PRECOMPUTE_STATUS["tickers_done"] = 0
-        _PRECOMPUTE_STATUS["last_error"] = None
-        print(f"[precompute] start: {len(tickers)} tickerów × 2 horyzonty")
-        for t in tickers:
-            _PRECOMPUTE_STATUS["last_ticker"] = t
-            for hz in ("1M", "3M"):
-                try:
-                    # quality=False, ale Hit i tak zawsze w _analyze_one
-                    data = _analyze_one(t, hz, fast=True, quality=False)
-                    _store_precompute(t, hz, data)
-                except Exception as e:
-                    msg = f"{t}/{hz}: {e}"
-                    print("[precompute]", msg)
-                    _PRECOMPUTE_STATUS["last_error"] = msg
-            _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
-            # oddech między tickerami – mniej banów / CPU spike
-            time.sleep(float(os.environ.get("PRECOMPUTE_PAUSE", "1.5")))
-        _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
-        _PRECOMPUTE_STATUS["running"] = False
-        print(f"[precompute] gotowe, sleep {_PRECOMPUTE_INTERVAL}s")
-        time.sleep(_PRECOMPUTE_INTERVAL)
-
+_ANALYZE_CACHE_TTL = 180  # 3 min
 
 
 def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
     """
-    Analiza pod Lovable/Render – ZAWSZE z Hit%/MAE (wymagane w produkcie).
-
-    Przyspieszenie bez wywalania Hit%:
-      - cache 15 min (powtórne requesty = instant)
-      - max_points=8 w walk-forward (ta sama definicja hitu, mniej okien)
-      - rankingi równolegle
-    Parametr quality zwiększa max_points (dokładniejsza próba, wolniej).
+    Pełna analiza jak desktop: fundamenty + predict + pełny Hit%/MAE (backtest_forecast_quality).
+    Parametry fast/quality zostawione dla kompatybilności URL, nie okrawają Hit%.
     """
     ticker = ticker.upper().strip()
     if not ticker or len(ticker) > 12:
@@ -214,9 +128,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
-    # cache rozróżnia quality (więcej punktów backtestu)
-    mode = "q" if quality else "std"
-    cache_key = f"v5|{ticker}|{horizon_label}|{mode}|fullhit"
+    cache_key = f"v3|{ticker}|{horizon_label}|fullhit"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -224,9 +136,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     sector = core.sector_mapping.get(ticker, "Unknown")
 
-    # 400 dni wystarcza na 1M/3M backtest; 500 przy quality
-    hist_days = 500 if quality else 400
-    df = core.get_historical_prices(ticker, days=hist_days)
+    df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
 
@@ -240,6 +150,8 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     fa = None
     fund_rating = None
     combined = None
+    # Fundamenty ZAWSZE (żeby % były zgodne z desktopem).
+    # Oszczędność czasu = tylko pomijanie ciężkiego walk-forward Hit% (chyba że quality=1).
     try:
         fa = core.get_comprehensive_fundamental_analysis(ticker)
     except Exception as e:
@@ -269,9 +181,8 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     except Exception as e:
         print(f"predict error {ticker}: {e}")
 
-    # Hit% ZAWSZE – ta sama definicja co desktop; mniej okien = szybciej, nie „fałszywy” hit
     hit_rate = mae = n_sig = None
-    max_pts = 12 if quality else 8
+    # PEŁNY Hit%/MAE – ta sama backtest_forecast_quality co w desktopie (bez okrawania)
     try:
         q = core.backtest_forecast_quality(
             df,
@@ -279,7 +190,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
             sector=sector,
             fund_score=combined or 50,
             ticker=ticker,
-            max_points=max_pts,
+            # bez max_points/step override → domyślne parametry jak w programie
         )
         if q:
             hit_rate = _safe_float(q.get("hit_rate"))
@@ -303,11 +214,12 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
-        "fast_mode": False,  # Hit zawsze włączony
+        "fast_mode": bool(fast and not quality),
     }
     _ANALYZE_CACHE[cache_key] = {"ts": now, "data": data}
-    if len(_ANALYZE_CACHE) > 300:
-        oldest = sorted(_ANALYZE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:80]
+    # nie rozrastaj cache w nieskończoność
+    if len(_ANALYZE_CACHE) > 200:
+        oldest = sorted(_ANALYZE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:50]
         for k, _ in oldest:
             _ANALYZE_CACHE.pop(k, None)
     return data
@@ -324,12 +236,6 @@ def _startup():
         core.init_macro_for_api()
     except Exception as e:
         print("startup macro:", e)
-    if _PRECOMPUTE_ENABLED:
-        th = threading.Thread(target=_precompute_worker, name="precompute", daemon=True)
-        th.start()
-        print(f"[precompute] worker started (interval={_PRECOMPUTE_INTERVAL}s)")
-    else:
-        print("[precompute] wyłączony (PRECOMPUTE_ENABLED=0)")
 
 
 @app.get("/health")
@@ -337,17 +243,12 @@ def health():
     key_ok = bool(core.POLYGON_API_KEY) and len(core.POLYGON_API_KEY) > 10 and not str(
         core.POLYGON_API_KEY
     ).startswith("WPISZ")
-    with _PRECOMPUTE_LOCK:
-        n_pre = len(_PRECOMPUTE)
     return {
         "status": "ok",
         "polygon_key_configured": key_ok,
         "ts": int(time.time()),
         "build": API_BUILD,
         "hit_mode": "full",
-        "precompute_enabled": _PRECOMPUTE_ENABLED,
-        "precompute_entries": n_pre,
-        "precompute_status": dict(_PRECOMPUTE_STATUS),
     }
 
 
@@ -360,36 +261,13 @@ def list_tickers():
 def analyze(
     ticker: str,
     horizon: str = Query("1M", description="1M lub 3M"),
-    fast: int = Query(1, description="kompatybilność – Hit i tak zawsze liczony w precompute"),
-    quality: int = Query(0, description="1=więcej punktów backtestu przy live compute"),
-    refresh: int = Query(0, description="1=wymuś przeliczenie teraz (wolne)"),
+    fast: int = Query(1, description="1=szybko bez pełnego Hit% backtestu (domyślne)"),
+    quality: int = Query(0, description="1=pełniejsze fundamenty + lekki Hit%/MAE"),
 ):
-    """
-    Domyślnie: wynik z precompute (ms).
-    refresh=1: liczy na żywo (gdy klient chce świeże / ticker spoza listy).
-    """
-    days = _horizon_days(horizon)
-    horizon_label = "3M" if days > 30 else "1M"
-    ticker_u = ticker.upper().strip()
-
-    if not refresh:
-        cached = _get_precompute(ticker_u, horizon_label)
-        if cached:
-            data = dict(cached)
-            data.pop("fast_mode", None)
-            data["from_precompute"] = True
-            # AnalyzeResponse może nie mieć from_precompute – usuń
-            data.pop("from_precompute", None)
-            return AnalyzeResponse(**{k: v for k, v in data.items() if k in AnalyzeResponse.model_fields})
-
-    data = _analyze_one(ticker_u, horizon, fast=bool(fast), quality=bool(quality))
+    data = _analyze_one(ticker, horizon, fast=bool(fast), quality=bool(quality))
+    # model może nie mieć fast_mode – wytnij przed response_model
     data.pop("fast_mode", None)
-    # zapisz też do precompute (kolejne kliknięcia instant)
-    try:
-        _store_precompute(ticker_u, horizon_label, data)
-    except Exception:
-        pass
-    return AnalyzeResponse(**{k: v for k, v in data.items() if k in AnalyzeResponse.model_fields})
+    return AnalyzeResponse(**data)
 
 
 @app.get("/rankings", response_model=RankingsResponse)
@@ -397,44 +275,30 @@ def rankings(
     horizon: str = Query("1M"),
     limit: int = Query(12, ge=1, le=30),
 ):
-    """Ranking po predicted_change_pct – równolegle, bez Hit% (szybko)."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    tick_list = list(getattr(core, "tickers", []))[: max(limit, 6)]
+    """Ranking po predicted_change_pct dla domyślnej listy tickerów."""
     items: List[RankingItem] = []
+    errors = []
+    for t in list(getattr(core, "tickers", []))[: max(limit, 6)]:
+        try:
+            d = _analyze_one(t, horizon, fast=True, quality=False)
+            items.append(
+                RankingItem(
+                    ticker=d["ticker"],
+                    current_price=d.get("current_price"),
+                    predicted_change_pct=d.get("predicted_change_pct"),
+                    direction=d.get("direction") or "NEUTRALNY",
+                    sector=d.get("sector") or "Unknown",
+                    fundamental_rating=d.get("fundamental_rating"),
+                    hit_rate=d.get("hit_rate"),
+                )
+            )
+        except Exception as e:
+            errors.append(f"{t}: {e}")
+            print("rankings skip", t, e)
 
-    def _one(t: str):
-        hz = "3M" if _horizon_days(horizon) > 30 else "1M"
-        d = _get_precompute(t, hz) or _analyze_one(t, horizon, fast=True, quality=False)
-        return RankingItem(
-            ticker=d["ticker"],
-            current_price=d.get("current_price"),
-            predicted_change_pct=d.get("predicted_change_pct"),
-            direction=d.get("direction") or "NEUTRALNY",
-            sector=d.get("sector") or "Unknown",
-            fundamental_rating=d.get("fundamental_rating"),
-            hit_rate=d.get("hit_rate"),
-        )
-
-    # 4 wątki – Polygon Free/Starter znosi równoległość lepiej niż sekwencja × N
-    workers = min(4, max(1, len(tick_list)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_one, t): t for t in tick_list}
-        for fut in as_completed(futs):
-            t = futs[fut]
-            try:
-                items.append(fut.result())
-            except Exception as e:
-                print("rankings skip", t, e)
-
-    items.sort(
-        key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999),
-        reverse=True,
-    )
+    items.sort(key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999), reverse=True)
     items = items[:limit]
-    return RankingsResponse(
-        horizon="3M" if _horizon_days(horizon) > 30 else "1M", items=items
-    )
+    return RankingsResponse(horizon="3M" if _horizon_days(horizon) > 30 else "1M", items=items)
 
 
 @app.get("/fundamentals/{ticker}")
@@ -587,46 +451,6 @@ def signals(
     }
 
 
-
-@app.get("/precompute/status")
-def precompute_status():
-    """Stan tła: ile tickerów policzonych, ostatni błąd, czy worker działa."""
-    with _PRECOMPUTE_LOCK:
-        keys = sorted(_PRECOMPUTE.keys())
-        ages = {k: round(time.time() - _PRECOMPUTE[k]["ts"], 1) for k in keys}
-    return {
-        "enabled": _PRECOMPUTE_ENABLED,
-        "interval_sec": _PRECOMPUTE_INTERVAL,
-        "entries": len(keys),
-        "keys": keys,
-        "ages_sec": ages,
-        "status": dict(_PRECOMPUTE_STATUS),
-    }
-
-
-@app.post("/precompute/run")
-def precompute_run_now():
-    """
-    Jednorazowo odśwież listę tickerów w tle (nie blokuje requestu).
-    Przydatne po deployu / gdy chcesz ciepły cache przed klientami.
-    """
-    def _once():
-        tickers = list(getattr(core, "tickers", []) or []) or ["AAPL"]
-        for t in tickers:
-            for hz in ("1M", "3M"):
-                try:
-                    data = _analyze_one(t, hz, fast=True, quality=False)
-                    _store_precompute(t, hz, data)
-                except Exception as e:
-                    print("[precompute/run]", t, hz, e)
-            time.sleep(1.0)
-        _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
-        print("[precompute/run] done")
-
-    threading.Thread(target=_once, daemon=True).start()
-    return {"started": True, "message": "Precompute uruchomiony w tle"}
-
-
 @app.get("/")
 def root():
     return {
@@ -641,8 +465,6 @@ def root():
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}?mode=Zrównoważony",
             "GET /signals?mode=Zrównoważony&limit=20",
-            "GET /precompute/status",
-            "POST /precompute/run",
             "GET /backtest/forecast/{ticker}?horizon=1M|3M",
             "GET /backtest/strategy/{ticker}?capital=10000",
             "GET /report/{ticker}",
