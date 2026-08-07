@@ -117,8 +117,8 @@ _ANALYZE_CACHE_TTL = 180  # 3 min
 
 def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
     """
-    fast=True (domyślnie): prognoza bez ciężkiego walk-forward Hit% → sekundy zamiast minut.
-    quality=True: dociąga fundamenty pełniej + lekki backtest (max_points=8).
+    Pełna analiza jak desktop: fundamenty + predict + pełny Hit%/MAE (backtest_forecast_quality).
+    Parametry fast/quality zostawione dla kompatybilności URL, nie okrawają Hit%.
     """
     ticker = ticker.upper().strip()
     if not ticker or len(ticker) > 12:
@@ -134,7 +134,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     sector = core.sector_mapping.get(ticker, "Unknown")
 
-    df = core.get_historical_prices(ticker, days=400 if fast else 500)
+    df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
 
@@ -148,14 +148,12 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     fa = None
     fund_rating = None
     combined = None
-    # Fundamenty: w fast tylko lekka próba / pominięcie długich łańcuchów przy quality=False
-    if quality or not fast:
-        try:
-            fa = core.get_comprehensive_fundamental_analysis(ticker)
-        except Exception as e:
-            print(f"fundamental error {ticker}: {e}")
-    else:
-        # szybka ścieżka: neutralny score, bez wielu requestów makro/fund
+    # Fundamenty ZAWSZE (żeby % były zgodne z desktopem).
+    # Oszczędność czasu = tylko pomijanie ciężkiego walk-forward Hit% (chyba że quality=1).
+    try:
+        fa = core.get_comprehensive_fundamental_analysis(ticker)
+    except Exception as e:
+        print(f"fundamental error {ticker}: {e}")
         fa = {"combined_score": 50, "fundamental_rating": None}
 
     if fa:
@@ -182,24 +180,22 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         print(f"predict error {ticker}: {e}")
 
     hit_rate = mae = n_sig = None
-    # Pełny walk-forward jest najdroższy – tylko przy quality=1 (albo fast=0 & quality)
-    if quality:
-        try:
-            q = core.backtest_forecast_quality(
-                df,
-                days_forward=days,
-                sector=sector,
-                fund_score=combined or 50,
-                ticker=ticker,
-                max_points=8,
-                step=max(12, days // 2),
-            )
-            if q:
-                hit_rate = _safe_float(q.get("hit_rate"))
-                mae = _safe_float(q.get("mae"))
-                n_sig = q.get("n_significant")
-        except Exception as e:
-            print(f"backtest quality {ticker}: {e}")
+    # PEŁNY Hit%/MAE – ta sama backtest_forecast_quality co w desktopie (bez okrawania)
+    try:
+        q = core.backtest_forecast_quality(
+            df,
+            days_forward=days,
+            sector=sector,
+            fund_score=combined or 50,
+            ticker=ticker,
+            # bez max_points/step override → domyślne parametry jak w programie
+        )
+        if q:
+            hit_rate = _safe_float(q.get("hit_rate"))
+            mae = _safe_float(q.get("mae"))
+            n_sig = q.get("n_significant")
+    except Exception as e:
+        print(f"backtest quality {ticker}: {e}")
 
     data = {
         "ticker": ticker,
