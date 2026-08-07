@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+import threading
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -19,7 +20,7 @@ from pydantic import BaseModel, Field
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "price-asof-v1"
+API_BUILD = "precompute-keepalive-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -116,7 +117,118 @@ def _safe_float(x: Any) -> Optional[float]:
 
 # Cache (TTL sekundy). Bez tego Free tier Render często timeoutuje.
 _ANALYZE_CACHE: Dict[str, Any] = {}
+
 _ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
+
+# ============================================================
+# PRECOMPUTE + KEEP-ALIVE
+# Nie zmienia silnika analizy – tylko woła _analyze_one w tle
+# i trzyma wyniki gotowe dla Lovable.
+# ============================================================
+_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "900"))  # pełna runda co 15 min
+_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
+_PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
+_PRECOMPUTE_LOCK = threading.Lock()
+_PRECOMPUTE_STATUS: Dict[str, Any] = {
+    "running": False,
+    "last_full_run_ts": None,
+    "last_ticker": None,
+    "last_error": None,
+    "tickers_done": 0,
+    "tickers_total": 0,
+    "started_ts": None,
+}
+
+
+def _pc_key(ticker: str, horizon_label: str) -> str:
+    return f"{str(ticker).upper()}|{horizon_label}"
+
+
+def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
+    with _PRECOMPUTE_LOCK:
+        _PRECOMPUTE[_pc_key(ticker, horizon_label)] = {
+            "ts": time.time(),
+            "data": dict(data),
+        }
+
+
+def _pc_get(ticker: str, horizon_label: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Zwraca skopiowane data lub None. max_age domyślnie 2x interval."""
+    if max_age is None:
+        max_age = float(_PRECOMPUTE_INTERVAL) * 2.5
+    with _PRECOMPUTE_LOCK:
+        row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
+        if not row:
+            return None
+        if time.time() - row["ts"] > max_age:
+            return None
+        return dict(row["data"])
+
+
+def _ticker_list_for_precompute() -> List[str]:
+    raw = list(getattr(core, "tickers", []) or [])
+    priority = [
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+        "JPM", "V", "JNJ", "UNH", "COST", "GS", "AMD", "INTC",
+    ]
+    if not raw:
+        raw = list(priority)
+    seen = set()
+    out = []
+    for t in priority + raw:
+        t = str(t).upper().strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _precompute_all_once() -> None:
+    """Jedna pełna runda 1M+3M – tylko _analyze_one, bez zmiany logiki."""
+    tickers = _ticker_list_for_precompute()
+    _PRECOMPUTE_STATUS["running"] = True
+    _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
+    _PRECOMPUTE_STATUS["tickers_done"] = 0
+    _PRECOMPUTE_STATUS["last_error"] = None
+    if _PRECOMPUTE_STATUS.get("started_ts") is None:
+        _PRECOMPUTE_STATUS["started_ts"] = time.time()
+    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M")
+    for t in tickers:
+        _PRECOMPUTE_STATUS["last_ticker"] = t
+        for hz in ("1M", "3M"):
+            try:
+                data = _analyze_one(t, hz, fast=True, quality=False)
+                if data and data.get("current_price") is not None:
+                    _pc_store(t, hz, data)
+            except Exception as e:
+                msg = f"{t}/{hz}: {e}"
+                print("[precompute]", msg)
+                _PRECOMPUTE_STATUS["last_error"] = msg
+        _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
+        time.sleep(_PRECOMPUTE_PAUSE)
+    _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
+    _PRECOMPUTE_STATUS["running"] = False
+    with _PRECOMPUTE_LOCK:
+        n = len(_PRECOMPUTE)
+    print(f"[precompute] done, entries={n}")
+
+
+def _precompute_worker() -> None:
+    time.sleep(4)  # API najpierw wstaje
+    while True:
+        if not _PRECOMPUTE_ENABLED:
+            time.sleep(30)
+            continue
+        try:
+            _precompute_all_once()
+        except Exception as e:
+            print("[precompute] worker error:", e)
+            _PRECOMPUTE_STATUS["last_error"] = str(e)
+            _PRECOMPUTE_STATUS["running"] = False
+        time.sleep(_PRECOMPUTE_INTERVAL)
+
+
 
 
 def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
@@ -255,6 +367,11 @@ def _startup():
         core.init_macro_for_api()
     except Exception as e:
         print("startup macro:", e)
+    if _PRECOMPUTE_ENABLED:
+        threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
+        print(f"[precompute] worker ON interval={_PRECOMPUTE_INTERVAL}s")
+    else:
+        print("[precompute] OFF (PRECOMPUTE_ENABLED=0)")
 
 
 @app.get("/health")
@@ -262,12 +379,17 @@ def health():
     key_ok = bool(core.POLYGON_API_KEY) and len(core.POLYGON_API_KEY) > 10 and not str(
         core.POLYGON_API_KEY
     ).startswith("WPISZ")
+    with _PRECOMPUTE_LOCK:
+        n = len(_PRECOMPUTE)
     return {
         "status": "ok",
         "polygon_key_configured": key_ok,
         "ts": int(time.time()),
         "build": API_BUILD,
         "hit_mode": "full",
+        "precompute_enabled": _PRECOMPUTE_ENABLED,
+        "precompute_entries": n,
+        "precompute_status": dict(_PRECOMPUTE_STATUS),
     }
 
 
@@ -282,27 +404,44 @@ def analyze(
     horizon: str = Query("1M", description="1M lub 3M"),
     fast: int = Query(1, description="kompatybilność"),
     quality: int = Query(0, description="1=więcej punktów Hit% backtestu"),
-    refresh: int = Query(0, description="1=pomiń cache API, przelicz teraz"),
+    refresh: int = Query(0, description="1=pomiń precompute/cache, przelicz teraz"),
 ):
+    """
+    Domyślnie: gotowy wynik z precompute (szybko).
+    refresh=1: przelicz live (wolniej) i zaktualizuj precompute.
+    Silnik = zawsze to samo _analyze_one / core – nic nie zmieniamy w modelu.
+    """
+    t = ticker.upper().strip()
+    days = _horizon_days(horizon)
+    hz = "3M" if days > 30 else "1M"
+
     if refresh:
-        # wyczyść cache tego tickera (wszystkie horyzonty / tryby)
-        t = ticker.upper().strip()
         for k in list(_ANALYZE_CACHE.keys()):
             if f"|{t}|" in k or k.startswith(f"v6|{t}|"):
                 _ANALYZE_CACHE.pop(k, None)
-        # oraz krótki cache plików Polygon dla ceny/historii (jeśli core ma)
-        try:
-            import glob
-            for p in glob.glob(os.path.join(getattr(core, "_CACHE_DIR", "polygon_cache"), "*.json")):
-                # nie kasuj całego cache makro – tylko przy twardym refresh opcjonalnie
-                pass
-        except Exception:
-            pass
-    data = _analyze_one(ticker, horizon, fast=bool(fast), quality=bool(quality))
-    # pola spoza modelu response – odetnij
-    extra = {k: data.get(k) for k in ("price_as_of", "cached") if k in data}
+        with _PRECOMPUTE_LOCK:
+            _PRECOMPUTE.pop(_pc_key(t, hz), None)
+
+    if not refresh:
+        cached = _pc_get(t, hz)
+        if (
+            cached
+            and cached.get("current_price") is not None
+            and cached.get("predicted_change_pct") is not None
+        ):
+            cached = dict(cached)
+            cached["cached"] = True
+            cached.pop("fast_mode", None)
+            payload = {k: v for k, v in cached.items() if k in AnalyzeResponse.model_fields}
+            return AnalyzeResponse(**payload)
+
+    data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
     data.pop("fast_mode", None)
-    # AnalyzeResponse bez price_as_of – dodaj do modelu lub zwróć dict
+    try:
+        if data.get("current_price") is not None:
+            _pc_store(t, hz, data)
+    except Exception:
+        pass
     payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields}
     return AnalyzeResponse(**payload)
 
@@ -319,7 +458,8 @@ def rankings(
     items: List[RankingItem] = []
 
     def _one(t: str):
-        d = _analyze_one(t, horizon, fast=True, quality=False)
+        hz = "3M" if _horizon_days(horizon) > 30 else "1M"
+        d = _pc_get(t, hz) or _analyze_one(t, horizon, fast=True, quality=False)
         return RankingItem(
             ticker=d["ticker"],
             current_price=d.get("current_price"),
@@ -501,6 +641,58 @@ def signals(
     }
 
 
+
+@app.get("/precompute/status")
+def precompute_status():
+    with _PRECOMPUTE_LOCK:
+        keys = sorted(_PRECOMPUTE.keys())
+        ages = {k: round(time.time() - _PRECOMPUTE[k]["ts"], 1) for k in keys}
+    return {
+        "enabled": _PRECOMPUTE_ENABLED,
+        "interval_sec": _PRECOMPUTE_INTERVAL,
+        "entries": len(keys),
+        "keys": keys,
+        "ages_sec": ages,
+        "status": dict(_PRECOMPUTE_STATUS),
+    }
+
+
+@app.post("/precompute/run")
+def precompute_run():
+    """Odśwież wszystkie tickery w tle (po wejściu na stronę / po deployu)."""
+    def _run():
+        try:
+            _precompute_all_once()
+        except Exception as e:
+            print("[precompute/run]", e)
+    threading.Thread(target=_run, daemon=True).start()
+    return {"started": True, "message": "Precompute uruchomiony w tle – nie blokuje UI"}
+
+
+@app.get("/keepalive")
+def keepalive():
+    """
+    Ping dla UptimeRobot / cron – trzyma Render Free przy życiu
+    i opcjonalnie odpala precompute jeśli cache pusty / stary.
+    """
+    with _PRECOMPUTE_LOCK:
+        n = len(_PRECOMPUTE)
+        last = _PRECOMPUTE_STATUS.get("last_full_run_ts")
+    stale = last is None or (time.time() - float(last)) > (_PRECOMPUTE_INTERVAL * 1.5)
+    if _PRECOMPUTE_ENABLED and (n == 0 or stale) and not _PRECOMPUTE_STATUS.get("running"):
+        threading.Thread(target=_precompute_all_once, daemon=True).start()
+        kicked = True
+    else:
+        kicked = False
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "precompute_entries": n,
+        "precompute_kicked": kicked,
+        "build": API_BUILD,
+    }
+
+
 @app.get("/")
 def root():
     return {
@@ -515,6 +707,9 @@ def root():
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}?mode=Zrównoważony",
             "GET /signals?mode=Zrównoważony&limit=20",
+            "GET /precompute/status",
+            "POST /precompute/run",
+            "GET /keepalive",
             "GET /backtest/forecast/{ticker}?horizon=1M|3M",
             "GET /backtest/strategy/{ticker}?capital=10000",
             "GET /report/{ticker}",
