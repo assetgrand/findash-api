@@ -110,16 +110,31 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _analyze_one(ticker: str, horizon: str = "1M") -> Dict[str, Any]:
+# Prosty cache odpowiedzi analyze (TTL sekundy) – mniej powtórek na Free tier
+_ANALYZE_CACHE: Dict[str, Any] = {}
+_ANALYZE_CACHE_TTL = 180  # 3 min
+
+
+def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
+    """
+    fast=True (domyślnie): prognoza bez ciężkiego walk-forward Hit% → sekundy zamiast minut.
+    quality=True: dociąga fundamenty pełniej + lekki backtest (max_points=8).
+    """
     ticker = ticker.upper().strip()
     if not ticker or len(ticker) > 12:
         raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
+    cache_key = f"{ticker}|{horizon_label}|fast={int(fast)}|q={int(quality)}"
+    now = time.time()
+    hit = _ANALYZE_CACHE.get(cache_key)
+    if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
+        return hit["data"]
+
     sector = core.sector_mapping.get(ticker, "Unknown")
 
-    df = core.get_historical_prices(ticker, days=500)
+    df = core.get_historical_prices(ticker, days=400 if fast else 500)
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
 
@@ -131,13 +146,18 @@ def _analyze_one(ticker: str, horizon: str = "1M") -> Dict[str, Any]:
     rsi = _safe_float(df["RSI"].iloc[-1]) if "RSI" in df.columns else None
 
     fa = None
-    try:
-        fa = core.get_comprehensive_fundamental_analysis(ticker)
-    except Exception as e:
-        print(f"fundamental error {ticker}: {e}")
-
     fund_rating = None
     combined = None
+    # Fundamenty: w fast tylko lekka próba / pominięcie długich łańcuchów przy quality=False
+    if quality or not fast:
+        try:
+            fa = core.get_comprehensive_fundamental_analysis(ticker)
+        except Exception as e:
+            print(f"fundamental error {ticker}: {e}")
+    else:
+        # szybka ścieżka: neutralny score, bez wielu requestów makro/fund
+        fa = {"combined_score": 50, "fundamental_rating": None}
+
     if fa:
         fund_rating = fa.get("fundamental_rating")
         combined = _safe_float(fa.get("combined_score"))
@@ -150,7 +170,6 @@ def _analyze_one(ticker: str, horizon: str = "1M") -> Dict[str, Any]:
         pred_price = _safe_float(pred_price)
         chg = _safe_float(chg)
     except TypeError:
-        # starsza sygnatura bez ticker/quiet
         try:
             pred_price, direction, chg = core.predict_with_technical_influence(
                 df, fa or {}, days, sector
@@ -163,18 +182,26 @@ def _analyze_one(ticker: str, horizon: str = "1M") -> Dict[str, Any]:
         print(f"predict error {ticker}: {e}")
 
     hit_rate = mae = n_sig = None
-    try:
-        q = core.backtest_forecast_quality(
-            df, days_forward=days, sector=sector, fund_score=combined or 50, ticker=ticker
-        )
-        if q:
-            hit_rate = _safe_float(q.get("hit_rate"))
-            mae = _safe_float(q.get("mae"))
-            n_sig = q.get("n_significant")
-    except Exception as e:
-        print(f"backtest quality {ticker}: {e}")
+    # Pełny walk-forward jest najdroższy – tylko przy quality=1 (albo fast=0 & quality)
+    if quality:
+        try:
+            q = core.backtest_forecast_quality(
+                df,
+                days_forward=days,
+                sector=sector,
+                fund_score=combined or 50,
+                ticker=ticker,
+                max_points=8,
+                step=max(12, days // 2),
+            )
+            if q:
+                hit_rate = _safe_float(q.get("hit_rate"))
+                mae = _safe_float(q.get("mae"))
+                n_sig = q.get("n_significant")
+        except Exception as e:
+            print(f"backtest quality {ticker}: {e}")
 
-    return {
+    data = {
         "ticker": ticker,
         "horizon": horizon_label,
         "days_forward": days,
@@ -189,7 +216,15 @@ def _analyze_one(ticker: str, horizon: str = "1M") -> Dict[str, Any]:
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
+        "fast_mode": bool(fast and not quality),
     }
+    _ANALYZE_CACHE[cache_key] = {"ts": now, "data": data}
+    # nie rozrastaj cache w nieskończoność
+    if len(_ANALYZE_CACHE) > 200:
+        oldest = sorted(_ANALYZE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:50]
+        for k, _ in oldest:
+            _ANALYZE_CACHE.pop(k, None)
+    return data
 
 
 @app.on_event("startup")
@@ -226,8 +261,12 @@ def list_tickers():
 def analyze(
     ticker: str,
     horizon: str = Query("1M", description="1M lub 3M"),
+    fast: int = Query(1, description="1=szybko bez pełnego Hit% backtestu (domyślne)"),
+    quality: int = Query(0, description="1=pełniejsze fundamenty + lekki Hit%/MAE"),
 ):
-    data = _analyze_one(ticker, horizon)
+    data = _analyze_one(ticker, horizon, fast=bool(fast), quality=bool(quality))
+    # model może nie mieć fast_mode – wytnij przed response_model
+    data.pop("fast_mode", None)
     return AnalyzeResponse(**data)
 
 
@@ -241,7 +280,7 @@ def rankings(
     errors = []
     for t in list(getattr(core, "tickers", []))[: max(limit, 6)]:
         try:
-            d = _analyze_one(t, horizon)
+            d = _analyze_one(t, horizon, fast=True, quality=False)
             items.append(
                 RankingItem(
                     ticker=d["ticker"],
