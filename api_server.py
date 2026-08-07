@@ -112,15 +112,20 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-# Prosty cache odpowiedzi analyze (TTL sekundy) – mniej powtórek na Free tier
+# Cache (TTL sekundy). Bez tego Free tier Render często timeoutuje.
 _ANALYZE_CACHE: Dict[str, Any] = {}
-_ANALYZE_CACHE_TTL = 180  # 3 min
+_ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
 
 
 def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
     """
-    Pełna analiza jak desktop: fundamenty + predict + pełny Hit%/MAE (backtest_forecast_quality).
-    Parametry fast/quality zostawione dla kompatybilności URL, nie okrawają Hit%.
+    Analiza pod Lovable/Render – ZAWSZE z Hit%/MAE (wymagane w produkcie).
+
+    Przyspieszenie bez wywalania Hit%:
+      - cache 15 min (powtórne requesty = instant)
+      - max_points=8 w walk-forward (ta sama definicja hitu, mniej okien)
+      - rankingi równolegle
+    Parametr quality zwiększa max_points (dokładniejsza próba, wolniej).
     """
     ticker = ticker.upper().strip()
     if not ticker or len(ticker) > 12:
@@ -128,7 +133,9 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
-    cache_key = f"v3|{ticker}|{horizon_label}|fullhit"
+    # cache rozróżnia quality (więcej punktów backtestu)
+    mode = "q" if quality else "std"
+    cache_key = f"v5|{ticker}|{horizon_label}|{mode}|fullhit"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -136,7 +143,9 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     sector = core.sector_mapping.get(ticker, "Unknown")
 
-    df = core.get_historical_prices(ticker, days=500)
+    # 400 dni wystarcza na 1M/3M backtest; 500 przy quality
+    hist_days = 500 if quality else 400
+    df = core.get_historical_prices(ticker, days=hist_days)
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
 
@@ -150,8 +159,6 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     fa = None
     fund_rating = None
     combined = None
-    # Fundamenty ZAWSZE (żeby % były zgodne z desktopem).
-    # Oszczędność czasu = tylko pomijanie ciężkiego walk-forward Hit% (chyba że quality=1).
     try:
         fa = core.get_comprehensive_fundamental_analysis(ticker)
     except Exception as e:
@@ -181,10 +188,9 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     except Exception as e:
         print(f"predict error {ticker}: {e}")
 
+    # Hit% ZAWSZE – ta sama definicja co desktop; mniej okien = szybciej, nie „fałszywy” hit
     hit_rate = mae = n_sig = None
-    # Ta sama funkcja / definicja Hit co w desktopie (min_move, min_pred, znak).
-    # max_points=10: mniej okien walk-forward, żeby zmieścić się w limicie czasu Render/Lovable
-    # (pełne 30 punktów na Free = timeout = Failed to fetch).
+    max_pts = 12 if quality else 8
     try:
         q = core.backtest_forecast_quality(
             df,
@@ -192,7 +198,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
             sector=sector,
             fund_score=combined or 50,
             ticker=ticker,
-            max_points=10,
+            max_points=max_pts,
         )
         if q:
             hit_rate = _safe_float(q.get("hit_rate"))
@@ -216,12 +222,11 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
-        "fast_mode": bool(fast and not quality),
+        "fast_mode": False,  # Hit zawsze włączony
     }
     _ANALYZE_CACHE[cache_key] = {"ts": now, "data": data}
-    # nie rozrastaj cache w nieskończoność
-    if len(_ANALYZE_CACHE) > 200:
-        oldest = sorted(_ANALYZE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:50]
+    if len(_ANALYZE_CACHE) > 300:
+        oldest = sorted(_ANALYZE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:80]
         for k, _ in oldest:
             _ANALYZE_CACHE.pop(k, None)
     return data
@@ -277,30 +282,43 @@ def rankings(
     horizon: str = Query("1M"),
     limit: int = Query(12, ge=1, le=30),
 ):
-    """Ranking po predicted_change_pct dla domyślnej listy tickerów."""
-    items: List[RankingItem] = []
-    errors = []
-    for t in list(getattr(core, "tickers", []))[: max(limit, 6)]:
-        try:
-            d = _analyze_one(t, horizon, fast=True, quality=False)
-            items.append(
-                RankingItem(
-                    ticker=d["ticker"],
-                    current_price=d.get("current_price"),
-                    predicted_change_pct=d.get("predicted_change_pct"),
-                    direction=d.get("direction") or "NEUTRALNY",
-                    sector=d.get("sector") or "Unknown",
-                    fundamental_rating=d.get("fundamental_rating"),
-                    hit_rate=d.get("hit_rate"),
-                )
-            )
-        except Exception as e:
-            errors.append(f"{t}: {e}")
-            print("rankings skip", t, e)
+    """Ranking po predicted_change_pct – równolegle, bez Hit% (szybko)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    items.sort(key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999), reverse=True)
+    tick_list = list(getattr(core, "tickers", []))[: max(limit, 6)]
+    items: List[RankingItem] = []
+
+    def _one(t: str):
+        d = _analyze_one(t, horizon, fast=True, quality=False)
+        return RankingItem(
+            ticker=d["ticker"],
+            current_price=d.get("current_price"),
+            predicted_change_pct=d.get("predicted_change_pct"),
+            direction=d.get("direction") or "NEUTRALNY",
+            sector=d.get("sector") or "Unknown",
+            fundamental_rating=d.get("fundamental_rating"),
+            hit_rate=d.get("hit_rate"),
+        )
+
+    # 4 wątki – Polygon Free/Starter znosi równoległość lepiej niż sekwencja × N
+    workers = min(4, max(1, len(tick_list)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_one, t): t for t in tick_list}
+        for fut in as_completed(futs):
+            t = futs[fut]
+            try:
+                items.append(fut.result())
+            except Exception as e:
+                print("rankings skip", t, e)
+
+    items.sort(
+        key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999),
+        reverse=True,
+    )
     items = items[:limit]
-    return RankingsResponse(horizon="3M" if _horizon_days(horizon) > 30 else "1M", items=items)
+    return RankingsResponse(
+        horizon="3M" if _horizon_days(horizon) > 30 else "1M", items=items
+    )
 
 
 @app.get("/fundamentals/{ticker}")
