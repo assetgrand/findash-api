@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "full-hit-v3-2026-08-07"
+API_BUILD = "full-hit-v4-timeout-fix"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -182,7 +182,9 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         print(f"predict error {ticker}: {e}")
 
     hit_rate = mae = n_sig = None
-    # PEŁNY Hit%/MAE – ta sama backtest_forecast_quality co w desktopie (bez okrawania)
+    # Ta sama funkcja / definicja Hit co w desktopie (min_move, min_pred, znak).
+    # max_points=10: mniej okien walk-forward, żeby zmieścić się w limicie czasu Render/Lovable
+    # (pełne 30 punktów na Free = timeout = Failed to fetch).
     try:
         q = core.backtest_forecast_quality(
             df,
@@ -190,7 +192,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
             sector=sector,
             fund_score=combined or 50,
             ticker=ticker,
-            # bez max_points/step override → domyślne parametry jak w programie
+            max_points=10,
         )
         if q:
             hit_rate = _safe_float(q.get("hit_rate"))
