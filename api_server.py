@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
+
+API_BUILD = "full-hit-v3-2026-08-07"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -126,7 +128,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
-    cache_key = f"{ticker}|{horizon_label}|fast={int(fast)}|q={int(quality)}"
+    cache_key = f"v3|{ticker}|{horizon_label}|fullhit"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -245,6 +247,8 @@ def health():
         "status": "ok",
         "polygon_key_configured": key_ok,
         "ts": int(time.time()),
+        "build": API_BUILD,
+        "hit_mode": "full",
     }
 
 
