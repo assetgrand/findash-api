@@ -2979,71 +2979,8 @@ def _vol_scale_for_ticker(df):
 
 
 
-# Wyjątki per spółka/horyzont – NIE ruszają reszty uniwersu
-# (TSLA 1M, UNH 3M, V 3M bywały systematycznie słabe)
-_SPECIAL_PRED_CASES = {
-    ('TSLA', '1M'),
-    ('UNH', '3M'),
-    ('V', '3M'),
-    # MSFT: mega-cap compounder – ensemble za często łapie szum 1M/3M
-    ('MSFT', '1M'),
-    ('MSFT', '3M'),
-}
-
-
-def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
-    """
-    Stabilniejsza reguła TYLKO dla trudnych par ticker/horyzont:
-    SMA50/SMA200 + dłuższy drift + fund. Bez ensemble/momentum.
-    MSFT: mocniejszy bias trendowy (grind-up), mniej agresywne odwrócenia.
-    """
-    close = float(df['Close'].iloc[-1])
-    sma50 = float(df['Close'].rolling(50).mean().iloc[-1]) if len(df) >= 50 else close
-    sma200 = float(df['Close'].rolling(200).mean().iloc[-1]) if len(df) >= 200 else sma50
-    t = (str(ticker).upper() if ticker else '')
-
-    trend_sign = 1.0 if close >= sma50 else -1.0
-    if close >= sma200 and sma50 >= sma200 * 0.98:
-        trend_sign = 1.0
-    elif close < sma200 and sma50 <= sma200 * 1.02:
-        trend_sign = -1.0
-
-    long_med = _historical_drift(df, min(days_forward * 2, 126))
-    if abs(long_med) < 0.35:
-        long_med = hist_med
-
-    # --- MSFT-only: quality compounder prior ---
-    if t == 'MSFT':
-        # lekki dodatni prior gdy brak sygnału (historycznie grind-up)
-        if abs(long_med) < 0.35:
-            long_med = 1.2 if days_forward <= 30 else 3.0
-        # w silnym uptrendzie nie pozwalaj na mocny short bias z szumu
-        if trend_sign > 0 and long_med < 0:
-            long_med = 0.4 * long_med  # tłumij negatywny drift
-        # w downtrendzie poniżej obu SMA – respektuj spadek, ale łagodniej
-        if trend_sign < 0 and close < sma200:
-            mag = max(abs(long_med), 1.2)
-            pred = 0.55 * trend_sign * mag + 0.30 * long_med + 0.15 * fund_ret
-            return float(pred)
-        mag = max(abs(long_med), 1.0)
-        # więcej wagi na trend strukturalny niż na krótki drift
-        pred = 0.55 * trend_sign * mag + 0.30 * long_med + 0.15 * fund_ret
-        # floor: w uptrendzie nie schodź poniżej lekkiego plusa przy dobrych fundach
-        if trend_sign > 0 and fund_ret >= 0 and pred < 0.3:
-            pred = 0.3 + 0.25 * max(fund_ret, 0)
-        return float(pred)
-
-    # --- domyślna reguła (TSLA / UNH / V) ---
-    if abs(long_med) < 0.35:
-        long_med = 0.8 if days_forward <= 30 else 2.0
-
-    mag = max(abs(long_med), 1.0)
-    pred = 0.50 * trend_sign * mag + 0.35 * long_med + 0.15 * fund_ret
-    return float(pred)
-
-
 def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
-    """Prognoza 1M/3M v2 + wyjątki tylko dla wybranych par ticker/horyzont."""
+    """Prognoza 1M/3M v2 klasyczna (bez wyjątków per ticker / bez mag-cal)."""
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
@@ -3111,28 +3048,12 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     if abs(blended_ret) < 1.2 and abs(hist_med) >= 0.8:
         blended_ret = 0.35 * blended_ret + 0.65 * np.sign(hist_med) * max(abs(hist_med), 1.0)
 
-    # Wyjątki TYLKO dla trudnych par (nie zmieniają AAPL/JPM/…)
-    t_key = (str(ticker).upper() if ticker else None, horizon)
-    special = t_key in _SPECIAL_PRED_CASES if t_key[0] else False
-    if special:
-        try:
-            blended_ret = _special_case_prediction(df_clean, days_forward, fund_ret, hist_med, ticker=ticker)
-            _log(f"   ⚡ SPECIAL CASE {t_key[0]} {horizon}: blend={blended_ret:+.2f}%")
-        except Exception as e:
-            _log(f"   special case fail: {e}")
-
     _log(f"   regime={regime} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
-          f"tech_w={tech_w:.2f} drift_w={drift_w:.2f} special={special} "
+          f"tech_w={tech_w:.2f} drift_w={drift_w:.2f} "
           f"→ blend={blended_ret:+.2f}%")
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
           f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
           f"| w={model_weights}")
-
-    # Kalibracja wielkości (znak bez zmian → Hit% stabilny, MAE w dół)
-    pre_cal = blended_ret
-    blended_ret = _calibrate_return_magnitude(blended_ret, df_clean, days_forward, regime)
-    if abs(pre_cal - blended_ret) > 0.05:
-        _log(f"   mag-cal: {pre_cal:+.2f}% → {blended_ret:+.2f}%")
 
     try:
         hist_cap = get_max_historical_change(df_clean, days_forward, percentile=88)
