@@ -1679,8 +1679,10 @@ def get_max_historical_change(df, horizon_days, percentile=90):
         return 15.0
     return float(cap * 100)
 
-def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector):
-    print(f"🔍 FUNKCJA WYWOŁANA dla {sector}, dni: {days_forward}")
+def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
+    """Klasyczna prognoza (regresja + tech + fund) – wersja sprzed ensemble v2."""
+    if not quiet:
+        print(f"🔍 FUNKCJA WYWOŁANA dla {sector}, dni: {days_forward}")
     """
     Prognozuje cenę na podstawie analizy fundamentalnej i technicznej.
     Uwzględnia: regresję liniową, RSI, MACD, SMA50, SMA200, momentum, wolumen, ATR.
@@ -2976,114 +2978,6 @@ def _vol_scale_for_ticker(df):
         return 1.0
     except Exception:
         return 1.0
-
-
-
-def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
-    """Prognoza 1M/3M v2 klasyczna (bez wyjątków per ticker / bez mag-cal)."""
-    def _log(*a, **k):
-        if not quiet:
-            print(*a, **k)
-    _log(f"🔍 ENSEMBLE v2 | ticker={ticker} sektor={sector} | dni={days_forward}")
-    if df is None or df.empty or len(df) < 5:
-        return 0.0, "NEUTRALNY", 0.0
-    df_clean = df.ffill().bfill()
-    if 'Close' not in df_clean.columns or len(df_clean) < 15:
-        current_p = float(df['Close'].iloc[-1]) if not df.empty else 0.0
-        return current_p, "NEUTRALNY", 0.0
-    current_price = float(df_clean['Close'].iloc[-1])
-    if current_price <= 0:
-        return 0.0, "NEUTRALNY", 0.0
-
-    horizon = '1M' if days_forward <= 30 else '3M'
-    regime = _detect_market_regime(df_clean)
-    feats = _extract_features_row(df_clean, len(df_clean) - 1)
-    if feats is None:
-        return current_price, "NEUTRALNY", 0.0
-
-    tech_ret, model_preds, model_weights = _ensemble_expected_return(
-        df_clean, days_forward, sector, regime, feats
-    )
-    fa = fundamental_analysis or {}
-    fund_score = fa.get('combined_score', 50)
-    if fund_score is None or (isinstance(fund_score, float) and np.isnan(fund_score)):
-        fund_score = 50
-    fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
-
-    base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    if horizon == '1M':
-        tech_w = min(0.72, base_tech + 0.10)
-    else:
-        tech_w = max(0.32, base_tech - 0.12)
-    if regime == 'HIGH_VOL':
-        tech_w *= 0.82
-    if regime == 'RANGE':
-        tech_w *= 0.88
-    if abs(fund_score - 50) < 5:
-        tech_w = min(0.85, tech_w + 0.08)
-
-    blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
-    if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
-        blended_ret *= 1.06
-
-    # --- Adaptacyjna kotwica kierunku (Hit% na trudnych spółkach jak TSLA/UNH) ---
-    try:
-        hist_med = _historical_drift(df_clean, days_forward)
-    except Exception:
-        hist_med = 0.0
-
-    # --- Kotwica v2 (ta, która dawała AAPL ~61/61) ---
-    drift_w = 0.22 if horizon == '1M' else 0.32
-    blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
-
-    if regime == 'TREND_UP' and blended_ret < 0:
-        blended_ret *= 0.45
-        if hist_med > 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * max(hist_med * 0.5, 0.3)
-    elif regime == 'TREND_DOWN' and blended_ret > 0:
-        blended_ret *= 0.45
-        if hist_med < 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * min(hist_med * 0.5, -0.3)
-
-    if abs(blended_ret) < 1.2 and abs(hist_med) >= 0.8:
-        blended_ret = 0.35 * blended_ret + 0.65 * np.sign(hist_med) * max(abs(hist_med), 1.0)
-
-    _log(f"   regime={regime} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
-          f"tech_w={tech_w:.2f} drift_w={drift_w:.2f} "
-          f"→ blend={blended_ret:+.2f}%")
-    _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
-          f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
-          f"| w={model_weights}")
-
-    try:
-        hist_cap = get_max_historical_change(df_clean, days_forward, percentile=88)
-    except Exception:
-        hist_cap = 15.0
-    sector_cap_mult = {
-        'Healthcare': 0.80, 'Consumer Defensive': 0.80,
-        'Technology': 1.20, 'Communication Services': 1.12,
-        'Energy': 1.15, 'Automotive': 1.12, 'Default': 1.0,
-    }
-    max_change = max(hist_cap * sector_cap_mult.get(sector, 1.0), 5.5)
-    if regime == 'HIGH_VOL':
-        max_change *= 1.10
-    if regime == 'RANGE':
-        max_change *= 0.80
-    if horizon == '1M':
-        max_change = min(max_change, 18.0)
-    else:
-        max_change = min(max_change, 35.0)
-
-    change_percent = float(np.clip(blended_ret, -max_change, max_change))
-    adjusted_pred = current_price * (1.0 + change_percent / 100.0)
-    if change_percent > 2.5:
-        direction = "WZROSTOWY"
-    elif change_percent < -2.5:
-        direction = "SPADKOWY"
-    else:
-        direction = "NEUTRALNY"
-    _log(f"✅ PROGNOZA v2: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
-    return float(adjusted_pred), direction, float(change_percent)
 
 
 
