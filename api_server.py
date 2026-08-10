@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "precompute-keepalive-v1"
+API_BUILD = "precompute-keepalive-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -126,7 +126,7 @@ _ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "900"))  # pełna runda co 15 min
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "600"))  # pełna runda co 10 min
 _PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
 _PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
 _PRECOMPUTE_LOCK = threading.Lock()
@@ -215,7 +215,7 @@ def _precompute_all_once() -> None:
 
 
 def _precompute_worker() -> None:
-    time.sleep(4)  # API najpierw wstaje
+    time.sleep(2)  # API wstaje – od razu pierwsza runda (po cold start)
     while True:
         if not _PRECOMPUTE_ENABLED:
             time.sleep(30)
@@ -672,24 +672,26 @@ def precompute_run():
 @app.get("/keepalive")
 def keepalive():
     """
-    Ping dla UptimeRobot / cron – trzyma Render Free przy życiu
-    i opcjonalnie odpala precompute jeśli cache pusty / stary.
+    Ping dla UptimeRobot / cron (co 5 min) – trzyma Render Free przy życiu.
+    Nie skraca analizy timeoutem – tylko budzi dyno i dba o precompute w tle.
     """
     with _PRECOMPUTE_LOCK:
         n = len(_PRECOMPUTE)
         last = _PRECOMPUTE_STATUS.get("last_full_run_ts")
-    stale = last is None or (time.time() - float(last)) > (_PRECOMPUTE_INTERVAL * 1.5)
-    if _PRECOMPUTE_ENABLED and (n == 0 or stale) and not _PRECOMPUTE_STATUS.get("running"):
-        threading.Thread(target=_precompute_all_once, daemon=True).start()
+        running = bool(_PRECOMPUTE_STATUS.get("running"))
+    stale = last is None or (time.time() - float(last)) > (_PRECOMPUTE_INTERVAL * 1.2)
+    kicked = False
+    if _PRECOMPUTE_ENABLED and not running and (n == 0 or stale):
+        threading.Thread(target=_precompute_all_once, daemon=True, name="pc-keepalive").start()
         kicked = True
-    else:
-        kicked = False
     return {
         "ok": True,
         "ts": int(time.time()),
         "precompute_entries": n,
         "precompute_kicked": kicked,
+        "precompute_running": running,
         "build": API_BUILD,
+        "hint": "Ustaw UptimeRobot HTTP(s) co 5 min na ten URL",
     }
 
 
