@@ -12,15 +12,17 @@ import time
 import threading
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import auth_plans as auth
+
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "precompute-keepalive-v2"
+API_BUILD = "auth-plans-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 
@@ -57,6 +59,54 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Auth + plany (Demo / Standard / Pro)
+# ---------------------------------------------------------------------------
+async def get_profile(
+    authorization: Optional[str] = Header(None),
+    x_dev_email: Optional[str] = Header(None, alias="X-Dev-Email"),
+) -> Dict[str, Any]:
+    """
+    Wymaga Bearer <supabase_access_token> gdy AUTH_REQUIRED=1.
+    Lokalnie: DEV_AUTH_BYPASS=1 + nagłówek X-Dev-Email.
+    """
+    if not auth.AUTH_REQUIRED:
+        return {
+            "id": "anonymous",
+            "email": None,
+            "plan": "pro",  # tryb otwarty – tylko dev
+            "analyze_count": 0,
+            "analyze_month": auth._month_key(),
+        }
+
+    # Dev bypass
+    if auth.DEV_AUTH_BYPASS and x_dev_email:
+        uid = "dev-" + str(abs(hash(x_dev_email.lower().strip())) % (10**12))
+        return auth.ensure_profile(uid, email=x_dev_email.strip())
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Wymagane logowanie (Authorization: Bearer <token>).",
+        )
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        user = auth.verify_supabase_jwt(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Nieprawidłowy token: {e}")
+    try:
+        return auth.ensure_profile(user["id"], email=user.get("email"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Profil: {e}")
+
+
+def _gate(prof: Dict[str, Any], feature: str) -> None:
+    try:
+        auth.require_feature(prof, feature)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
 class AnalyzeResponse(BaseModel):
     ticker: str
     horizon: str
@@ -74,6 +124,8 @@ class AnalyzeResponse(BaseModel):
     mae: Optional[float] = None
     n_significant: Optional[int] = None
     cached: Optional[bool] = None
+    analyze_remaining: Optional[int] = None
+    plan: Optional[str] = None
     disclaimer: str = (
         "To narzędzie analityczne, nie rekomendacja inwestycyjna. "
         "Prognozy oparte na modelu historycznym; nie uwzględniają zdarzeń losowych."
@@ -386,6 +438,8 @@ def health():
         "polygon_key_configured": key_ok,
         "ts": int(time.time()),
         "build": API_BUILD,
+        "auth_required": auth.AUTH_REQUIRED,
+        "supabase_configured": auth.supabase_configured(),
         "hit_mode": "full",
         "precompute_enabled": _PRECOMPUTE_ENABLED,
         "precompute_entries": n,
@@ -405,12 +459,18 @@ def analyze(
     fast: int = Query(1, description="kompatybilność"),
     quality: int = Query(0, description="1=więcej punktów Hit% backtestu"),
     refresh: int = Query(0, description="1=pomiń precompute/cache, przelicz teraz"),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    Domyślnie: gotowy wynik z precompute (szybko).
-    refresh=1: przelicz live (wolniej) i zaktualizuj precompute.
-    Silnik = zawsze to samo _analyze_one / core – nic nie zmieniamy w modelu.
+    Demo: max 2 analizy 1M/3M na miesiąc UTC.
+    Standard/Pro: bez limitu liczbowego.
     """
+    _gate(prof, "analyze")
+    try:
+        auth.check_analyze_quota(prof)
+    except PermissionError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+
     t = ticker.upper().strip()
     days = _horizon_days(horizon)
     hz = "3M" if days > 30 else "1M"
@@ -432,7 +492,13 @@ def analyze(
             cached = dict(cached)
             cached["cached"] = True
             cached.pop("fast_mode", None)
+            # Licznik Demo – nawet przy cache (to jest „użycie” analizy przez usera)
+            if (prof.get("plan") or "demo").lower() == "demo":
+                new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
+                prof["analyze_count"] = new_c
             payload = {k: v for k, v in cached.items() if k in AnalyzeResponse.model_fields}
+            payload["plan"] = (prof.get("plan") or "demo").lower()
+            payload["analyze_remaining"] = auth.remaining_analyze(prof)
             return AnalyzeResponse(**payload)
 
     data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
@@ -442,7 +508,12 @@ def analyze(
             _pc_store(t, hz, data)
     except Exception:
         pass
+    if (prof.get("plan") or "demo").lower() == "demo":
+        new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
+        prof["analyze_count"] = new_c
     payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields}
+    payload["plan"] = (prof.get("plan") or "demo").lower()
+    payload["analyze_remaining"] = auth.remaining_analyze(prof)
     return AnalyzeResponse(**payload)
 
 
@@ -450,7 +521,9 @@ def analyze(
 def rankings(
     horizon: str = Query("1M"),
     limit: int = Query(12, ge=1, le=30),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
+    _gate(prof, "rankings")
     """Ranking po predicted_change_pct – równolegle, bez Hit% (szybko)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -492,7 +565,8 @@ def rankings(
 
 
 @app.get("/fundamentals/{ticker}")
-def fundamentals(ticker: str):
+def fundamentals(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+    _gate(prof, "fundamentals")
     ticker = ticker.upper().strip()
     try:
         fa = core.get_comprehensive_fundamental_analysis(ticker)
@@ -517,7 +591,8 @@ def fundamentals(ticker: str):
 
 
 @app.get("/perspective-3y/{ticker}")
-def perspective_3y(ticker: str):
+def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+    _gate(prof, "perspective_3y")
     ticker = ticker.upper().strip()
     score = None
     try:
@@ -550,8 +625,10 @@ def perspective_3y(ticker: str):
 def forecast_backtest(
     ticker: str,
     horizon: str = Query("1M"),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Walk-forward Hit%% / MAE jak w desktopie."""
+    _gate(prof, "backtest_forecast")
     try:
         return reports.forecast_quality_backtest(ticker, horizon=horizon)
     except ValueError as e:
@@ -564,8 +641,10 @@ def forecast_backtest(
 def strategy_backtest(
     ticker: str,
     capital: float = Query(10000, ge=100, le=1_000_000),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Backtest strategii MACD/RSI/ADX + SL/TP."""
+    _gate(prof, "backtest_strategy")
     try:
         return reports.strategy_backtest(ticker, initial_capital=capital)
     except ValueError as e:
@@ -575,8 +654,9 @@ def strategy_backtest(
 
 
 @app.get("/report/{ticker}")
-def report_json(ticker: str):
+def report_json(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     """Pelny raport jako JSON (pod UI / eksport)."""
+    _gate(prof, "report")
     try:
         return reports.build_report_payload(ticker)
     except Exception as e:
@@ -584,7 +664,8 @@ def report_json(ticker: str):
 
 
 @app.get("/report/{ticker}/pdf")
-def report_pdf(ticker: str):
+def report_pdf(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+    _gate(prof, "report")
     try:
         data = reports.report_pdf_bytes(ticker)
     except Exception as e:
@@ -597,7 +678,8 @@ def report_pdf(ticker: str):
 
 
 @app.get("/report/{ticker}/xlsx")
-def report_xlsx(ticker: str):
+def report_xlsx(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+    _gate(prof, "report")
     try:
         data = reports.report_excel_bytes(ticker)
     except Exception as e:
@@ -613,8 +695,10 @@ def report_xlsx(ticker: str):
 def hybrid_analyze(
     ticker: str,
     mode: str = Query("Zrównoważony", description="Agresywny | Zrównoważony | Bezpieczny"),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Hybrid Analyzer – score, próg, sygnał KUPNO/SPRZEDAŻ (plan Pro)."""
+    _gate(prof, "hybrid")
     try:
         return hybrid.analyze_hybrid(ticker, mode=mode)
     except ValueError as e:
@@ -627,8 +711,10 @@ def hybrid_analyze(
 def signals(
     mode: str = Query("Zrównoważony"),
     limit: int = Query(20, ge=1, le=50),
+    prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Skaner sygnałów Hybrid po domyślnej liście tickerów (plan Pro)."""
+    _gate(prof, "signals")
     tickers = list(getattr(core, "tickers", []))[:limit]
     items = hybrid.scan_signals(tickers=tickers, mode=mode)
     return {
@@ -695,6 +781,79 @@ def keepalive():
     }
 
 
+
+@app.get("/me")
+def me(prof: Dict[str, Any] = Depends(get_profile)):
+    """Profil, plan, pozostałe analizy Demo, lista feature."""
+    return auth.public_me(prof)
+
+
+@app.get("/plans")
+def list_plans():
+    """Publiczny cennik feature (bez auth) – pod stronę Pricing."""
+    return {
+        "demo": auth.public_me({"plan": "demo", "analyze_count": 0, "analyze_month": auth._month_key()})["plans"]["demo"],
+        "standard": auth.public_me({"plan": "standard", "analyze_count": 0})["plans"]["standard"],
+        "pro": auth.public_me({"plan": "pro", "analyze_count": 0})["plans"]["pro"],
+        "note": "Płatności: Stripe Checkout → webhook ustawia plan na profilu.",
+    }
+
+
+@app.post("/billing/stripe-webhook")
+async def stripe_webhook(request: Request):
+    """
+    Stripe Checkout completed → profiles.plan = standard|pro.
+    W Stripe Dashboard: webhook na https://TWOJ-API/billing/stripe-webhook
+    Event: checkout.session.completed
+    Metadata sesji: supabase_user_id, plan
+    """
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET") or ""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    if not secret:
+        # tryb bez weryfikacji – tylko dev (NIE na prod bez secret)
+        try:
+            import json
+            event = json.loads(payload.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Bad payload")
+    else:
+        try:
+            import stripe
+            event = stripe.Webhook.construct_event(payload, sig, secret)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
+
+    etype = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
+    data_obj = event.get("data", {}).get("object", {}) if isinstance(event, dict) else {}
+    if etype == "checkout.session.completed":
+        meta = data_obj.get("metadata") or {}
+        uid = meta.get("supabase_user_id") or meta.get("user_id")
+        plan = (meta.get("plan") or "").lower()
+        if uid and plan in auth.VALID_PLANS and plan != "demo":
+            try:
+                auth.set_plan(uid, plan)
+                print(f"[stripe] plan={plan} user={uid}")
+            except Exception as e:
+                print("[stripe] set_plan error", e)
+                raise HTTPException(status_code=500, detail=str(e))
+    return {"received": True}
+
+
+@app.post("/billing/set-plan-dev")
+def set_plan_dev(
+    plan: str = Query(..., description="demo|standard|pro"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Tylko gdy DEV_AUTH_BYPASS=1 – ręczne ustawienie planu do testów."""
+    if not auth.DEV_AUTH_BYPASS:
+        raise HTTPException(status_code=403, detail="Tylko w trybie DEV_AUTH_BYPASS")
+    auth.set_plan(prof["id"], plan)
+    prof2 = auth.ensure_profile(prof["id"], email=prof.get("email"))
+    return auth.public_me(prof2)
+
+
 @app.get("/")
 def root():
     return {
@@ -702,6 +861,8 @@ def root():
         "docs": "/docs",
         "endpoints": [
             "GET /health",
+            "GET /me",
+            "GET /plans",
             "GET /tickers",
             "GET /analyze/{ticker}?horizon=1M|3M",
             "GET /rankings?horizon=1M&limit=12",
