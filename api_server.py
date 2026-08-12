@@ -1,9 +1,4 @@
-"""
-FastAPI – most łączący dashboard (core_analysis) ze stroną Lovable.
-Uruchomienie lokalne:
-  export POLYGON_API_KEY="twoj_klucz"
-  uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
-"""
+
 
 from __future__ import annotations
 
