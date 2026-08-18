@@ -1,4 +1,9 @@
-
+"""
+FastAPI – most łączący dashboard (core_analysis) ze stroną Lovable.
+Uruchomienie lokalne:
+  export POLYGON_API_KEY="twoj_klucz"
+  uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+"""
 
 from __future__ import annotations
 
@@ -17,9 +22,10 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "auth-plans-v1"
+API_BUILD = "gov-contracts-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
+import gov_contracts as gov
 
 # Klucz: najpierw ENV (produkcja), potem stała z core
 if os.environ.get("POLYGON_API_KEY"):
@@ -435,6 +441,7 @@ def health():
         "build": API_BUILD,
         "auth_required": auth.AUTH_REQUIRED,
         "supabase_configured": auth.supabase_configured(),
+        "supabase": auth.supabase_status(),
         "hit_mode": "full",
         "precompute_enabled": _PRECOMPUTE_ENABLED,
         "precompute_entries": n,
@@ -849,6 +856,44 @@ def set_plan_dev(
     return auth.public_me(prof2)
 
 
+
+@app.get("/gov/contracts")
+def gov_contracts(
+    q: Optional[str] = Query(None, description="Słowa kluczowe (np. semiconductor, cybersecurity)"),
+    company: Optional[str] = Query(None, description="Nazwa odbiorcy / firmy"),
+    days: int = Query(30, ge=1, le=1825, description="Okres wstecz od dziś"),
+    limit: int = Query(25, ge=1, le=100),
+    page: int = Query(1, ge=1, le=50),
+    min_amount: Optional[float] = Query(None, ge=0, description="Minimalna kwota kontraktu USD"),
+):
+    """Przyznane kontrakty federalne USA (USASpending.gov) – publiczne, bez auth."""
+    keywords = [q] if q and q.strip() else None
+    data = gov.search_awarded_contracts(
+        keywords=keywords,
+        recipient_name=company,
+        days=days,
+        limit=limit,
+        page=page,
+        min_amount=min_amount,
+    )
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
+    return data
+
+
+@app.get("/gov/contracts/company/{name}")
+def gov_contracts_company(
+    name: str,
+    days: int = Query(365, ge=1, le=1825),
+    limit: int = Query(25, ge=1, le=100),
+):
+    """Kontrakty przyznane firmie (po nazwie recipient)."""
+    data = gov.search_by_company_name(name, days=days, limit=limit)
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
+    return data
+
+
 @app.get("/")
 def root():
     return {
@@ -857,6 +902,8 @@ def root():
         "endpoints": [
             "GET /health",
             "GET /me",
+            "GET /gov/contracts?q=&company=&days=30",
+            "GET /gov/contracts/company/{name}",
             "GET /plans",
             "GET /tickers",
             "GET /analyze/{ticker}?horizon=1M|3M",
