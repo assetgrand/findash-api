@@ -94,13 +94,17 @@ def search_awarded_contracts(
         "time_period": _date_range(days),
         "award_type_codes": CONTRACT_TYPE_CODES,
     }
+    kw: List[str] = []
     if keywords:
-        kw = [k.strip() for k in keywords if k and str(k).strip()]
-        if kw:
-            filters["keywords"] = kw
+        kw.extend([k.strip() for k in keywords if k and str(k).strip()])
+    # Nazwa firmy: keywords dziala stabilnie; recipient_search_text bywa kaprysne
     if recipient_name and recipient_name.strip():
-        # USASpending wymaga listy stringów, nie pojedynczego stringa
-        filters["recipient_search_text"] = [recipient_name.strip()]
+        name = recipient_name.strip()
+        if name not in kw:
+            kw.append(name)
+        filters["recipient_search_text"] = [name]
+    if kw:
+        filters["keywords"] = kw
     if min_amount is not None and min_amount > 0:
         filters["award_amounts"] = [
             {"lower_bound": float(min_amount)}
@@ -115,24 +119,46 @@ def search_awarded_contracts(
         "limit": limit,
     }
 
-    try:
+    def _post(pl: Dict[str, Any]) -> Dict[str, Any]:
         r = requests.post(
             USASPENDING_SEARCH,
-            json=payload,
+            json=pl,
             headers={"Content-Type": "application/json"},
-            timeout=45,
+            timeout=60,
         )
         r.raise_for_status()
-        raw = r.json()
+        return r.json()
+
+    try:
+        raw = _post(payload)
     except requests.RequestException as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "results": [],
-            "page": page,
-            "limit": limit,
-            "source": "usaspending.gov",
-        }
+        # fallback: tylko keywords (bez recipient_search_text)
+        if "recipient_search_text" in filters:
+            try:
+                f2 = {k: v for k, v in filters.items() if k != "recipient_search_text"}
+                if not f2.get("keywords") and recipient_name:
+                    f2["keywords"] = [recipient_name.strip()]
+                pl2 = dict(payload)
+                pl2["filters"] = f2
+                raw = _post(pl2)
+            except requests.RequestException as e2:
+                return {
+                    "ok": False,
+                    "error": str(e2),
+                    "results": [],
+                    "page": page,
+                    "limit": limit,
+                    "source": "usaspending.gov",
+                }
+        else:
+            return {
+                "ok": False,
+                "error": str(e),
+                "results": [],
+                "page": page,
+                "limit": limit,
+                "source": "usaspending.gov",
+            }
 
     results_raw = raw.get("results") or []
     results: List[Dict[str, Any]] = []
