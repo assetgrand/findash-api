@@ -99,7 +99,8 @@ def search_awarded_contracts(
         if kw:
             filters["keywords"] = kw
     if recipient_name and recipient_name.strip():
-        filters["recipient_search_text"] = recipient_name.strip()
+        # USASpending wymaga listy stringów, nie pojedynczego stringa
+        filters["recipient_search_text"] = [recipient_name.strip()]
     if min_amount is not None and min_amount > 0:
         filters["award_amounts"] = [
             {"lower_bound": float(min_amount)}
