@@ -22,14 +22,18 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "gov-contracts-v1"
+API_BUILD = "twelve-data-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
 
 # Klucz: najpierw ENV (produkcja), potem stała z core
-if os.environ.get("POLYGON_API_KEY"):
+if os.environ.get("TWELVE_DATA_API_KEY"):
+    core.TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"].strip()
+    core.POLYGON_API_KEY = core.TWELVE_DATA_API_KEY
+elif os.environ.get("POLYGON_API_KEY"):
     core.POLYGON_API_KEY = os.environ["POLYGON_API_KEY"].strip()
+    core.TWELVE_DATA_API_KEY = core.POLYGON_API_KEY
 
 app = FastAPI(
     title="FinDash Analysis API",
@@ -434,14 +438,26 @@ def health():
     ).startswith("WPISZ")
     with _PRECOMPUTE_LOCK:
         n = len(_PRECOMPUTE)
+    sb_cfg = False
+    sb_extra = None
+    try:
+        sb_cfg = bool(auth.supabase_configured())
+    except Exception as e:
+        sb_extra = {"error": f"supabase_configured: {e}"}
+    try:
+        if hasattr(auth, "supabase_status"):
+            sb_extra = auth.supabase_status()
+    except Exception as e:
+        sb_extra = {"error": f"supabase_status: {e}"}
     return {
         "status": "ok",
         "polygon_key_configured": key_ok,
+        "twelve_key_configured": key_ok,
         "ts": int(time.time()),
         "build": API_BUILD,
-        "auth_required": auth.AUTH_REQUIRED,
-        "supabase_configured": auth.supabase_configured(),
-        "supabase": auth.supabase_status(),
+        "auth_required": getattr(auth, "AUTH_REQUIRED", False),
+        "supabase_configured": sb_cfg,
+        "supabase": sb_extra,
         "hit_mode": "full",
         "precompute_enabled": _PRECOMPUTE_ENABLED,
         "precompute_entries": n,

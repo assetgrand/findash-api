@@ -1,8 +1,8 @@
 # ============================================================
-# ADVANCED FINANCIAL DASHBOARD - POLYGON.IO EDITION
+# ADVANCED FINANCIAL DASHBOARD - TWELVE DATA EDITION
 # ============================================================
 # KOMPLETNY KOD - WSZYSTKIE FUNKCJE, OKNA, ANALIZY
-# BEZ YAHOO FINANCE - TYLKO POLYGON.IO
+# BEZ YAHOO FINANCE - TYLKO TWELVE DATA
 # BEZ LIMITÓW DZIENNYCH - PLAN STARTER $29/MIES.
 # ============================================================
 
@@ -93,21 +93,23 @@ FONT_MONO = ("Consolas", 10)
 
 
 # ============================================================
-# ⭐⭐⭐ WPISZ SWÓJ KLUCZ API POLYGON.IO TUTAJ ⭐⭐⭐
+# ⭐⭐⭐ WPISZ SWÓJ KLUCZ API TWELVE DATA TUTAJ ⭐⭐⭐
 # ============================================================
-# Zarejestruj się na: https://polygon.io/
-# Plan Starter: $29/mies. - NIELIMITOWANE ZAPYTANIA
-# ============================================================
-
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_POLYGON"  # env lub tu
-
-# ============================================================
-# POLYGON.IO API - JEDYNE ŹRÓDŁO DANYCH
+# https://twelvedata.com/ — darmowy plan ma limity kredytów
 # ============================================================
 
-POLYGON_BASE_URL = "https://api.polygon.io"
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_TWELVE_DATA"
+# kompatybilność ze starym env (opcjonalnie)
+if TWELVE_DATA_API_KEY in ("", "WPISZ_KLUCZ_TWELVE_DATA"):
+    TWELVE_DATA_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or TWELVE_DATA_API_KEY
 
-_CACHE_DIR = "polygon_cache"
+# Alias używany dalej w kodzie (stare nazwy zmiennych)
+POLYGON_API_KEY = TWELVE_DATA_API_KEY
+
+TWELVE_BASE_URL = "https://api.twelvedata.com"
+POLYGON_BASE_URL = TWELVE_BASE_URL  # alias
+
+_CACHE_DIR = "twelve_data_cache"
 os.makedirs(_CACHE_DIR, exist_ok=True)
 
 def _cache_key(func_name, *args, **kwargs):
@@ -122,30 +124,42 @@ def _cache_get(key):
                 data = json.load(f)
             if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(minutes=5):
                 return data['data']
-        except:
+        except Exception:
             pass
     return None
 
 def _cache_set(key, data):
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     with open(path, 'w', encoding='utf-8') as f:
-        json.dump({'_timestamp': datetime.now().isoformat(), 'data': data}, f, indent=2)
+        json.dump({'_timestamp': datetime.now().isoformat(), 'data': data}, f, indent=2, default=str)
+
+def _normalize_symbol(ticker: str) -> str:
+    """Polygon X:BTCUSD / krypto -> format Twelve Data (BTC/USD)."""
+    if not ticker:
+        return ticker
+    t = str(ticker).strip()
+    if t.startswith("X:") and t.endswith("USD") and len(t) > 5:
+        base = t[2:-3]
+        if base:
+            return f"{base}/USD"
+    if t.upper().endswith("USD") and "/" not in t and len(t) <= 8 and not t.isalpha():
+        # e.g. BTCUSD
+        if t.upper().endswith("USD") and len(t) > 3:
+            return f"{t[:-3]}/USD"
+    return t
 
 def _api_call(url, max_retries=3):
-    """Wykonuje zapytanie do Polygon.io API."""
+    """Wykonuje zapytanie do Twelve Data API."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            
-            if 'error' in data:
-                print(f"❌ Błąd Polygon.io: {data['error']}")
-                return None
-            if 'status' in data and data['status'] == 'ERROR':
-                print(f"❌ Błąd Polygon.io: {data.get('message', 'Nieznany błąd')}")
-                return None
-                
+            if isinstance(data, dict):
+                if data.get("status") == "error" or data.get("code"):
+                    msg = data.get("message") or data.get("status") or str(data)[:200]
+                    print(f"❌ Błąd Twelve Data: {msg}")
+                    return None
             return data
         except requests.exceptions.RequestException as e:
             print(f"❌ Błąd sieci (próba {attempt+1}): {e}")
@@ -153,420 +167,353 @@ def _api_call(url, max_retries=3):
         except Exception as e:
             print(f"❌ Błąd (próba {attempt+1}): {e}")
             time.sleep(2)
-            
     return None
 
-# ============================================================
-# TEST API NA STARCIE
-# ============================================================
-
 def test_api_key():
-    """Testuje klucz API Polygon.io."""
+    """Testuje klucz API Twelve Data."""
     print("=" * 60)
-    print("🔑 TEST KLUCZA API POLYGON.IO")
+    print("🔑 TEST KLUCZA API TWELVE DATA")
     print("=" * 60)
-    print(f"📌 Klucz: {POLYGON_API_KEY[:4]}...{POLYGON_API_KEY[-4:]}")
+    key = TWELVE_DATA_API_KEY
+    print(f"📌 Klucz: {key[:4]}...{key[-4:] if len(key) > 8 else '????'}")
     print("-" * 60)
-    
-    if POLYGON_API_KEY == "TWOJ_KLUCZ_POLYGON" or len(POLYGON_API_KEY) < 10:
-        print("❌❌❌ NIE WPISAŁEŚ KLUCZA API!")
-        print("📌 Otwórz plik main.py i wpisz swój klucz w linii:")
-        print('   POLYGON_API_KEY = "TWOJ_KLUCZ_POLYGON"')
-        print("📌 Klucz możesz uzyskać na: https://polygon.io/dashboard/signup")
+
+    if key in ("WPISZ_KLUCZ_TWELVE_DATA", "TWOJ_KLUCZ_POLYGON", "") or len(key) < 8:
+        print("❌❌❌ NIE WPISAŁEŚ KLUCZA API TWELVE DATA!")
+        print('   TWELVE_DATA_API_KEY = "twoj_klucz"')
+        print("📌 https://twelvedata.com/")
         input("Naciśnij ENTER, aby zakończyć...")
         sys.exit(1)
-    
-    url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/AAPL/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
-    print("⏳ Wysyłam zapytanie do Polygon.io...")
+
+    url = f"{TWELVE_BASE_URL}/quote?symbol=AAPL&apikey={key}"
+    print("⏳ Wysyłam zapytanie do Twelve Data...")
     try:
         resp = requests.get(url, timeout=30)
         print(f"📡 Status HTTP: {resp.status_code}")
-        
         if resp.status_code != 200:
             print(f"❌ Błąd HTTP: {resp.status_code}")
             print(f"   Odpowiedź: {resp.text[:200]}")
             return False
-            
         data = resp.json()
-        
-        if 'error' in data:
-            print(f"❌ Błąd: {data['error']}")
+        if data.get("status") == "error":
+            print(f"❌ Błąd: {data.get('message')}")
             return False
-            
-        if 'results' in data and data['results']:
-            price = data['results'][0]['c']
+        price = data.get("close") or data.get("price")
+        if price is not None:
             print(f"✅ KLUCZ DZIAŁA!")
             print(f"   📈 AAPL: ${price}")
             return True
-        else:
-            print(f"❌ Nieznana odpowiedź API: {data}")
-            return False
-            
+        print(f"❌ Nieznana odpowiedź API: {str(data)[:200]}")
+        return False
     except Exception as e:
         print(f"❌ Błąd: {e}")
         return False
 
-# Test klucza TYLKO przy bezpośrednim uruchomieniu core (nie przy imporcie z API)
 def _run_startup_api_check():
-    if not test_api_key():
-        print("=" * 60)
-        print("❌ KLUCZ API POLYGON NIE DZIAŁA – ustaw POLYGON_API_KEY")
-        print("=" * 60)
+    """Przy imporcie z FastAPI nie przerywamy procesu – tylko log."""
+    try:
+        ok = test_api_key()
+    except Exception as e:
+        print("test_api_key:", e)
         return False
-    print("✅ KLUCZ ZATWIERDZONY")
+    if not ok:
+        print("⚠️ TWELVE_DATA_API_KEY / POLYGON_API_KEY – klucz nie działa lub pusty")
+        return False
+    print("✅ KLUCZ TWELVE DATA ZATWIERDZONY")
     return True
 
 if __name__ == "__main__":
-    _run_startup_api_check()
+    if not _run_startup_api_check():
+        sys.exit(1)
 
 # ============================================================
-# FUNKCJE POLYGON.IO - POBIERANIE DANYCH
+# FUNKCJE TWELVE DATA - POBIERANIE DANYCH
 # ============================================================
-
-def get_company_profile(ticker):
-    """Pobiera profil spółki z Polygon.io – WSZYSTKIE pola."""
-    if not ticker:
-        return {}
-    cache_key = _cache_key("profile", ticker)
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-    
-    url = f"{POLYGON_BASE_URL}/v3/reference/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
-    data = _api_call(url)
-    
-    if data and 'results' in data:
-        results = data['results']
-        # Mapuj WSZYSTKIE dostępne pola
-        profile = {
-            # Podstawowe
-            'Symbol': results.get('ticker'),
-            'Name': results.get('name'),
-            'Sector': results.get('sector'),
-            'Industry': results.get('industry'),
-            
-            # Wycena
-            'MarketCapitalization': results.get('market_cap'),
-            'PERatio': results.get('pe_ratio'),
-            'PriceToSalesRatioTTM': results.get('ps_ratio'),
-            'PriceToBookRatio': results.get('pb_ratio'),
-            'PEGRatio': results.get('peg_ratio'),
-            
-            # Rentowność
-            'ReturnOnEquityTTM': results.get('roe'),
-            'ReturnOnAssetsTTM': results.get('roa'),
-            'ProfitMargin': results.get('profit_margin'),
-            'OperatingMarginTTM': results.get('operating_margin'),
-            'GrossProfitMarginTTM': results.get('gross_margin'),
-            
-            # Zadłużenie i płynność
-            'DebtToEquityRatio': results.get('debt_to_equity'),
-            'CurrentRatio': results.get('current_ratio'),
-            'QuickRatio': results.get('quick_ratio'),
-            
-            # Wycena (EV)
-            'EVToEBITDA': results.get('ev_to_ebitda'),
-            'EVToRevenue': results.get('ev_to_revenue'),
-            
-            # Wzrost
-            'QuarterlyRevenueGrowthYOY': results.get('revenue_growth'),
-            'QuarterlyEarningsGrowthYOY': results.get('earnings_growth'),
-            
-            # Inne
-            'EBITDA': results.get('ebitda'),
-            'FreeCashFlow': results.get('free_cash_flow'),
-            'TrailingEPS': results.get('eps'),
-            'ForwardEPS': results.get('eps_forward'),
-            'Beta': results.get('beta'),
-            'DividendYield': results.get('dividend_yield'),
-            '52WeekHigh': results.get('high_52_week'),
-            '52WeekLow': results.get('low_52_week'),
-            'TotalAssets': results.get('total_assets'),
-            'TotalRevenue': results.get('total_revenue'),
-            'EnterpriseValue': results.get('enterprise_value'),
-            'OperatingCashflow': results.get('operating_cash_flow'),
-            'NetIncomeTTM': results.get('net_income'),
-        }
-        _cache_set(cache_key, profile)
-        return profile
-    
-    return {}
-
-def get_company_fundamentals(ticker):
-    """Zwraca wszystkie wskaźniki fundamentalne w jednym słowniku."""
-    profile = get_company_profile(ticker)
-    if not profile:
-        return None
-
-    fundamentals = {
-        'P/E': profile.get('PERatio'),
-        'PEG': profile.get('PEGRatio'),
-        'P/S': profile.get('PriceToSalesRatioTTM'),
-        'P/B': profile.get('PriceToBookRatio'),
-        'EV/EBITDA': profile.get('EVToEBITDA'),
-        'EV/Revenue': profile.get('EVToRevenue'),
-        'ROE': profile.get('ReturnOnEquityTTM'),
-        'ROA': profile.get('ReturnOnAssetsTTM'),
-        'Gross Margin': profile.get('GrossProfitMarginTTM'),
-        'Profit Margin': profile.get('ProfitMargin'),
-        'Operating Margin': profile.get('OperatingMarginTTM'),
-        'Revenue Growth': profile.get('QuarterlyRevenueGrowthYOY'),
-        'Earnings Growth': profile.get('QuarterlyEarningsGrowthYOY'),
-        'Debt/Equity': profile.get('DebtToEquityRatio'),
-        'Current Ratio': profile.get('CurrentRatio'),
-        'Quick Ratio': profile.get('QuickRatio'),
-        'EBITDA': profile.get('EBITDA'),
-        'Free Cash Flow': profile.get('FreeCashFlow'),
-        'EPS (Trailing)': profile.get('TrailingEPS'),
-        'EPS (Forward)': profile.get('ForwardEPS'),
-        'Market Cap': profile.get('MarketCapitalization'),
-        'Enterprise Value': profile.get('EnterpriseValue'),
-        'Operating Cash Flow': profile.get('OperatingCashflow'),
-        'Net Income': profile.get('NetIncomeTTM'),
-        'Total Assets': profile.get('TotalAssets'),
-        'Total Revenue': profile.get('TotalRevenue'),
-        'Dividend Yield': profile.get('DividendYield'),
-        'Beta': profile.get('Beta'),
-        '52Week High': profile.get('52WeekHigh'),
-        '52Week Low': profile.get('52WeekLow'),
-    }
-
-    # Konwersja procentów (Polygon zwraca ułamki, np. 0.15 = 15%)
-    for key in ['ROE','ROA','Gross Margin','Profit Margin','Operating Margin',
-                'Revenue Growth','Earnings Growth', 'Dividend Yield']:
-        if fundamentals.get(key) is not None:
-            fundamentals[key] = fundamentals[key] * 100
-
-    return fundamentals
-
 
 def get_live_price(ticker):
-    """Pobiera aktualną cenę z Polygon.io (ostatnia sesja)."""
+    """Aktualna / ostatnia cena z Twelve Data (/quote)."""
     if not ticker:
         return None
-    cache_key = _cache_key("price", ticker)
+    sym = _normalize_symbol(ticker)
+    cache_key = _cache_key("price", sym)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    
-    url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={POLYGON_API_KEY}"
+
+    from urllib.parse import quote
+    url = f"{TWELVE_BASE_URL}/quote?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
     data = _api_call(url)
-    
-    if data and 'results' in data and data['results']:
-        try:
-            price = float(data['results'][0]['c'])  # c = close price
-            _cache_set(cache_key, price)
-            return price
-        except:
-            return None
-    return None
+    if not data:
+        return None
+    try:
+        price = float(data.get("close") or data.get("price") or data.get("previous_close"))
+        _cache_set(cache_key, price)
+        return price
+    except Exception:
+        return None
 
 def get_historical_prices(ticker, days=500):
-    """Pobiera dane historyczne z Polygon.io."""
+    """Historyczne OHLCV – Twelve Data time_series (1day), stabilne pod Hit%/backtest."""
     if not ticker:
         return pd.DataFrame()
-    
-    cache_key = _cache_key("hist", ticker, days)
+
+    sym = _normalize_symbol(ticker)
+    # prosimy o wystarczająco barek sesyjnych (nie kalendarz 1:1)
+    calendar_days = max(int(days), 400)
+    outputsize = max(250, min(int(calendar_days * 0.85) + 50, 5000))
+
+    cache_key = _cache_key("hist_v2", sym, outputsize)
     cached = _cache_get(cache_key)
     if cached is not None:
         try:
             df = pd.DataFrame(cached)
-            df.index = pd.to_datetime(df.index)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                df.set_index("date", inplace=True)
+            else:
+                df.index = pd.to_datetime(df.index)
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["Close"])
+            df = df[~df.index.duplicated(keep="last")]
             df.sort_index(inplace=True)
-            return df
-        except:
+            if len(df) >= 60:
+                return df
+        except Exception:
             pass
-    
-    end = datetime.now().strftime('%Y-%m-%d')
-    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-    
-    url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&apiKey={POLYGON_API_KEY}"
+
+    from urllib.parse import quote
+    end_d = datetime.now().strftime("%Y-%m-%d")
+    start_d = (datetime.now() - timedelta(days=calendar_days + 40)).strftime("%Y-%m-%d")
+    sym_q = quote(sym, safe="/")
+    url = (
+        f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"
+        f"&interval=1day&start_date={start_d}&end_date={end_d}"
+        f"&outputsize={outputsize}&order=ASC&adjust=all"
+        f"&apikey={TWELVE_DATA_API_KEY}"
+    )
     data = _api_call(url)
-    
-    if data is None or 'results' not in data or not data['results']:
+    # fallback bez start/end (niektóre plany)
+    if not data or "values" not in data or not data["values"]:
+        url2 = (
+            f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"
+            f"&interval=1day&outputsize={outputsize}&order=ASC&adjust=all"
+            f"&apikey={TWELVE_DATA_API_KEY}"
+        )
+        data = _api_call(url2)
+    if not data or "values" not in data or not data["values"]:
         return pd.DataFrame()
-    
-    df = pd.DataFrame(data['results'])
-    df['date'] = pd.to_datetime(df['t'], unit='ms')
-    df.set_index('date', inplace=True)
-    df.rename(columns={
-        'o': 'Open',
-        'h': 'High',
-        'l': 'Low',
-        'c': 'Close',
-        'v': 'Volume'
-    }, inplace=True)
-    
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-    _cache_set(cache_key, df.to_dict('records'))
+
+    rows = []
+    for v in data["values"]:
+        try:
+            rows.append({
+                "date": v.get("datetime"),
+                "Open": float(v["open"]),
+                "High": float(v["high"]),
+                "Low": float(v["low"]),
+                "Close": float(v["close"]),
+                "Volume": float(v.get("volume") or 0),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df.set_index("date", inplace=True)
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
+    df = df.dropna(subset=["Close"])
+    # obetnij do ~żądanej długości
+    if len(df) > outputsize:
+        df = df.iloc[-outputsize:]
+    rec = df.reset_index().to_dict("records")
+    for r in rec:
+        if hasattr(r.get("date"), "isoformat"):
+            r["date"] = r["date"].isoformat()
+    _cache_set(cache_key, rec)
     return df
 
+
+
 def get_company_profile(ticker):
-    """Pobiera profil spółki z Polygon.io."""
+    """Profil spółki – /profile (+ /quote uzupełniająco)."""
     if not ticker:
         return {}
-    cache_key = _cache_key("profile", ticker)
+    sym = _normalize_symbol(ticker)
+    cache_key = _cache_key("profile", sym)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    
-    # Najpierw spróbuj pobrać szczegółowe dane
-    url = f"{POLYGON_BASE_URL}/v3/reference/tickers/{ticker}?apiKey={POLYGON_API_KEY}"
+
+    from urllib.parse import quote
+    url = f"{TWELVE_BASE_URL}/profile?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
     data = _api_call(url)
-    
-    if data and 'results' in data:
-        results = data['results']
-        # Polygon zwraca inne nazwy pól – mapujemy je na to, czego oczekuje reszta kodu
+    profile = {}
+    if data and isinstance(data, dict) and data.get("status") != "error":
         profile = {
-            'Symbol': results.get('ticker'),
-            'Name': results.get('name'),
-            'Sector': results.get('sector'),
-            'Industry': results.get('industry'),
-            'MarketCapitalization': results.get('market_cap'),
-            'TotalAssets': results.get('total_assets'),
-            'TotalRevenue': results.get('total_revenue'),
-            'EBITDA': results.get('ebitda'),
-            'EPS': results.get('eps'),
-            'Beta': results.get('beta'),
-            '52WeekHigh': results.get('high_52_week'),
-            '52WeekLow': results.get('low_52_week'),
-            'DividendYield': results.get('dividend_yield'),
+            "Symbol": data.get("symbol") or sym,
+            "Name": data.get("name"),
+            "Sector": data.get("sector"),
+            "Industry": data.get("industry"),
+            "MarketCapitalization": data.get("market_cap") or data.get("market_capitalization"),
+            "Beta": data.get("beta"),
+            "DividendYield": data.get("dividend_yield") or data.get("dividends_yield"),
+            "52WeekHigh": data.get("fifty_two_week", {}).get("high") if isinstance(data.get("fifty_two_week"), dict) else data.get("52_week_high"),
+            "52WeekLow": data.get("fifty_two_week", {}).get("low") if isinstance(data.get("fifty_two_week"), dict) else data.get("52_week_low"),
+            "Employees": data.get("employees"),
+            "Exchange": data.get("exchange"),
+            "Type": data.get("type"),
         }
-        _cache_set(cache_key, profile)
-        return profile
-    
-    return {}
+    # statistics for richer fundamentals
+    url2 = f"{TWELVE_BASE_URL}/statistics?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
+    stats = _api_call(url2)
+    if stats and isinstance(stats, dict) and "statistics" in stats:
+        st = stats["statistics"]
+        val = st.get("valuations_metrics") or {}
+        fin = st.get("financials") or {}
+        stock = st.get("stock_price_summary") or {}
+        profile.setdefault("MarketCapitalization", val.get("market_capitalization"))
+        profile["pe_ratio"] = val.get("trailing_pe") or val.get("forward_pe")
+        profile["ps_ratio"] = val.get("price_to_sales_ttm")
+        profile["pb_ratio"] = val.get("price_to_book_mrq")
+        profile["eps"] = (fin.get("income_statement") or {}).get("diluted_eps_ttm")
+        profile["EnterpriseValue"] = val.get("enterprise_value")
+        if stock:
+            profile["52WeekHigh"] = profile.get("52WeekHigh") or stock.get("fifty_two_week_high")
+            profile["52WeekLow"] = profile.get("52WeekLow") or stock.get("fifty_two_week_low")
+    _cache_set(cache_key, profile)
+    return profile
 
 def get_key_metrics(ticker):
-    """Pobiera kluczowe wskaźniki z Polygon.io."""
     profile = get_company_profile(ticker)
     if not profile:
         return {}
-    
-    # Polygon nie ma tych wskaźników bezpośrednio w ticker details
-    # Musimy je pobrać z innego endpointu lub wyliczyć
-    # Na razie zwracamy to, co mamy
     metrics = {
-        'pegRatio': profile.get('peg_ratio'),
-        'revenueGrowth': profile.get('revenue_growth'),
-        'netIncomeGrowth': profile.get('net_income_growth'),
-        'ebitda': profile.get('ebitda'),
-        'freeCashFlow': profile.get('free_cash_flow'),
-        'eps': profile.get('eps'),
-        'epsForward': profile.get('eps_forward'),
-        'totalAssets': profile.get('total_assets'),
-        'totalRevenue': profile.get('total_revenue'),
-        'operatingCashFlow': profile.get('operating_cash_flow'),
-        'netIncome': profile.get('net_income'),
+        "pegRatio": profile.get("peg_ratio"),
+        "revenueGrowth": profile.get("revenue_growth"),
+        "netIncomeGrowth": profile.get("net_income_growth"),
+        "ebitda": profile.get("ebitda") or profile.get("EBITDA"),
+        "freeCashFlow": profile.get("free_cash_flow"),
+        "eps": profile.get("eps") or profile.get("EPS"),
+        "epsForward": profile.get("eps_forward"),
+        "totalAssets": profile.get("total_assets") or profile.get("TotalAssets"),
+        "totalRevenue": profile.get("total_revenue") or profile.get("TotalRevenue"),
+        "operatingCashFlow": profile.get("operating_cash_flow"),
+        "netIncome": profile.get("net_income"),
     }
-    
-    for k, v in metrics.items():
+    for k, v in list(metrics.items()):
         if v is not None:
             try:
                 metrics[k] = float(v)
-            except:
+            except Exception:
                 metrics[k] = None
     return metrics
 
 def get_financial_ratios(ticker):
-    """Pobiera wskaźniki finansowe z Polygon.io."""
     profile = get_company_profile(ticker)
     if not profile:
         return {}
-    
     ratios = {
-        'enterpriseValueToEbitda': profile.get('ev_to_ebitda'),
-        'enterpriseValueToRevenue': profile.get('ev_to_revenue'),
-        'returnOnEquity': profile.get('roe'),
-        'returnOnAssets': profile.get('roa'),
-        'grossProfitMargin': profile.get('gross_margin'),
-        'netProfitMargin': profile.get('profit_margin'),
-        'operatingProfitMargin': profile.get('operating_margin'),
-        'debtEquityRatio': profile.get('debt_to_equity'),
-        'currentRatio': profile.get('current_ratio'),
-        'quickRatio': profile.get('quick_ratio')
+        "enterpriseValueToEbitda": profile.get("ev_to_ebitda"),
+        "enterpriseValueToRevenue": profile.get("ev_to_revenue"),
+        "returnOnEquity": profile.get("roe"),
+        "returnOnAssets": profile.get("roa"),
+        "grossProfitMargin": profile.get("gross_margin"),
+        "netProfitMargin": profile.get("profit_margin"),
+        "operatingProfitMargin": profile.get("operating_margin"),
+        "debtEquityRatio": profile.get("debt_to_equity"),
+        "currentRatio": profile.get("current_ratio"),
+        "quickRatio": profile.get("quick_ratio"),
     }
-    
-    for k, v in ratios.items():
+    for k, v in list(ratios.items()):
         if v is not None:
             try:
                 ratios[k] = float(v)
-            except:
+            except Exception:
                 ratios[k] = None
     return ratios
 
 def get_company_fundamentals(ticker):
-    """Zwraca wszystkie wskaźniki fundamentalne w jednym słowniku."""
+    """Zwraca wskaźniki fundamentalne w jednym słowniku (Twelve Data)."""
     try:
         profile = get_company_profile(ticker)
         metrics = get_key_metrics(ticker)
         ratios = get_financial_ratios(ticker)
     except Exception as e:
-        print(f"Błąd Polygon.io dla {ticker}: {e}")
+        print(f"Błąd Twelve Data dla {ticker}: {e}")
         return None
-
     if not profile:
         return None
-
     fundamentals = {
-        'P/E': profile.get('pe_ratio'),
-        'PEG': metrics.get('pegRatio'),
-        'P/S': profile.get('ps_ratio'),
-        'P/B': profile.get('pb_ratio'),
-        'EV/EBITDA': ratios.get('enterpriseValueToEbitda'),
-        'EV/Revenue': ratios.get('enterpriseValueToRevenue'),
-        'ROE': ratios.get('returnOnEquity'),
-        'ROA': ratios.get('returnOnAssets'),
-        'Gross Margin': ratios.get('grossProfitMargin'),
-        'Profit Margin': ratios.get('netProfitMargin'),
-        'Operating Margin': ratios.get('operatingProfitMargin'),
-        'Revenue Growth': metrics.get('revenueGrowth'),
-        'Earnings Growth': metrics.get('netIncomeGrowth'),
-        'Debt/Equity': ratios.get('debtEquityRatio'),
-        'Current Ratio': ratios.get('currentRatio'),
-        'Quick Ratio': ratios.get('quickRatio'),
-        'EBITDA': metrics.get('ebitda'),
-        'Free Cash Flow': metrics.get('freeCashFlow'),
-        'EPS (Trailing)': metrics.get('eps'),
-        'EPS (Forward)': metrics.get('epsForward'),
-        'Market Cap': profile.get('MarketCapitalization'),
-        'Enterprise Value': profile.get('EnterpriseValue'),
-        'Operating Cash Flow': metrics.get('operatingCashFlow'),
-        'Net Income': metrics.get('netIncome'),
-        'Total Assets': metrics.get('totalAssets'),
-        'Total Revenue': metrics.get('totalRevenue'),
-        'Dividend Yield': profile.get('DividendYield'),
-        'Beta': profile.get('Beta'),
-        '52Week High': profile.get('52WeekHigh'),
-        '52Week Low': profile.get('52WeekLow'),
+        "P/E": profile.get("pe_ratio"),
+        "PEG": metrics.get("pegRatio"),
+        "P/S": profile.get("ps_ratio"),
+        "P/B": profile.get("pb_ratio"),
+        "EV/EBITDA": ratios.get("enterpriseValueToEbitda"),
+        "EV/Revenue": ratios.get("enterpriseValueToRevenue"),
+        "ROE": ratios.get("returnOnEquity"),
+        "ROA": ratios.get("returnOnAssets"),
+        "Gross Margin": ratios.get("grossProfitMargin"),
+        "Profit Margin": ratios.get("netProfitMargin"),
+        "Operating Margin": ratios.get("operatingProfitMargin"),
+        "Revenue Growth": metrics.get("revenueGrowth"),
+        "Earnings Growth": metrics.get("netIncomeGrowth"),
+        "Debt/Equity": ratios.get("debtEquityRatio"),
+        "Current Ratio": ratios.get("currentRatio"),
+        "Quick Ratio": ratios.get("quickRatio"),
+        "EBITDA": metrics.get("ebitda"),
+        "Free Cash Flow": metrics.get("freeCashFlow"),
+        "EPS (Trailing)": metrics.get("eps"),
+        "EPS (Forward)": metrics.get("epsForward"),
+        "Market Cap": profile.get("MarketCapitalization"),
+        "Enterprise Value": profile.get("EnterpriseValue"),
+        "Operating Cash Flow": metrics.get("operatingCashFlow"),
+        "Net Income": metrics.get("netIncome"),
+        "Total Assets": metrics.get("totalAssets"),
+        "Total Revenue": metrics.get("totalRevenue"),
+        "Dividend Yield": profile.get("DividendYield"),
+        "Beta": profile.get("Beta"),
+        "52Week High": profile.get("52WeekHigh"),
+        "52Week Low": profile.get("52WeekLow"),
     }
-
-    for key in ['ROE','ROA','Gross Margin','Profit Margin','Operating Margin']:
+    for key in ["ROE", "ROA", "Gross Margin", "Profit Margin", "Operating Margin"]:
         if fundamentals.get(key) is not None:
-            fundamentals[key] = fundamentals[key] * 100
-    for key in ['Revenue Growth','Earnings Growth']:
+            try:
+                v = float(fundamentals[key])
+                if abs(v) <= 1.5:
+                    fundamentals[key] = v * 100
+            except Exception:
+                pass
+    for key in ["Revenue Growth", "Earnings Growth"]:
         if fundamentals.get(key) is not None:
-            fundamentals[key] = fundamentals[key] * 100
-
+            try:
+                v = float(fundamentals[key])
+                if abs(v) <= 1.5:
+                    fundamentals[key] = v * 100
+            except Exception:
+                pass
     return fundamentals
 
 def _to_scalar(val, default=0.0):
     if val is None:
         return default
-    if hasattr(val, 'iloc'):
+    if hasattr(val, "iloc"):
         try:
             val = val.iloc[-1]
-        except:
+        except Exception:
             pass
-    if hasattr(val, 'item'):
+    if hasattr(val, "item"):
         try:
             val = val.item()
-        except:
+        except Exception:
             pass
     try:
         v = float(val)
         return default if np.isnan(v) else v
-    except:
+    except Exception:
         return default
 
 # ============================================================
@@ -2625,12 +2572,19 @@ FEATURE_KEYS = [
 
 
 def _build_training_set(df, horizon_days, max_samples=200):
+    """Zbiór treningowy z krokiem ~horizon/3 – mniej nachodzących etykiet (mniej szumu)."""
     n = len(df)
     if n < horizon_days + 40:
         return None, None
-    start = max(40, n - horizon_days - max_samples)
-    X_list, y_list = [], []
-    for i in range(start, n - horizon_days):
+    # krok zmniejsza overlap etykiet forward-return (uczciwszy sygnał dla Ridge/GB)
+    step = max(1, min(5, horizon_days // 4))
+    span = max_samples * step
+    start = max(40, n - horizon_days - span)
+    X_list, y_list, w_list = [], [], []
+    idxs = list(range(start, n - horizon_days, step))
+    if len(idxs) < 30:
+        idxs = list(range(start, n - horizon_days))  # fallback gęstszy
+    for j, i in enumerate(idxs):
         feats = _extract_features_row(df, i)
         if feats is None:
             continue
@@ -2638,11 +2592,15 @@ def _build_training_set(df, horizon_days, max_samples=200):
         if future <= 0 or feats['close'] <= 0:
             continue
         fwd_ret = (future / feats['close'] - 1.0) * 100.0
+        # lekka normalizacja ekstremów (winsor) – stabilniejsze dopasowanie
+        fwd_ret = float(np.clip(fwd_ret, -45.0, 45.0))
         X_list.append([feats[k] for k in FEATURE_KEYS])
         y_list.append(fwd_ret)
+        # świeższe próbki ważniejsze (recency weight)
+        w_list.append(0.55 + 0.45 * ((j + 1) / max(len(idxs), 1)))
     if len(X_list) < 30:
-        return None, None
-    return np.array(X_list, dtype=float), np.array(y_list, dtype=float)
+        return None, None, None
+    return np.array(X_list, dtype=float), np.array(y_list, dtype=float), np.array(w_list, dtype=float)
 
 
 def _heuristic_momentum_return(feats, regime, days_forward):
@@ -2844,8 +2802,12 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v2: Ridge + GradientBoosting + heurystyka + shrinkage + agreement."""
-    X, y = _build_training_set(df, days_forward)
+    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, silniejszy prior przy sporze."""
+    built = _build_training_set(df, days_forward)
+    if built[0] is None:
+        X, y, sw = None, None, None
+    else:
+        X, y, sw = built
     weights = _calibrate_model_weights(X, y, days_forward, regime)
     preds = {}
     preds['heuristic'] = _heuristic_momentum_return(feats, regime, days_forward)
@@ -2853,8 +2815,11 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
 
     try:
         if X is not None and y is not None:
-            ridge = Ridge(alpha=1.2)
-            ridge.fit(X, y)
+            ridge = Ridge(alpha=1.5)
+            if sw is not None and len(sw) == len(y):
+                ridge.fit(X, y, sample_weight=sw)
+            else:
+                ridge.fit(X, y)
             preds['ridge'] = float(ridge.predict(x_now)[0])
         else:
             preds['ridge'] = preds['heuristic']
@@ -2864,10 +2829,13 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     try:
         if X is not None and y is not None and len(X) >= 40:
             gb = GradientBoostingRegressor(
-                n_estimators=100, max_depth=3, learning_rate=0.05,
-                min_samples_leaf=4, subsample=0.85, random_state=42
+                n_estimators=120, max_depth=3, learning_rate=0.05,
+                min_samples_leaf=5, subsample=0.85, random_state=42
             )
-            gb.fit(X, y)
+            if sw is not None and len(sw) == len(y):
+                gb.fit(X, y, sample_weight=sw)
+            else:
+                gb.fit(X, y)
             preds['gb'] = float(gb.predict(x_now)[0])
         else:
             preds['gb'] = preds['heuristic']
@@ -2884,19 +2852,25 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
         + weights.get('gb', 0.30) * preds['gb']
         + weights.get('heuristic', 0.40) * preds['heuristic']
     )
-    blended *= _model_agreement_penalty(preds)
+    agree = _model_agreement_penalty(preds)
+    blended *= agree
     prior = _historical_drift(df, days_forward)
-    # Mniejszy shrink → mniej systematycznego niedoszacowania wielkości (MAE)
-    shrink_s = 0.28 if days_forward <= 30 else 0.20
+    # przy niskiej zgodności modeli mocniej kotwica historyczna (kierunek z rynku, nie szum ML)
+    shrink_s = 0.28 if days_forward <= 30 else 0.22
+    if agree < 0.75:
+        shrink_s += 0.12
     if regime == 'HIGH_VOL':
         shrink_s += 0.08
     elif regime == 'RANGE':
-        shrink_s += 0.04
-    blended = _shrink_prediction(blended, prior, strength=shrink_s)
+        shrink_s += 0.05
+    blended = _shrink_prediction(blended, prior, strength=min(0.55, shrink_s))
     if regime == 'HIGH_VOL':
         blended *= 0.88
     elif regime == 'RANGE':
         blended *= 0.93
+    # 3M: lekko większy udział dłuższego dryfu (ret60 już w features; tu prior)
+    if days_forward > 30 and abs(prior) >= 0.5:
+        blended = 0.88 * blended + 0.12 * prior
     return float(blended), preds, weights
 
 
@@ -3047,7 +3021,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v2 | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3b | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRALNY", 0.0
     df_clean = df.ffill().bfill()
@@ -3074,30 +3048,38 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
+    # v3b: rozdział 1M vs 3M (jak desktop main)
     if horizon == '1M':
-        tech_w = min(0.72, base_tech + 0.10)
+        tech_w = min(0.74, base_tech + 0.12)
     else:
-        tech_w = max(0.32, base_tech - 0.12)
+        tech_w = max(0.28, base_tech - 0.16)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.82
+        tech_w *= 0.80 if horizon == '1M' else 0.75
     if regime == 'RANGE':
-        tech_w *= 0.88
+        tech_w *= 0.90 if horizon == '1M' else 0.85
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.85, tech_w + 0.08)
+        tech_w = min(0.85, tech_w + (0.06 if horizon == '1M' else 0.04))
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
-        blended_ret *= 1.06
+        blended_ret *= 1.04 if horizon == '1M' else 1.02
 
-    # --- Adaptacyjna kotwica kierunku (Hit% na trudnych spółkach jak TSLA/UNH) ---
     try:
         hist_med = _historical_drift(df_clean, days_forward)
     except Exception:
         hist_med = 0.0
+    try:
+        hist_med_long = _historical_drift(df_clean, min(days_forward * 2, 126)) if horizon == '3M' else hist_med
+    except Exception:
+        hist_med_long = hist_med
 
-    # --- Kotwica v2 (ta, która dawała AAPL ~61/61) ---
-    drift_w = 0.22 if horizon == '1M' else 0.32
-    blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
+    if horizon == '1M':
+        drift_w = 0.20
+        blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
+    else:
+        drift_w = 0.38
+        mix_prior = 0.65 * hist_med + 0.35 * hist_med_long
+        blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
     if regime == 'TREND_UP' and blended_ret < 0:
         blended_ret *= 0.45
@@ -3186,9 +3168,9 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
         return None
 
     # Trochę ostrzejsze progi niż wcześniej (2.0 / 3.5)
-    min_move = 2.5 if days_forward <= 30 else 4.0
+    min_move = 2.0 if days_forward <= 30 else 3.5
     # Prognoza musi być „wyraźna” – inaczej nie liczymy hitu
-    min_pred = 1.5 if days_forward <= 30 else 2.5
+    min_pred = 1.0 if days_forward <= 30 else 2.0
 
     df_clean = df.ffill().bfill()
     n = len(df_clean)
