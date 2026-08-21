@@ -98,7 +98,7 @@ FONT_MONO = ("Consolas", 10)
 # https://twelvedata.com/ — darmowy plan ma limity kredytów
 # ============================================================
 
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_TWELVE_DATA"
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "3de02576d0a142f4ae30a38d8fe08109"
 # kompatybilność ze starym env (opcjonalnie)
 if TWELVE_DATA_API_KEY in ("", "WPISZ_KLUCZ_TWELVE_DATA"):
     TWELVE_DATA_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or TWELVE_DATA_API_KEY
