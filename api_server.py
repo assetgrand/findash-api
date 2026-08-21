@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "twelve-data-v1"
+API_BUILD = "cache1h-keepalive-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -182,8 +182,8 @@ _ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
 # Nie zmienia silnika analizy – tylko woła _analyze_one w tle
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
-_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "600"))  # pełna runda co 10 min
+_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "0") == "1"
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # pełna runda co 10 min
 _PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
 _PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
 _PRECOMPUTE_LOCK = threading.Lock()
@@ -433,35 +433,32 @@ def _startup():
 
 @app.get("/health")
 def health():
-    key_ok = bool(core.POLYGON_API_KEY) and len(core.POLYGON_API_KEY) > 10 and not str(
-        core.POLYGON_API_KEY
-    ).startswith("WPISZ")
-    with _PRECOMPUTE_LOCK:
-        n = len(_PRECOMPUTE)
-    sb_cfg = False
-    sb_extra = None
+    """Minimalny health – nie może wywalić 500 (keepalive / Render)."""
     try:
-        sb_cfg = bool(auth.supabase_configured())
-    except Exception as e:
-        sb_extra = {"error": f"supabase_configured: {e}"}
+        key = getattr(core, "TWELVE_DATA_API_KEY", None) or getattr(core, "POLYGON_API_KEY", "") or ""
+        key_ok = bool(key) and len(str(key)) > 10 and not str(key).startswith("WPISZ")
+    except Exception:
+        key, key_ok = "", False
+    n = 0
+    pre = {}
     try:
-        if hasattr(auth, "supabase_status"):
-            sb_extra = auth.supabase_status()
+        with _PRECOMPUTE_LOCK:
+            n = len(_PRECOMPUTE)
+            pre = dict(_PRECOMPUTE_STATUS)
     except Exception as e:
-        sb_extra = {"error": f"supabase_status: {e}"}
+        pre = {"error": str(e)}
     return {
         "status": "ok",
         "polygon_key_configured": key_ok,
         "twelve_key_configured": key_ok,
-        "ts": int(time.time()),
+        "ts": int(__import__("time").time()),
         "build": API_BUILD,
-        "auth_required": getattr(auth, "AUTH_REQUIRED", False),
-        "supabase_configured": sb_cfg,
-        "supabase": sb_extra,
+        "auth_required": bool(getattr(auth, "AUTH_REQUIRED", False)),
+        "supabase_configured": False,
         "hit_mode": "full",
-        "precompute_enabled": _PRECOMPUTE_ENABLED,
+        "precompute_enabled": bool(_PRECOMPUTE_ENABLED),
         "precompute_entries": n,
-        "precompute_status": dict(_PRECOMPUTE_STATUS),
+        "precompute_status": pre,
     }
 
 

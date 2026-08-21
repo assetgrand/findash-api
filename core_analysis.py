@@ -98,7 +98,7 @@ FONT_MONO = ("Consolas", 10)
 # https://twelvedata.com/ — darmowy plan ma limity kredytów
 # ============================================================
 
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "3de02576d0a142f4ae30a38d8fe08109"
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_TWELVE_DATA"
 # kompatybilność ze starym env (opcjonalnie)
 if TWELVE_DATA_API_KEY in ("", "WPISZ_KLUCZ_TWELVE_DATA"):
     TWELVE_DATA_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or TWELVE_DATA_API_KEY
@@ -122,7 +122,7 @@ def _cache_get(key):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(minutes=5):
+            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=1):  # cache 1h – mniej kredytów Twelve
                 return data['data']
         except Exception:
             pass
