@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "cache1h-keepalive-v1"
+API_BUILD = "gov-latest-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -878,8 +878,10 @@ def gov_contracts(
     limit: int = Query(25, ge=1, le=100),
     page: int = Query(1, ge=1, le=50),
     min_amount: Optional[float] = Query(None, ge=0, description="Minimalna kwota kontraktu USD"),
+    sort: str = Query("Start Date", description="Start Date | Award Amount | End Date"),
+    order: str = Query("desc", description="desc = najnowsze / największe pierwsze"),
 ):
-    """Przyznane kontrakty federalne USA (USASpending.gov) – publiczne, bez auth."""
+    """Przyznane kontrakty federalne USA. Bez q/company = lista najnowszych w okresie."""
     keywords = [q] if q and q.strip() else None
     data = gov.search_awarded_contracts(
         keywords=keywords,
@@ -888,7 +890,21 @@ def gov_contracts(
         limit=limit,
         page=page,
         min_amount=min_amount,
+        sort_by=sort,
+        order=order,
     )
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
+    return data
+
+
+@app.get("/gov/contracts/latest")
+def gov_contracts_latest(
+    days: int = Query(30, ge=1, le=365, description="Ile dni wstecz"),
+    limit: int = Query(40, ge=1, le=100),
+):
+    """Najnowsze przyznane kontrakty federalne (lista pod zakładkę Kontrakty USA)."""
+    data = gov.latest_awarded_contracts(days=days, limit=limit)
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
     return data
@@ -915,7 +931,8 @@ def root():
         "endpoints": [
             "GET /health",
             "GET /me",
-            "GET /gov/contracts?q=&company=&days=30",
+            "GET /gov/contracts?days=30&limit=40",
+            "GET /gov/contracts/latest?days=30",
             "GET /gov/contracts/company/{name}",
             "GET /plans",
             "GET /tickers",
