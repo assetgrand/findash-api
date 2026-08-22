@@ -73,6 +73,8 @@ def search_awarded_contracts(
     limit: int = 25,
     page: int = 1,
     min_amount: Optional[float] = None,
+    sort_by: str = "Start Date",
+    order: str = "desc",
 ) -> Dict[str, Any]:
     """
     Szuka przyznanych kontraktów (nie grantów).
@@ -110,11 +112,14 @@ def search_awarded_contracts(
             {"lower_bound": float(min_amount)}
         ]
 
+    # "Start Date" desc = najnowsze kontrakty; "Award Amount" = największe
+    sort_field = sort_by if sort_by in ("Start Date", "Award Amount", "End Date") else "Start Date"
+    ord_ = order if order in ("asc", "desc") else "desc"
     payload = {
         "filters": filters,
         "fields": DEFAULT_FIELDS,
-        "sort": "Award Amount",
-        "order": "desc",
+        "sort": sort_field,
+        "order": ord_,
         "page": page,
         "limit": limit,
     }
@@ -215,4 +220,17 @@ def search_by_company_name(name: str, days: int = 365, limit: int = 25) -> Dict[
         days=days,
         limit=limit,
         page=1,
+    )
+
+
+def latest_awarded_contracts(days: int = 30, limit: int = 40) -> Dict[str, Any]:
+    """Lista najnowszych przyznanych kontraktów federalnych (bez filtra słowa kluczowego)."""
+    return search_awarded_contracts(
+        keywords=None,
+        recipient_name=None,
+        days=days,
+        limit=limit,
+        page=1,
+        sort_by="Start Date",
+        order="desc",
     )
