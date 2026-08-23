@@ -436,17 +436,258 @@ def get_financial_ratios(ticker):
                 ratios[k] = None
     return ratios
 
-def get_company_fundamentals(ticker):
-    """Zwraca wskaźniki fundamentalne w jednym słowniku (Twelve Data)."""
+
+# ============================================================
+# SEC EDGAR – company facts (publiczne US, bez Yahoo/FMP)
+# SEC wymaga User-Agent – ustaw SEC_USER_AGENT w env (email)
+# ============================================================
+
+_SEC_UA = os.environ.get(
+    "SEC_USER_AGENT",
+    "AssetCoreAlpha/1.0 (research; contact@assetcore.local)",
+)
+_SEC_TICKERS_CACHE = None
+_SEC_TICKERS_TS = 0.0
+
+
+def _sec_get(url: str, timeout: int = 30):
+    headers = {
+        "User-Agent": _SEC_UA,
+        "Accept": "application/json",
+    }
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 429:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"SEC request fail ({attempt+1}): {e}")
+            time.sleep(0.8)
+    return None
+
+
+def _sec_ticker_to_cik(ticker: str):
+    """Mapuje ticker → CIK (10 cyfr). Cache 24h."""
+    global _SEC_TICKERS_CACHE, _SEC_TICKERS_TS
+    sym = _normalize_symbol(ticker).split("/")[0].upper().replace(".", "-")
+    now = time.time()
+    if _SEC_TICKERS_CACHE is None or (now - _SEC_TICKERS_TS) > 86400:
+        cache_path = os.path.join(_CACHE_DIR, "sec_company_tickers.json")
+        data = None
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    blob = json.load(f)
+                if time.time() - blob.get("_ts", 0) < 86400:
+                    data = blob.get("data")
+            except Exception:
+                data = None
+        if data is None:
+            data = _sec_get("https://www.sec.gov/files/company_tickers.json")
+            if data:
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump({"_ts": time.time(), "data": data}, f)
+                except Exception:
+                    pass
+        if not data:
+            return None
+        mapping = {}
+        if isinstance(data, dict):
+            for row in data.values():
+                if not isinstance(row, dict):
+                    continue
+                t = str(row.get("ticker") or "").upper()
+                cik = row.get("cik_str")
+                if t and cik is not None:
+                    mapping[t] = int(cik)
+        _SEC_TICKERS_CACHE = mapping
+        _SEC_TICKERS_TS = now
+    cik = (_SEC_TICKERS_CACHE or {}).get(sym)
+    if cik is None:
+        return None
+    return f"{int(cik):010d}"
+
+
+def _sec_latest_fact(facts_gaap: dict, tag_names: list):
+    """Najnowsza wartość liczbowa z listy tagów US-GAAP."""
+    if not facts_gaap:
+        return None
+    best_val = None
+    best_end = ""
+    for tag in tag_names:
+        node = facts_gaap.get(tag)
+        if not node or not isinstance(node, dict):
+            continue
+        units = node.get("units") or {}
+        series = None
+        for unit_key in ("USD", "USD/shares", "pure", "shares"):
+            if unit_key in units:
+                series = units[unit_key]
+                break
+        if series is None and units:
+            series = next(iter(units.values()))
+        if not series:
+            continue
+        for row in series:
+            if not isinstance(row, dict):
+                continue
+            end = str(row.get("end") or row.get("filed") or "")
+            val = row.get("val")
+            if val is None:
+                continue
+            try:
+                fv = float(val)
+            except Exception:
+                continue
+            if end >= best_end:
+                best_end = end
+                best_val = fv
+    return best_val
+
+
+def _fundamentals_nonempty(fund: dict) -> bool:
+    if not fund:
+        return False
+    keys = ("P/E", "P/S", "P/B", "ROE", "EPS (Trailing)", "Profit Margin", "Market Cap", "Total Revenue")
+    return any(fund.get(k) is not None for k in keys)
+
+
+def _edgar_fundamentals(ticker: str) -> dict:
+    """
+    Fundamenty z SEC company facts + cena Twelve (P/E, P/S, P/B).
+    Tylko spółki US z CIK.
+    """
+    cik = _sec_ticker_to_cik(ticker)
+    if not cik:
+        print(f"EDGAR: brak CIK dla {ticker}")
+        return {}
+    cache_key = _cache_key("edgar_facts", cik)
+    facts = _cache_get(cache_key)
+    if facts is None:
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        facts = _sec_get(url)
+        if facts:
+            _cache_set(cache_key, facts)
+        time.sleep(0.15)
+    if not facts or not isinstance(facts, dict):
+        return {}
+    gaap = (facts.get("facts") or {}).get("us-gaap") or {}
+    if not gaap:
+        gaap = (facts.get("facts") or {}).get("ifrs-full") or {}
+
+    revenue = _sec_latest_fact(gaap, [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+    ])
+    net_income = _sec_latest_fact(gaap, [
+        "NetIncomeLoss",
+        "ProfitLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+    ])
+    assets = _sec_latest_fact(gaap, ["Assets"])
+    equity = _sec_latest_fact(gaap, [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        "Equity",
+    ])
+    eps = _sec_latest_fact(gaap, [
+        "EarningsPerShareDiluted",
+        "EarningsPerShareBasic",
+    ])
+    gross_profit = _sec_latest_fact(gaap, ["GrossProfit"])
+    operating_income = _sec_latest_fact(gaap, ["OperatingIncomeLoss"])
+    liabilities = _sec_latest_fact(gaap, ["Liabilities"])
+    current_assets = _sec_latest_fact(gaap, ["AssetsCurrent"])
+    current_liab = _sec_latest_fact(gaap, ["LiabilitiesCurrent"])
+
+    out = {
+        "Net Income": net_income,
+        "Total Revenue": revenue,
+        "Total Assets": assets,
+        "EPS (Trailing)": eps,
+        "_source": "sec_edgar",
+        "_cik": cik,
+    }
+
+    if net_income is not None and equity not in (None, 0):
+        try:
+            out["ROE"] = (float(net_income) / float(equity)) * 100.0
+        except Exception:
+            pass
+    if net_income is not None and assets not in (None, 0):
+        try:
+            out["ROA"] = (float(net_income) / float(assets)) * 100.0
+        except Exception:
+            pass
+    if net_income is not None and revenue not in (None, 0):
+        try:
+            out["Profit Margin"] = (float(net_income) / float(revenue)) * 100.0
+        except Exception:
+            pass
+    if gross_profit is not None and revenue not in (None, 0):
+        try:
+            out["Gross Margin"] = (float(gross_profit) / float(revenue)) * 100.0
+        except Exception:
+            pass
+    if operating_income is not None and revenue not in (None, 0):
+        try:
+            out["Operating Margin"] = (float(operating_income) / float(revenue)) * 100.0
+        except Exception:
+            pass
+    if current_assets is not None and current_liab not in (None, 0):
+        try:
+            out["Current Ratio"] = float(current_assets) / float(current_liab)
+        except Exception:
+            pass
+    if liabilities is not None and equity not in (None, 0):
+        try:
+            out["Debt/Equity"] = float(liabilities) / float(equity)
+        except Exception:
+            pass
+
     try:
-        profile = get_company_profile(ticker)
-        metrics = get_key_metrics(ticker)
-        ratios = get_financial_ratios(ticker)
+        price = get_live_price(ticker)
+        if price and eps and float(eps) != 0:
+            out["P/E"] = float(price) / float(eps)
+        shares = _sec_latest_fact(gaap, [
+            "CommonStockSharesOutstanding",
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+            "EntityCommonStockSharesOutstanding",
+        ])
+        if price and shares:
+            mcap = float(price) * float(shares)
+            out["Market Cap"] = mcap
+            if revenue and float(revenue) != 0:
+                out["P/S"] = mcap / float(revenue)
+            if equity and float(equity) != 0:
+                out["P/B"] = mcap / float(equity)
+    except Exception:
+        pass
+
+    return {k: v for k, v in out.items() if v is not None or str(k).startswith("_")}
+
+
+
+def get_company_fundamentals(ticker):
+    """
+    Fundamenty: Twelve Data (profile/statistics), potem SEC EDGAR
+    gdy Twelve zwraca pusto (typowe na free/starter bez statistics).
+    Bez Yahoo / FMP.
+    """
+    try:
+        profile = get_company_profile(ticker) or {}
+        metrics = get_key_metrics(ticker) or {}
+        ratios = get_financial_ratios(ticker) or {}
     except Exception as e:
-        print(f"Błąd Twelve Data dla {ticker}: {e}")
-        return None
-    if not profile:
-        return None
+        print(f"Błąd Twelve Data fundamentals dla {ticker}: {e}")
+        profile, metrics, ratios = {}, {}, {}
+
     fundamentals = {
         "P/E": profile.get("pe_ratio"),
         "PEG": metrics.get("pegRatio"),
@@ -466,7 +707,7 @@ def get_company_fundamentals(ticker):
         "Quick Ratio": ratios.get("quickRatio"),
         "EBITDA": metrics.get("ebitda"),
         "Free Cash Flow": metrics.get("freeCashFlow"),
-        "EPS (Trailing)": metrics.get("eps"),
+        "EPS (Trailing)": metrics.get("eps") or profile.get("eps"),
         "EPS (Forward)": metrics.get("epsForward"),
         "Market Cap": profile.get("MarketCapitalization"),
         "Enterprise Value": profile.get("EnterpriseValue"),
@@ -478,16 +719,26 @@ def get_company_fundamentals(ticker):
         "Beta": profile.get("Beta"),
         "52Week High": profile.get("52WeekHigh"),
         "52Week Low": profile.get("52WeekLow"),
+        "_source": "twelve_data",
     }
-    for key in ["ROE", "ROA", "Gross Margin", "Profit Margin", "Operating Margin"]:
-        if fundamentals.get(key) is not None:
-            try:
-                v = float(fundamentals[key])
-                if abs(v) <= 1.5:
-                    fundamentals[key] = v * 100
-            except Exception:
-                pass
-    for key in ["Revenue Growth", "Earnings Growth"]:
+
+    if not _fundamentals_nonempty(fundamentals):
+        try:
+            edgar = _edgar_fundamentals(ticker)
+        except Exception as e:
+            print(f"EDGAR error {ticker}: {e}")
+            edgar = {}
+        if edgar and _fundamentals_nonempty(edgar):
+            for k, v in edgar.items():
+                if v is not None and (fundamentals.get(k) is None or str(k).startswith("_")):
+                    fundamentals[k] = v
+            fundamentals["_source"] = "sec_edgar"
+            print(f"Fundamentals {ticker}: SEC EDGAR (CIK {edgar.get('_cik', '?')})")
+        else:
+            print(f"Fundamentals {ticker}: brak danych (Twelve puste, EDGAR puste/brak CIK)")
+
+    for key in ["ROE", "ROA", "Gross Margin", "Profit Margin", "Operating Margin",
+                "Revenue Growth", "Earnings Growth", "Dividend Yield"]:
         if fundamentals.get(key) is not None:
             try:
                 v = float(fundamentals[key])
@@ -496,6 +747,7 @@ def get_company_fundamentals(ticker):
             except Exception:
                 pass
     return fundamentals
+
 
 def _to_scalar(val, default=0.0):
     if val is None:
