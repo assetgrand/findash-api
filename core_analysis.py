@@ -438,8 +438,8 @@ def get_financial_ratios(ticker):
 
 
 # ============================================================
-# SEC EDGAR – company facts (publiczne US, bez Yahoo/FMP)
-# SEC wymaga User-Agent – ustaw SEC_USER_AGENT w env (email)
+# SEC EDGAR – fallback fundamentów (publiczne US)
+# Nie rusza frontu. Przy imporcie nie woła sieci.
 # ============================================================
 
 _SEC_UA = os.environ.get(
@@ -451,10 +451,7 @@ _SEC_TICKERS_TS = 0.0
 
 
 def _sec_get(url: str, timeout: int = 30):
-    headers = {
-        "User-Agent": _SEC_UA,
-        "Accept": "application/json",
-    }
+    headers = {"User-Agent": _SEC_UA, "Accept": "application/json"}
     for attempt in range(3):
         try:
             resp = requests.get(url, headers=headers, timeout=timeout)
@@ -470,7 +467,6 @@ def _sec_get(url: str, timeout: int = 30):
 
 
 def _sec_ticker_to_cik(ticker: str):
-    """Mapuje ticker → CIK (10 cyfr). Cache 24h."""
     global _SEC_TICKERS_CACHE, _SEC_TICKERS_TS
     sym = _normalize_symbol(ticker).split("/")[0].upper().replace(".", "-")
     now = time.time()
@@ -481,7 +477,7 @@ def _sec_ticker_to_cik(ticker: str):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     blob = json.load(f)
-                if time.time() - blob.get("_ts", 0) < 86400:
+                if time.time() - float(blob.get("_ts", 0)) < 86400:
                     data = blob.get("data")
             except Exception:
                 data = None
@@ -513,11 +509,9 @@ def _sec_ticker_to_cik(ticker: str):
 
 
 def _sec_latest_fact(facts_gaap: dict, tag_names: list):
-    """Najnowsza wartość liczbowa z listy tagów US-GAAP."""
     if not facts_gaap:
         return None
-    best_val = None
-    best_end = ""
+    best_val, best_end = None, ""
     for tag in tag_names:
         node = facts_gaap.get(tag)
         if not node or not isinstance(node, dict):
@@ -529,7 +523,7 @@ def _sec_latest_fact(facts_gaap: dict, tag_names: list):
                 series = units[unit_key]
                 break
         if series is None and units:
-            series = next(iter(units.values()))
+            series = next(iter(units.values()), None)
         if not series:
             continue
         for row in series:
@@ -544,21 +538,11 @@ def _sec_latest_fact(facts_gaap: dict, tag_names: list):
             except Exception:
                 continue
             if end >= best_end:
-                best_end = end
-                best_val = fv
+                best_end, best_val = end, fv
     return best_val
 
 
-def _fundamentals_nonempty(fund: dict) -> bool:
-    if not fund:
-        return False
-    keys = ("P/E", "P/S", "P/B", "ROE", "EPS (Trailing)", "Profit Margin", "Market Cap", "Total Revenue")
-    return any(fund.get(k) is not None for k in keys)
-
-
-
 def _sec_two_periods(facts_gaap: dict, tag_names: list):
-    """(latest, previous) po dacie end – YoY growth."""
     if not facts_gaap:
         return None, None
     points = []
@@ -573,7 +557,7 @@ def _sec_two_periods(facts_gaap: dict, tag_names: list):
                 series = units[unit_key]
                 break
         if series is None and units:
-            series = next(iter(units.values()))
+            series = next(iter(units.values()), None)
         if not series:
             continue
         for row in series:
@@ -602,16 +586,17 @@ def _sec_two_periods(facts_gaap: dict, tag_names: list):
         uniq.append((end, fv))
     if not uniq:
         return None, None
-    latest = uniq[0][1]
-    prev = uniq[1][1] if len(uniq) > 1 else None
-    return latest, prev
+    return uniq[0][1], (uniq[1][1] if len(uniq) > 1 else None)
+
+
+def _fundamentals_nonempty(fund: dict) -> bool:
+    if not fund:
+        return False
+    keys = ("P/E", "P/S", "P/B", "ROE", "EPS (Trailing)", "Profit Margin", "Market Cap", "Total Revenue")
+    return any(fund.get(k) is not None for k in keys)
 
 
 def _edgar_fundamentals(ticker: str) -> dict:
-    """
-    Fundamenty z SEC company facts + cena Twelve (P/E, P/S, P/B).
-    Tylko spółki US z CIK.
-    """
     cik = _sec_ticker_to_cik(ticker)
     if not cik:
         print(f"EDGAR: brak CIK dla {ticker}")
@@ -619,8 +604,7 @@ def _edgar_fundamentals(ticker: str) -> dict:
     cache_key = _cache_key("edgar_facts", cik)
     facts = _cache_get(cache_key)
     if facts is None:
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        facts = _sec_get(url)
+        facts = _sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
         if facts:
             _cache_set(cache_key, facts)
         time.sleep(0.15)
@@ -631,26 +615,18 @@ def _edgar_fundamentals(ticker: str) -> dict:
         gaap = (facts.get("facts") or {}).get("ifrs-full") or {}
 
     revenue = _sec_latest_fact(gaap, [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "Revenues",
-        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
     ])
     net_income = _sec_latest_fact(gaap, [
-        "NetIncomeLoss",
-        "ProfitLoss",
-        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic",
     ])
     assets = _sec_latest_fact(gaap, ["Assets"])
     equity = _sec_latest_fact(gaap, [
         "StockholdersEquity",
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-        "Equity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "Equity",
     ])
-    eps = _sec_latest_fact(gaap, [
-        "EarningsPerShareDiluted",
-        "EarningsPerShareBasic",
-    ])
+    eps = _sec_latest_fact(gaap, ["EarningsPerShareDiluted", "EarningsPerShareBasic"])
     gross_profit = _sec_latest_fact(gaap, ["GrossProfit"])
     operating_income = _sec_latest_fact(gaap, ["OperatingIncomeLoss"])
     liabilities = _sec_latest_fact(gaap, ["Liabilities"])
@@ -661,14 +637,9 @@ def _edgar_fundamentals(ticker: str) -> dict:
         "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
     ])
     rev_latest, rev_prev = _sec_two_periods(gaap, [
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "Revenues",
-        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
     ])
-    ni_latest, ni_prev = _sec_two_periods(gaap, [
-        "NetIncomeLoss",
-        "ProfitLoss",
-    ])
+    ni_latest, ni_prev = _sec_two_periods(gaap, ["NetIncomeLoss", "ProfitLoss"])
 
     out = {
         "Net Income": net_income,
@@ -678,59 +649,31 @@ def _edgar_fundamentals(ticker: str) -> dict:
         "_source": "sec_edgar",
         "_cik": cik,
     }
-
-    if net_income is not None and equity not in (None, 0):
-        try:
+    try:
+        if net_income is not None and equity not in (None, 0):
             out["ROE"] = (float(net_income) / float(equity)) * 100.0
-        except Exception:
-            pass
-    if net_income is not None and assets not in (None, 0):
-        try:
+        if net_income is not None and assets not in (None, 0):
             out["ROA"] = (float(net_income) / float(assets)) * 100.0
-        except Exception:
-            pass
-    if net_income is not None and revenue not in (None, 0):
-        try:
+        if net_income is not None and revenue not in (None, 0):
             out["Profit Margin"] = (float(net_income) / float(revenue)) * 100.0
-        except Exception:
-            pass
-    if gross_profit is not None and revenue not in (None, 0):
-        try:
+        if gross_profit is not None and revenue not in (None, 0):
             out["Gross Margin"] = (float(gross_profit) / float(revenue)) * 100.0
-        except Exception:
-            pass
-    if operating_income is not None and revenue not in (None, 0):
-        try:
+        if operating_income is not None and revenue not in (None, 0):
             out["Operating Margin"] = (float(operating_income) / float(revenue)) * 100.0
-        except Exception:
-            pass
-    if current_assets is not None and current_liab not in (None, 0):
-        try:
+        if current_assets is not None and current_liab not in (None, 0):
             out["Current Ratio"] = float(current_assets) / float(current_liab)
-        except Exception:
-            pass
-    if liabilities is not None and equity not in (None, 0):
-        try:
+        if liabilities is not None and equity not in (None, 0):
             out["Debt/Equity"] = float(liabilities) / float(equity)
-        except Exception:
-            pass
-    if rnd is not None:
-        out["ResearchAndDevelopment"] = rnd
-        if revenue not in (None, 0):
-            try:
+        if rnd is not None:
+            out["ResearchAndDevelopment"] = rnd
+            if revenue not in (None, 0):
                 out["RnD_to_Revenue"] = float(rnd) / float(revenue)
-            except Exception:
-                pass
-    if rev_latest is not None and rev_prev not in (None, 0):
-        try:
+        if rev_latest is not None and rev_prev not in (None, 0):
             out["Revenue Growth"] = (float(rev_latest) / float(rev_prev) - 1.0) * 100.0
-        except Exception:
-            pass
-    if ni_latest is not None and ni_prev not in (None, 0):
-        try:
+        if ni_latest is not None and ni_prev not in (None, 0):
             out["Earnings Growth"] = (float(ni_latest) / float(ni_prev) - 1.0) * 100.0
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"EDGAR ratio calc: {e}")
 
     try:
         price = get_live_price(ticker)
@@ -754,19 +697,14 @@ def _edgar_fundamentals(ticker: str) -> dict:
     return {k: v for k, v in out.items() if v is not None or str(k).startswith("_")}
 
 
-
 def get_company_fundamentals(ticker):
-    """
-    Fundamenty: Twelve Data (profile/statistics), potem SEC EDGAR
-    gdy Twelve zwraca pusto (typowe na free/starter bez statistics).
-    Bez Yahoo / FMP.
-    """
+    """Twelve Data; gdy pusto → SEC EDGAR. Bez Yahoo/FMP."""
     try:
         profile = get_company_profile(ticker) or {}
         metrics = get_key_metrics(ticker) or {}
         ratios = get_financial_ratios(ticker) or {}
     except Exception as e:
-        print(f"Błąd Twelve Data fundamentals dla {ticker}: {e}")
+        print(f"Błąd Twelve fundamentals {ticker}: {e}")
         profile, metrics, ratios = {}, {}, {}
 
     fundamentals = {
@@ -805,18 +743,18 @@ def get_company_fundamentals(ticker):
 
     if not _fundamentals_nonempty(fundamentals):
         try:
-            edgar = _edgar_fundamentals(ticker)
+            edgar_f = _edgar_fundamentals(ticker)
         except Exception as e:
             print(f"EDGAR error {ticker}: {e}")
-            edgar = {}
-        if edgar and _fundamentals_nonempty(edgar):
-            for k, v in edgar.items():
+            edgar_f = {}
+        if edgar_f and _fundamentals_nonempty(edgar_f):
+            for k, v in edgar_f.items():
                 if v is not None and (fundamentals.get(k) is None or str(k).startswith("_")):
                     fundamentals[k] = v
             fundamentals["_source"] = "sec_edgar"
-            print(f"Fundamentals {ticker}: SEC EDGAR (CIK {edgar.get('_cik', '?')})")
+            print(f"Fundamentals {ticker}: SEC EDGAR (CIK {edgar_f.get('_cik', '?')})")
         else:
-            print(f"Fundamentals {ticker}: brak danych (Twelve puste, EDGAR puste/brak CIK)")
+            print(f"Fundamentals {ticker}: brak danych (Twelve+EDGAR)")
 
     for key in ["ROE", "ROA", "Gross Margin", "Profit Margin", "Operating Margin",
                 "Revenue Growth", "Earnings Growth", "Dividend Yield"]:
@@ -1591,168 +1529,134 @@ def calculate_sector_fundamental_score(fundamentals, sector):
     return round(final_score, 2)
 
 # ============================================================
-# NOWE WSKAŹNIKI PRZYSZŁOŚCIOWE (EDGAR / darmowe źródła)
+# NOWE WSKAŹNIKI PRZYSZŁOŚCIOWE
 # ============================================================
 
 def get_innovation_score(ticker):
-    """R&D intensity z EDGAR. Brak danych → None."""
     try:
-        fund = get_company_fundamentals(ticker) or {}
-        revenue = fund.get("Total Revenue")
-        rnd = fund.get("ResearchAndDevelopment")
-        ratio = fund.get("RnD_to_Revenue")
-        if ratio is None and revenue and rnd is not None and float(revenue) > 0:
-            ratio = float(rnd) / float(revenue)
-        if ratio is None:
-            return None
-        ratio = float(ratio)
-        if ratio > 0.15:
-            score = 85
-        elif ratio > 0.08:
-            score = 70
-        elif ratio > 0.03:
-            score = 55
-        elif ratio > 0.01:
-            score = 40
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        revenue = float(profile.get('TotalRevenue', 0)) if profile.get('TotalRevenue') else 0
+        rnd = float(profile.get('ResearchAndDevelopment', 0)) if profile.get('ResearchAndDevelopment') else 0
+        capex = float(profile.get('CapitalExpenditures', 0)) if profile.get('CapitalExpenditures') else 0
+        if revenue and revenue > 0:
+            rnd_ratio = rnd / revenue
+            capex_ratio = abs(capex) / revenue
         else:
-            score = 25
-        return int(min(100, score))
-    except Exception:
-        return None
-
+            return 50
+        score = 0
+        if rnd_ratio > 0.15: score += 60
+        elif rnd_ratio > 0.08: score += 40
+        elif rnd_ratio > 0.03: score += 20
+        else: score += 10
+        if capex_ratio > 0.08: score += 30
+        elif capex_ratio > 0.04: score += 20
+        else: score += 10
+        return min(score, 100)
+    except:
+        return 50
 
 def get_analyst_revision_momentum(ticker):
-    """Feed analityków – niedostępne za free."""
-    return None
-
+    try:
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        eps_change = profile.get('EPSChange', 0)
+        if eps_change:
+            eps_change = float(eps_change)
+            if eps_change > 10: return 80
+            elif eps_change > 5: return 70
+            elif eps_change > 0: return 60
+            elif eps_change > -5: return 40
+            else: return 20
+        return 50
+    except:
+        return 50
 
 def get_recommendation_momentum(ticker):
-    """Consensus / target – niedostępne za free."""
-    return None
-
+    try:
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        analyst_target = profile.get('AnalystTargetPrice')
+        current_price = get_live_price(ticker)
+        if analyst_target and current_price and current_price > 0:
+            upside = (float(analyst_target) - current_price) / current_price * 100
+            if upside > 20: return 80
+            elif upside > 10: return 70
+            elif upside > 5: return 60
+            elif upside > -5: return 40
+            else: return 20
+        return 50
+    except:
+        return 50
 
 def get_management_quality(ticker):
-    """ROE + profit margin z fundamentów (EDGAR)."""
     try:
-        fund = get_company_fundamentals(ticker) or {}
-        roe = fund.get("ROE")
-        pm = fund.get("Profit Margin")
-        if roe is None and pm is None:
-            return None
-        scores = []
-        if roe is not None:
-            r = float(roe)
-            if abs(r) <= 1.5:
-                r *= 100
-            if r > 25:
-                scores.append(85)
-            elif r > 20:
-                scores.append(75)
-            elif r > 15:
-                scores.append(65)
-            elif r > 10:
-                scores.append(55)
-            elif r > 5:
-                scores.append(45)
-            elif r > 0:
-                scores.append(35)
-            else:
-                scores.append(20)
-        if pm is not None:
-            p = float(pm)
-            if abs(p) <= 1.5:
-                p *= 100
-            if p > 20:
-                scores.append(80)
-            elif p > 12:
-                scores.append(70)
-            elif p > 6:
-                scores.append(55)
-            elif p > 0:
-                scores.append(40)
-            else:
-                scores.append(25)
-        return int(sum(scores) / len(scores))
-    except Exception:
-        return None
-
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        roe = float(profile.get('ROE', 0)) if profile.get('ROE') else 0
+        roe = roe * 100 if abs(roe) < 10 else roe
+        if roe > 25: return 80
+        elif roe > 20: return 70
+        elif roe > 15: return 60
+        elif roe > 10: return 50
+        elif roe > 5: return 40
+        else: return 30
+    except:
+        return 50
 
 def get_growth_momentum(ticker):
-    """YoY revenue/earnings growth z EDGAR."""
     try:
-        fund = get_company_fundamentals(ticker) or {}
-        rg = fund.get("Revenue Growth")
-        eg = fund.get("Earnings Growth")
-        if rg is None and eg is None:
-            return None
-        scores = []
-        for g in (rg, eg):
-            if g is None:
-                continue
-            v = float(g)
-            if abs(v) <= 1.5:
-                v *= 100
-            if v > 25:
-                scores.append(90)
-            elif v > 15:
-                scores.append(80)
-            elif v > 8:
-                scores.append(70)
-            elif v > 0:
-                scores.append(55)
-            elif v > -10:
-                scores.append(40)
-            else:
-                scores.append(25)
-        return int(sum(scores) / len(scores)) if scores else None
-    except Exception:
-        return None
-
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        rev_growth = profile.get('RevenueGrowth', 0)
+        eps_growth = profile.get('EarningsGrowth', 0)
+        if rev_growth:
+            rev_growth = float(rev_growth) * 100 if abs(float(rev_growth)) < 10 else float(rev_growth)
+        else:
+            rev_growth = 0
+        if eps_growth:
+            eps_growth = float(eps_growth) * 100 if abs(float(eps_growth)) < 10 else float(eps_growth)
+        else:
+            eps_growth = 0
+        avg_growth = (rev_growth + eps_growth) / 2
+        if avg_growth > 30: return 80
+        elif avg_growth > 20: return 70
+        elif avg_growth > 10: return 60
+        elif avg_growth > 0: return 50
+        elif avg_growth > -10: return 40
+        else: return 30
+    except:
+        return 50
 
 def get_risk_assessment(ticker):
-    """Beta (profil) + Debt/Equity (EDGAR). Wyższy = niższe ryzyko."""
     try:
-        fund = get_company_fundamentals(ticker) or {}
-        profile = get_company_profile(ticker) or {}
-        beta = profile.get("Beta")
-        if beta is None:
-            beta = fund.get("Beta")
-        de = fund.get("Debt/Equity")
-        if beta is None and de is None:
-            return None
-        parts = []
-        if beta is not None:
-            b = float(beta)
-            if b < 0.8:
-                parts.append(80)
-            elif b < 1.0:
-                parts.append(70)
-            elif b < 1.2:
-                parts.append(60)
-            elif b < 1.5:
-                parts.append(50)
-            elif b < 2.0:
-                parts.append(40)
-            else:
-                parts.append(30)
-        if de is not None:
-            d = float(de)
-            if d < 0.3:
-                parts.append(80)
-            elif d < 0.6:
-                parts.append(70)
-            elif d < 1.0:
-                parts.append(60)
-            elif d < 1.5:
-                parts.append(50)
-            elif d < 2.5:
-                parts.append(40)
-            else:
-                parts.append(30)
-        return int(sum(parts) / len(parts))
-    except Exception:
-        return None
-
+        profile = get_company_profile(ticker)
+        if not profile:
+            return 50
+        beta = float(profile.get('Beta', 1)) if profile.get('Beta') else 1
+        de_ratio = float(profile.get('Debt/Equity', 0)) if profile.get('Debt/Equity') else 0
+        beta_score = 0
+        if beta < 0.8: beta_score = 80
+        elif beta < 1.0: beta_score = 70
+        elif beta < 1.2: beta_score = 60
+        elif beta < 1.5: beta_score = 50
+        elif beta < 2.0: beta_score = 40
+        else: beta_score = 30
+        de_score = 0
+        if de_ratio < 0.3: de_score = 80
+        elif de_ratio < 0.6: de_score = 70
+        elif de_ratio < 1.0: de_score = 60
+        elif de_ratio < 1.5: de_score = 50
+        elif de_ratio < 2.5: de_score = 40
+        else: de_score = 30
+        return int(beta_score * 0.6 + de_score * 0.4)
+    except:
+        return 50
 
 def get_short_interest_boost(ticker):
     return 1.0
@@ -1826,29 +1730,18 @@ def get_comprehensive_fundamental_analysis(ticker):
     analyst_revision_score = get_analyst_revision_momentum(ticker)
     recommendation_momentum_score = get_recommendation_momentum(ticker)
 
-    def _nz(x):
-        return x is not None
-
     if company_fundamentals:
         basic_company_score = calculate_sector_fundamental_score(company_fundamentals, sector)
-        # Wagi tylko dla dostępnych score'ów (None = brak darmowych danych, nie fałszywe 50)
-        parts = [
-            (basic_company_score, 0.35),
-            (sector_position_score, 0.10),
-        ]
-        for sc, w in (
-            (management_quality_score, 0.13),
-            (growth_momentum_score, 0.12),
-            (risk_assessment_score, 0.10),
-            (innovation_score, 0.10),
-            (analyst_revision_score, 0.05),
-            (recommendation_momentum_score, 0.05),
-        ):
-            if _nz(sc):
-                parts.append((float(sc), w))
-        wsum = sum(w for _, w in parts) or 1.0
-        comprehensive_company_score = sum(float(s) * w for s, w in parts) / wsum
-
+        comprehensive_company_score = (
+            basic_company_score * 0.35 +
+            sector_position_score * 0.10 +
+            management_quality_score * 0.13 +
+            growth_momentum_score * 0.12 +
+            risk_assessment_score * 0.10 +
+            innovation_score * 0.10 +
+            analyst_revision_score * 0.05 +
+            recommendation_momentum_score * 0.05
+        )
         # Przy niepełnych fundach spółki nie karz makro (free plan / braki API)
         missing_ratio = 0.0
         try:
