@@ -2602,38 +2602,74 @@ def _build_training_set(df, horizon_days, max_samples=200):
 
 
 def _heuristic_momentum_return(feats, regime, days_forward):
+    """
+    Heurystyka kierunku v4 – mniej mean-reversion przeciw trendowi (Hit%↑).
+    1M: mom średni (ret10/20) + zgodność. 3M: więcej ret20/60 + slope SMA.
+    """
     scale = days_forward / 21.0
-    mom = 0.25 * feats['ret5'] + 0.35 * feats['ret10'] + 0.25 * feats['ret20'] + 0.15 * feats.get('ret60', 0.0)
-    if feats.get('mom_agree', 0) > 0:
-        mom *= 1.12
-    mr = 0.0
-    if feats['rsi'] > 70:
-        mr -= (feats['rsi'] - 70) * 0.18
-    elif feats['rsi'] < 30:
-        mr += (30 - feats['rsi']) * 0.18
-    if feats['pct_b'] > 0.95:
-        mr -= 1.8
-    elif feats['pct_b'] < 0.05:
-        mr += 1.8
-    if feats.get('stoch_k', 50) > 80:
-        mr -= 0.8
-    elif feats.get('stoch_k', 50) < 20:
-        mr += 0.8
-    slope = feats.get('sma_slope', 0.0)
-    if regime == 'TREND_UP':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
-        if feats['macd_hist'] > 0:
-            pred += 0.5 * scale
-    elif regime == 'TREND_DOWN':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
-        if feats['macd_hist'] < 0:
-            pred -= 0.5 * scale
-    elif regime == 'HIGH_VOL':
-        pred = mom * 0.20 * scale + mr * 0.50 * scale
+    # 1M vs 3M: inna mieszanka momentum (krótki szum szkodzi Hit% na 3M)
+    if days_forward <= 30:
+        mom = (
+            0.15 * feats['ret5']
+            + 0.35 * feats['ret10']
+            + 0.35 * feats['ret20']
+            + 0.15 * feats.get('ret60', 0.0)
+        )
     else:
-        pred = mom * 0.12 * scale + mr * 0.55 * scale
-    if feats['adx'] > 30 and regime in ('TREND_UP', 'TREND_DOWN'):
-        pred *= 1.12
+        mom = (
+            0.05 * feats['ret5']
+            + 0.20 * feats['ret10']
+            + 0.40 * feats['ret20']
+            + 0.35 * feats.get('ret60', 0.0)
+        )
+    if feats.get('mom_agree', 0) > 0:
+        mom *= 1.15
+
+    # Mean-reversion: mocny tylko w RANGE; w trendzie mocno stłumiony
+    mr = 0.0
+    if feats['rsi'] > 72:
+        mr -= (feats['rsi'] - 72) * 0.14
+    elif feats['rsi'] < 28:
+        mr += (28 - feats['rsi']) * 0.14
+    if feats['pct_b'] > 0.97:
+        mr -= 1.4
+    elif feats['pct_b'] < 0.03:
+        mr += 1.4
+    if feats.get('stoch_k', 50) > 85:
+        mr -= 0.6
+    elif feats.get('stoch_k', 50) < 15:
+        mr += 0.6
+
+    slope = feats.get('sma_slope', 0.0)
+    # Strukturalny bias: pozycja względem SMA (kierunek, nie wielkość)
+    struct = 0.0
+    if feats.get('dist_sma50', 0) > 1.5 and feats.get('dist_sma200', 0) > 0:
+        struct += 1.0
+    elif feats.get('dist_sma50', 0) < -1.5 and feats.get('dist_sma200', 0) < 0:
+        struct -= 1.0
+
+    if regime == 'TREND_UP':
+        # kontynuacja > mean-reversion
+        pred = mom * 0.55 * scale + mr * 0.06 * scale + slope * 0.20 * scale + struct * 0.35 * scale
+        if feats['macd_hist'] > 0:
+            pred += 0.55 * scale
+        # nie pozwalaj heurystyce mocno shortować silnego uptrendu
+        if pred < 0 and feats.get('adx', 20) >= 22:
+            pred *= 0.35
+    elif regime == 'TREND_DOWN':
+        pred = mom * 0.55 * scale + mr * 0.06 * scale + slope * 0.20 * scale + struct * 0.35 * scale
+        if feats['macd_hist'] < 0:
+            pred -= 0.55 * scale
+        if pred > 0 and feats.get('adx', 20) >= 22:
+            pred *= 0.35
+    elif regime == 'HIGH_VOL':
+        # ostrożniej: mniej mom, trochę MR, struktura słabsza
+        pred = mom * 0.22 * scale + mr * 0.35 * scale + struct * 0.15 * scale
+    else:  # RANGE
+        pred = mom * 0.15 * scale + mr * 0.50 * scale + struct * 0.10 * scale
+
+    if feats.get('adx', 20) > 28 and regime in ('TREND_UP', 'TREND_DOWN'):
+        pred *= 1.14
     return float(np.clip(pred, -22, 22))
 
 
@@ -2741,17 +2777,23 @@ def _calibrate_return_magnitude(pred_ret, df, days_forward, regime='RANGE'):
 
 
 def _model_agreement_penalty(preds):
+    """
+    v4: przy sporze modeli silniej tłumimy magnitude (kierunek ogarnia trend/drift).
+    Zwraca mnożnik 0.45–1.05.
+    """
     vals = [preds.get('ridge'), preds.get('gb'), preds.get('heuristic')]
     vals = [v for v in vals if v is not None]
     if len(vals) < 2:
         return 1.0
-    signs = [np.sign(v) if abs(v) >= 0.8 else 0 for v in vals]
+    signs = [np.sign(v) if abs(v) >= 0.7 else 0 for v in vals]
     nonzero = [s for s in signs if s != 0]
     if len(nonzero) < 2:
-        return 0.85
+        return 0.80
     if len(set(nonzero)) == 1:
-        return 1.0
-    return 0.60
+        # pełna zgodność – lekki boost magnitude (wyraźniejszy sygnał)
+        return 1.05
+    # spór znaków – mocno ściąć (Hit% z modelu w sporze ~50%)
+    return 0.48
 
 
 def _calibrate_model_weights(X, y, horizon_days, regime):
@@ -2800,7 +2842,10 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, silniejszy prior przy sporze."""
+    """
+    Ensemble v4: Ridge+GB+heurystyka.
+    Hit%: przy sporze modeli kierunek kotwiczony w historycznym dryfie / strukturze SMA.
+    """
     built = _build_training_set(df, days_forward)
     if built[0] is None:
         X, y, sw = None, None, None
@@ -2845,6 +2890,19 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     except Exception:
         preds['gb'] = preds['heuristic']
 
+    # 1M: więcej heurystyki (stabilniejszy kierunek). 3M: więcej ML + dłuższy prior później
+    if days_forward <= 30:
+        w_h = max(weights.get('heuristic', 0.40), 0.38)
+        rest = 1.0 - w_h
+        w_r = weights.get('ridge', 0.30)
+        w_g = weights.get('gb', 0.30)
+        s_rg = (w_r + w_g) or 1.0
+        weights = {
+            'heuristic': w_h,
+            'ridge': rest * (w_r / s_rg),
+            'gb': rest * (w_g / s_rg),
+        }
+
     blended = (
         weights.get('ridge', 0.30) * preds['ridge']
         + weights.get('gb', 0.30) * preds['gb']
@@ -2853,22 +2911,30 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     agree = _model_agreement_penalty(preds)
     blended *= agree
     prior = _historical_drift(df, days_forward)
-    # przy niskiej zgodności modeli mocniej kotwica historyczna (kierunek z rynku, nie szum ML)
-    shrink_s = 0.28 if days_forward <= 30 else 0.22
+
+    # Przy sporze: kierunek z prioru (historia), magnitude zostaje stłumiona przez agree
+    if agree < 0.75 and abs(prior) >= 0.6:
+        if np.sign(blended) != np.sign(prior) and abs(blended) > 0:
+            # odwróć znak w stronę historii, zachowaj część magnitude
+            blended = abs(blended) * 0.55 * np.sign(prior) + 0.45 * prior
+        else:
+            blended = 0.55 * blended + 0.45 * prior
+
+    shrink_s = 0.30 if days_forward <= 30 else 0.24
     if agree < 0.75:
-        shrink_s += 0.12
+        shrink_s += 0.14
     if regime == 'HIGH_VOL':
         shrink_s += 0.08
     elif regime == 'RANGE':
-        shrink_s += 0.05
-    blended = _shrink_prediction(blended, prior, strength=min(0.55, shrink_s))
+        shrink_s += 0.06
+    blended = _shrink_prediction(blended, prior, strength=min(0.58, shrink_s))
     if regime == 'HIGH_VOL':
-        blended *= 0.88
+        blended *= 0.86
     elif regime == 'RANGE':
-        blended *= 0.93
-    # 3M: lekko większy udział dłuższego dryfu (ret60 już w features; tu prior)
+        blended *= 0.92
+    # 3M: większy udział dłuższego dryfu
     if days_forward > 30 and abs(prior) >= 0.5:
-        blended = 0.88 * blended + 0.12 * prior
+        blended = 0.82 * blended + 0.18 * prior
     return float(blended), preds, weights
 
 
@@ -3014,12 +3080,50 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
     return float(pred)
 
 
+def _structural_trend_sign(df, feats=None):
+    """
+    Głos strukturalny kierunku: SMA50/SMA200 + ADX.
+    +1 uptrend, -1 downtrend, 0 brak wyraźnej struktury.
+    """
+    try:
+        close = float(df['Close'].iloc[-1])
+        sma50 = float(df['Close'].rolling(50).mean().iloc[-1]) if len(df) >= 50 else close
+        sma200 = float(df['Close'].rolling(200).mean().iloc[-1]) if len(df) >= 200 else sma50
+        adx = 20.0
+        if feats and feats.get('adx') is not None:
+            adx = float(feats['adx'])
+        elif 'ADX' in df.columns and pd.notna(df['ADX'].iloc[-1]):
+            adx = float(df['ADX'].iloc[-1])
+
+        above50 = close >= sma50 * 0.995
+        below50 = close <= sma50 * 1.005
+        above200 = close >= sma200 * 0.99
+        below200 = close <= sma200 * 1.01
+        sma50_above_200 = sma50 >= sma200 * 0.985
+        sma50_below_200 = sma50 <= sma200 * 1.015
+
+        if above50 and above200 and sma50_above_200:
+            return 1.0 if adx >= 18 else 0.6
+        if below50 and below200 and sma50_below_200:
+            return -1.0 if adx >= 18 else -0.6
+        if above50 and sma50_above_200:
+            return 0.5
+        if below50 and sma50_below_200:
+            return -0.5
+        return 0.0
+    except Exception:
+        return 0.0
+
+
 def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
-    """Prognoza 1M/3M v2 + wyjątki tylko dla wybranych par ticker/horyzont."""
+    """
+    Prognoza 1M/3M v4 – priorytet Hit% (kierunek).
+    Ensemble + fund + dryf, potem twardy filtr strukturalny trendu (SMA/ADX).
+    """
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3b | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v4 | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRALNY", 0.0
     df_clean = df.ffill().bfill()
@@ -3046,21 +3150,21 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v3b: rozdział 1M vs 3M (jak desktop main)
+    # v4: 1M bardziej tech, 3M mocniej fund+dryf
     if horizon == '1M':
-        tech_w = min(0.74, base_tech + 0.12)
+        tech_w = min(0.72, base_tech + 0.10)
     else:
-        tech_w = max(0.28, base_tech - 0.16)
+        tech_w = max(0.26, base_tech - 0.18)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.80 if horizon == '1M' else 0.75
+        tech_w *= 0.78 if horizon == '1M' else 0.72
     if regime == 'RANGE':
-        tech_w *= 0.90 if horizon == '1M' else 0.85
+        tech_w *= 0.88 if horizon == '1M' else 0.82
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.85, tech_w + (0.06 if horizon == '1M' else 0.04))
+        tech_w = min(0.82, tech_w + (0.05 if horizon == '1M' else 0.03))
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
-        blended_ret *= 1.04 if horizon == '1M' else 1.02
+        blended_ret *= 1.03 if horizon == '1M' else 1.015
 
     try:
         hist_med = _historical_drift(df_clean, days_forward)
@@ -3072,24 +3176,68 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         hist_med_long = hist_med
 
     if horizon == '1M':
-        drift_w = 0.20
+        drift_w = 0.24
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.38
-        mix_prior = 0.65 * hist_med + 0.35 * hist_med_long
+        drift_w = 0.42
+        mix_prior = 0.60 * hist_med + 0.40 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
-    if regime == 'TREND_UP' and blended_ret < 0:
-        blended_ret *= 0.45
-        if hist_med > 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * max(hist_med * 0.5, 0.3)
-    elif regime == 'TREND_DOWN' and blended_ret > 0:
-        blended_ret *= 0.45
-        if hist_med < 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * min(hist_med * 0.5, -0.3)
+    # --- v4 DIRECTION LOCK: struktura trendu (klucz do Hit%) ---
+    struct = _structural_trend_sign(df_clean, feats)
+    adx = float(feats.get('adx', 20) or 20)
 
-    if abs(blended_ret) < 1.2 and abs(hist_med) >= 0.8:
-        blended_ret = 0.35 * blended_ret + 0.65 * np.sign(hist_med) * max(abs(hist_med), 1.0)
+    # 1) Silny uptrend – nie pozwalaj na wyraźny short z szumu
+    if struct >= 0.6 and regime in ('TREND_UP', 'RANGE') and blended_ret < 0:
+        if adx >= 22 or struct >= 0.9:
+            # odwróć w stronę trendu z magnitude z historii / minimum
+            mag = max(abs(blended_ret) * 0.40, abs(hist_med) * 0.55, 0.8 if horizon == '1M' else 1.5)
+            if hist_med > 0:
+                mag = max(mag, abs(hist_med) * 0.7)
+            blended_ret = mag
+        else:
+            blended_ret *= 0.30
+
+    # 2) Silny downtrend – nie pozwalaj na wyraźny long z szumu
+    elif struct <= -0.6 and regime in ('TREND_DOWN', 'RANGE') and blended_ret > 0:
+        if adx >= 22 or struct <= -0.9:
+            mag = max(abs(blended_ret) * 0.40, abs(hist_med) * 0.55, 0.8 if horizon == '1M' else 1.5)
+            if hist_med < 0:
+                mag = max(mag, abs(hist_med) * 0.7)
+            blended_ret = -mag
+        else:
+            blended_ret *= 0.30
+
+    # 3) Klasyczne tłumienie przeciw trendowi (gdy jeszcze nie odwrócone)
+    if regime == 'TREND_UP' and blended_ret < 0:
+        blended_ret *= 0.40
+        if hist_med > 0:
+            blended_ret = 0.55 * blended_ret + 0.45 * max(hist_med * 0.55, 0.35)
+    elif regime == 'TREND_DOWN' and blended_ret > 0:
+        blended_ret *= 0.40
+        if hist_med < 0:
+            blended_ret = 0.55 * blended_ret + 0.45 * min(hist_med * 0.55, -0.35)
+
+    # 4) Słaby sygnał + wyraźny dryf historyczny → weź kierunek z historii
+    if abs(blended_ret) < 1.15 and abs(hist_med) >= 0.75:
+        blended_ret = 0.30 * blended_ret + 0.70 * np.sign(hist_med) * max(abs(hist_med), 1.0)
+
+    # 5) Głos większości: ensemble sign vs hist vs structure
+    #    przy sporze ensemble vs (hist+struct) → hist+struct wygrywa
+    votes = []
+    if abs(tech_ret) >= 0.6:
+        votes.append(np.sign(tech_ret))
+    if abs(hist_med) >= 0.6:
+        votes.append(np.sign(hist_med))
+    if abs(struct) >= 0.5:
+        votes.append(np.sign(struct))
+    if len(votes) >= 2:
+        vote_sum = sum(votes)
+        if vote_sum != 0 and np.sign(blended_ret) != np.sign(vote_sum) and abs(blended_ret) < 3.5:
+            # słaby sygnał przeciwko większości – odwróć
+            blended_ret = abs(blended_ret) * np.sign(vote_sum)
+            if abs(blended_ret) < 0.9:
+                blended_ret = np.sign(vote_sum) * (1.0 if horizon == '1M' else 1.8)
 
     # Wyjątki TYLKO dla trudnych par (nie zmieniają AAPL/JPM/…)
     t_key = (str(ticker).upper() if ticker else None, horizon)
@@ -3101,7 +3249,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         except Exception as e:
             _log(f"   special case fail: {e}")
 
-    _log(f"   regime={regime} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
+    _log(f"   regime={regime} struct={struct:+.1f} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
           f"tech_w={tech_w:.2f} drift_w={drift_w:.2f} special={special} "
           f"→ blend={blended_ret:+.2f}%")
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
@@ -3135,13 +3283,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
     change_percent = float(np.clip(blended_ret, -max_change, max_change))
     adjusted_pred = current_price * (1.0 + change_percent / 100.0)
-    if change_percent > 2.5:
+    if change_percent > 2.2:
         direction = "WZROSTOWY"
-    elif change_percent < -2.5:
+    elif change_percent < -2.2:
         direction = "SPADKOWY"
     else:
         direction = "NEUTRALNY"
-    _log(f"✅ PROGNOZA v2: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v4: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
