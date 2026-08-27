@@ -369,7 +369,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     # Hit% ZAWSZE – ta sama definicja co desktop; mniej okien = szybciej, nie „fałszywy” hit
     hit_rate = mae = n_sig = None
-    max_pts = 40 if quality else 30
+    max_pts = 12 if quality else 8
     try:
         q = core.backtest_forecast_quality(
             df,
