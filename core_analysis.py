@@ -1438,12 +1438,12 @@ def get_comprehensive_fundamental_analysis(ticker):
             'basic_company_score': None,
             'comprehensive_company_score': None,
             'sector_position_score': 50,
-            'management_quality_score': None,
-            'growth_momentum_score': None,
-            'risk_assessment_score': None,
-            'innovation_score': None,
-            'analyst_revision_score': None,
-            'recommendation_momentum_score': None,
+            'management_quality_score': 50,
+            'growth_momentum_score': 50,
+            'risk_assessment_score': 50,
+            'innovation_score': 50,
+            'analyst_revision_score': 50,
+            'recommendation_momentum_score': 50,
             'combined_score': country_score,
             'fundamental_rating': "INDEX",
             'color': "blue",
@@ -1452,22 +1452,24 @@ def get_comprehensive_fundamental_analysis(ticker):
         }
 
     sector_position_score = get_sector_analysis(ticker, sector)
-    # Usunięte z wag: management / risk / analyst / growth momentum / innovation / recommendation
-    management_quality_score = None
-    growth_momentum_score = None
-    risk_assessment_score = None
-    innovation_score = None
-    analyst_revision_score = None
-    recommendation_momentum_score = None
+    management_quality_score = get_management_quality(ticker)
+    growth_momentum_score = get_growth_momentum(ticker)
+    risk_assessment_score = get_risk_assessment(ticker)
+    innovation_score = get_innovation_score(ticker)
+    analyst_revision_score = get_analyst_revision_momentum(ticker)
+    recommendation_momentum_score = get_recommendation_momentum(ticker)
 
     if company_fundamentals:
         basic_company_score = calculate_sector_fundamental_score(company_fundamentals, sector)
-        # Tylko podstawowy score sektorowy + pozycja w sektorze (renormalizacja 0.35+0.10)
-        w_basic, w_pos = 0.35, 0.10
-        wsum = w_basic + w_pos
         comprehensive_company_score = (
-            basic_company_score * (w_basic / wsum) +
-            sector_position_score * (w_pos / wsum)
+            basic_company_score * 0.35 +
+            sector_position_score * 0.10 +
+            management_quality_score * 0.13 +
+            growth_momentum_score * 0.12 +
+            risk_assessment_score * 0.10 +
+            innovation_score * 0.10 +
+            analyst_revision_score * 0.05 +
+            recommendation_momentum_score * 0.05
         )
         # Przy niepełnych fundach spółki nie karz makro (free plan / braki API)
         missing_ratio = 0.0
