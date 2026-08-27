@@ -339,54 +339,24 @@ def get_historical_prices(ticker, days=500):
 
 
 def get_company_profile(ticker):
-    """
-    Profil spółki – /profile + /statistics.
-    Free plan Twelve: 403 na tych endpointach → sektor z mapy lokalnej (nie blokuje 1M/3M).
-    Analiza prognoz = kod źródłowy użytkownika (ENSEMBLE v3b / PROGNOZA v2).
-    """
+    """Profil spółki – /profile (+ /quote uzupełniająco)."""
     if not ticker:
         return {}
     sym = _normalize_symbol(ticker)
-    t_key = str(ticker).upper().strip()
     cache_key = _cache_key("profile", sym)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     from urllib.parse import quote
-    profile = {"Symbol": sym, "Sector": "Default"}
-    try:
-        profile["Sector"] = sector_mapping.get(t_key, "Default")
-    except Exception:
-        pass
-
-    def _soft_get(path_q):
-        key = (TWELVE_DATA_API_KEY or "").strip()
-        if not key:
-            return None, None
-        url = f"{TWELVE_BASE_URL}{path_q}&apikey={key}" if "?" in path_q else f"{TWELVE_BASE_URL}{path_q}?apikey={key}"
-        try:
-            resp = requests.get(url, timeout=25)
-            if resp.status_code in (401, 403):
-                return None, resp.status_code
-            if resp.status_code != 200:
-                return None, resp.status_code
-            data = resp.json()
-            if isinstance(data, dict) and (data.get("status") == "error" or data.get("code")):
-                return None, data.get("code") or resp.status_code
-            return data if isinstance(data, dict) else None, resp.status_code
-        except Exception:
-            return None, None
-
-    sym_q = quote(sym, safe="/")
-    data, st = _soft_get(f"/profile?symbol={sym_q}")
-    if st in (401, 403):
-        print(f"ℹ️ /profile niedostępne na planie Twelve ({st}) – sektor lokalny dla {t_key}")
-    elif data:
-        profile.update({
+    url = f"{TWELVE_BASE_URL}/profile?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
+    data = _api_call(url)
+    profile = {}
+    if data and isinstance(data, dict) and data.get("status") != "error":
+        profile = {
             "Symbol": data.get("symbol") or sym,
             "Name": data.get("name"),
-            "Sector": data.get("sector") or profile.get("Sector"),
+            "Sector": data.get("sector"),
             "Industry": data.get("industry"),
             "MarketCapitalization": data.get("market_cap") or data.get("market_capitalization"),
             "Beta": data.get("beta"),
@@ -396,16 +366,15 @@ def get_company_profile(ticker):
             "Employees": data.get("employees"),
             "Exchange": data.get("exchange"),
             "Type": data.get("type"),
-        })
-
-    stats, st2 = _soft_get(f"/statistics?symbol={sym_q}")
-    if st2 in (401, 403):
-        print(f"ℹ️ /statistics niedostępne na planie Twelve ({st2})")
-    elif stats and "statistics" in stats:
-        stt = stats["statistics"]
-        val = stt.get("valuations_metrics") or {}
-        fin = stt.get("financials") or {}
-        stock = stt.get("stock_price_summary") or {}
+        }
+    # statistics for richer fundamentals
+    url2 = f"{TWELVE_BASE_URL}/statistics?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
+    stats = _api_call(url2)
+    if stats and isinstance(stats, dict) and "statistics" in stats:
+        st = stats["statistics"]
+        val = st.get("valuations_metrics") or {}
+        fin = st.get("financials") or {}
+        stock = st.get("stock_price_summary") or {}
         profile.setdefault("MarketCapitalization", val.get("market_capitalization"))
         profile["pe_ratio"] = val.get("trailing_pe") or val.get("forward_pe")
         profile["ps_ratio"] = val.get("price_to_sales_ttm")
@@ -415,7 +384,6 @@ def get_company_profile(ticker):
         if stock:
             profile["52WeekHigh"] = profile.get("52WeekHigh") or stock.get("fifty_two_week_high")
             profile["52WeekLow"] = profile.get("52WeekLow") or stock.get("fifty_two_week_low")
-
     _cache_set(cache_key, profile)
     return profile
 
@@ -1470,12 +1438,12 @@ def get_comprehensive_fundamental_analysis(ticker):
             'basic_company_score': None,
             'comprehensive_company_score': None,
             'sector_position_score': 50,
-            'management_quality_score': 50,
-            'growth_momentum_score': 50,
-            'risk_assessment_score': 50,
-            'innovation_score': 50,
-            'analyst_revision_score': 50,
-            'recommendation_momentum_score': 50,
+            'management_quality_score': None,
+            'growth_momentum_score': None,
+            'risk_assessment_score': None,
+            'innovation_score': None,
+            'analyst_revision_score': None,
+            'recommendation_momentum_score': None,
             'combined_score': country_score,
             'fundamental_rating': "INDEX",
             'color': "blue",
@@ -1484,24 +1452,22 @@ def get_comprehensive_fundamental_analysis(ticker):
         }
 
     sector_position_score = get_sector_analysis(ticker, sector)
-    management_quality_score = get_management_quality(ticker)
-    growth_momentum_score = get_growth_momentum(ticker)
-    risk_assessment_score = get_risk_assessment(ticker)
-    innovation_score = get_innovation_score(ticker)
-    analyst_revision_score = get_analyst_revision_momentum(ticker)
-    recommendation_momentum_score = get_recommendation_momentum(ticker)
+    # Usunięte z wag: management / risk / analyst / growth momentum / innovation / recommendation
+    management_quality_score = None
+    growth_momentum_score = None
+    risk_assessment_score = None
+    innovation_score = None
+    analyst_revision_score = None
+    recommendation_momentum_score = None
 
     if company_fundamentals:
         basic_company_score = calculate_sector_fundamental_score(company_fundamentals, sector)
+        # Tylko podstawowy score sektorowy + pozycja w sektorze (renormalizacja 0.35+0.10)
+        w_basic, w_pos = 0.35, 0.10
+        wsum = w_basic + w_pos
         comprehensive_company_score = (
-            basic_company_score * 0.35 +
-            sector_position_score * 0.10 +
-            management_quality_score * 0.13 +
-            growth_momentum_score * 0.12 +
-            risk_assessment_score * 0.10 +
-            innovation_score * 0.10 +
-            analyst_revision_score * 0.05 +
-            recommendation_momentum_score * 0.05
+            basic_company_score * (w_basic / wsum) +
+            sector_position_score * (w_pos / wsum)
         )
         # Przy niepełnych fundach spółki nie karz makro (free plan / braki API)
         missing_ratio = 0.0
