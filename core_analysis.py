@@ -457,25 +457,65 @@ def get_historical_prices(ticker, days=500):
 
 
 
+def _twelve_get_json(path_and_query: str) -> Tuple[Optional[dict], Optional[int], Optional[str]]:
+    """
+    Lekki GET do Twelve bez psucia LAST_TWELVE_ERROR przy 403 planu (profile/statistics).
+    Zwraca (data|None, http_status, error_msg).
+    """
+    key = (TWELVE_DATA_API_KEY or "").strip()
+    if not key:
+        return None, None, "brak klucza"
+    url = f"{TWELVE_BASE_URL}{path_and_query}&apikey={key}" if "?" in path_and_query else f"{TWELVE_BASE_URL}{path_and_query}?apikey={key}"
+    try:
+        resp = requests.get(url, timeout=25)
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if resp.status_code != 200:
+            msg = ""
+            if isinstance(data, dict):
+                msg = str(data.get("message") or data.get("status") or "")[:200]
+            else:
+                msg = (resp.text or "")[:200]
+            return None, resp.status_code, msg
+        if isinstance(data, dict) and (data.get("status") == "error" or data.get("code")):
+            return None, resp.status_code, str(data.get("message") or data.get("code"))[:200]
+        return data if isinstance(data, dict) else None, resp.status_code, None
+    except Exception as e:
+        return None, None, str(e)
+
+
 def get_company_profile(ticker):
-    """Profil spółki – /profile (+ /quote uzupełniająco)."""
+    """
+    Profil spółki. /profile i /statistics często wymagają planu Grow+.
+    Na Free: miękki fallback (sektor z mapy lokalnej) – NIE blokuje prognoz 1M/3M.
+    """
     if not ticker:
         return {}
     sym = _normalize_symbol(ticker)
-    cache_key = _cache_key("profile", sym)
+    t_key = str(ticker).upper().strip()
+    cache_key = _cache_key("profile_v2", sym)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     from urllib.parse import quote
-    url = f"{TWELVE_BASE_URL}/profile?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
-    data = _api_call(url)
-    profile = {}
-    if data and isinstance(data, dict) and data.get("status") != "error":
-        profile = {
+    profile: Dict[str, Any] = {"Symbol": sym, "Sector": "Default"}
+    try:
+        profile["Sector"] = sector_mapping.get(t_key, "Default")
+    except Exception:
+        profile["Sector"] = "Default"
+
+    sym_q = quote(sym, safe="/")
+    data, status, err = _twelve_get_json(f"/profile?symbol={sym_q}")
+    if status in (401, 403):
+        print(f"ℹ️ /profile niedostępne na tym planie Twelve ({status}) – fallback sektora lokalnego dla {t_key}")
+    elif data and isinstance(data, dict):
+        profile.update({
             "Symbol": data.get("symbol") or sym,
             "Name": data.get("name"),
-            "Sector": data.get("sector"),
+            "Sector": data.get("sector") or profile.get("Sector"),
             "Industry": data.get("industry"),
             "MarketCapitalization": data.get("market_cap") or data.get("market_capitalization"),
             "Beta": data.get("beta"),
@@ -485,11 +525,14 @@ def get_company_profile(ticker):
             "Employees": data.get("employees"),
             "Exchange": data.get("exchange"),
             "Type": data.get("type"),
-        }
-    # statistics for richer fundamentals
-    url2 = f"{TWELVE_BASE_URL}/statistics?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
-    stats = _api_call(url2)
-    if stats and isinstance(stats, dict) and "statistics" in stats:
+        })
+    elif err:
+        print(f"ℹ️ profile {t_key}: {err}")
+
+    stats, st2, err2 = _twelve_get_json(f"/statistics?symbol={sym_q}")
+    if st2 in (401, 403):
+        print(f"ℹ️ /statistics niedostępne na tym planie Twelve ({st2}) – analiza tech bez pełnych fundamentów")
+    elif stats and isinstance(stats, dict) and "statistics" in stats:
         st = stats["statistics"]
         val = st.get("valuations_metrics") or {}
         fin = st.get("financials") or {}
@@ -503,6 +546,9 @@ def get_company_profile(ticker):
         if stock:
             profile["52WeekHigh"] = profile.get("52WeekHigh") or stock.get("fifty_two_week_high")
             profile["52WeekLow"] = profile.get("52WeekLow") or stock.get("fifty_two_week_low")
+    elif err2:
+        print(f"ℹ️ statistics {t_key}: {err2}")
+
     _cache_set(cache_key, profile)
     return profile
 
