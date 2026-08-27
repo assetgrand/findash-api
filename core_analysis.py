@@ -148,145 +148,26 @@ def _normalize_symbol(ticker: str) -> str:
             return f"{t[:-3]}/USD"
     return t
 
-# Ostatni błąd Twelve – do /health i /debug/twelve (bez pełnego klucza)
-LAST_TWELVE_ERROR: Optional[str] = None
-LAST_TWELVE_STATUS: Optional[int] = None
-
-
-def _mask_key_in_url(url: str) -> str:
-    try:
-        if "apikey=" in url:
-            pre, rest = url.split("apikey=", 1)
-            key = rest.split("&", 1)[0]
-            masked = (key[:4] + "…" + key[-4:]) if len(key) > 8 else "****"
-            tail = rest[len(key):] if len(rest) > len(key) else ""
-            return pre + "apikey=" + masked + tail
-    except Exception:
-        pass
-    return url
-
-
 def _api_call(url, max_retries=3):
-    """Wykonuje zapytanie do Twelve Data API. Zapisuje LAST_TWELVE_ERROR przy failu."""
-    global LAST_TWELVE_ERROR, LAST_TWELVE_STATUS
-    safe = _mask_key_in_url(url)
+    """Wykonuje zapytanie do Twelve Data API."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
-            LAST_TWELVE_STATUS = resp.status_code
-            if resp.status_code != 200:
-                body = (resp.text or "")[:240]
-                LAST_TWELVE_ERROR = f"HTTP {resp.status_code}: {body}"
-                print(f"❌ Twelve HTTP {resp.status_code} (próba {attempt+1}): {safe} | {body}")
-                # 401/403 – bez sensu retryować tym samym kluczem
-                if resp.status_code in (401, 403):
-                    return None
-                time.sleep(2)
-                continue
+            resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
                 if data.get("status") == "error" or data.get("code"):
                     msg = data.get("message") or data.get("status") or str(data)[:200]
-                    LAST_TWELVE_ERROR = f"API error: {msg}"
-                    print(f"❌ Błąd Twelve Data: {msg} | {safe}")
+                    print(f"❌ Błąd Twelve Data: {msg}")
                     return None
-            LAST_TWELVE_ERROR = None
             return data
         except requests.exceptions.RequestException as e:
-            LAST_TWELVE_ERROR = f"network: {e}"
-            LAST_TWELVE_STATUS = None
-            print(f"❌ Błąd sieci (próba {attempt+1}): {e} | {safe}")
+            print(f"❌ Błąd sieci (próba {attempt+1}): {e}")
             time.sleep(2)
         except Exception as e:
-            LAST_TWELVE_ERROR = f"exception: {e}"
-            LAST_TWELVE_STATUS = None
-            print(f"❌ Błąd (próba {attempt+1}): {e} | {safe}")
+            print(f"❌ Błąd (próba {attempt+1}): {e}")
             time.sleep(2)
     return None
-
-
-def diagnose_twelve_connection(symbol: str = "AAPL") -> Dict[str, Any]:
-    """
-    Live test klucza Twelve: quote + time_series.
-    Nie loguje pełnego klucza. Do endpointu /debug/twelve.
-    """
-    key = (TWELVE_DATA_API_KEY or POLYGON_API_KEY or "").strip()
-    out: Dict[str, Any] = {
-        "ok": False,
-        "key_present": bool(key) and len(key) > 8 and not key.startswith("WPISZ"),
-        "key_prefix": (key[:4] + "…" + key[-4:]) if key and len(key) > 8 else None,
-        "quote_http": None,
-        "quote_ok": False,
-        "quote_price": None,
-        "quote_message": None,
-        "series_http": None,
-        "series_ok": False,
-        "series_bars": 0,
-        "series_message": None,
-        "hint": None,
-    }
-    if not out["key_present"]:
-        out["hint"] = "Brak TWELVE_DATA_API_KEY / POLYGON_API_KEY w Environment na Render."
-        return out
-
-    from urllib.parse import quote
-    sym = quote(symbol, safe="/")
-    try:
-        r = requests.get(
-            f"{TWELVE_BASE_URL}/quote?symbol={sym}&apikey={key}",
-            timeout=25,
-        )
-        out["quote_http"] = r.status_code
-        try:
-            q = r.json()
-        except Exception:
-            q = {}
-        if r.status_code == 200 and isinstance(q, dict) and not q.get("status") == "error":
-            price = q.get("close") or q.get("price") or q.get("previous_close")
-            out["quote_ok"] = price is not None
-            out["quote_price"] = float(price) if price is not None else None
-            out["quote_message"] = "ok"
-        else:
-            out["quote_message"] = (q.get("message") if isinstance(q, dict) else None) or (r.text or "")[:200]
-    except Exception as e:
-        out["quote_message"] = str(e)
-
-    try:
-        r2 = requests.get(
-            f"{TWELVE_BASE_URL}/time_series?symbol={sym}&interval=1day&outputsize=10&apikey={key}",
-            timeout=25,
-        )
-        out["series_http"] = r2.status_code
-        try:
-            s = r2.json()
-        except Exception:
-            s = {}
-        vals = s.get("values") if isinstance(s, dict) else None
-        if r2.status_code == 200 and vals:
-            out["series_ok"] = True
-            out["series_bars"] = len(vals)
-            out["series_message"] = "ok"
-        else:
-            out["series_message"] = (
-                (s.get("message") if isinstance(s, dict) else None)
-                or (r2.text or "")[:200]
-            )
-    except Exception as e:
-        out["series_message"] = str(e)
-
-    out["ok"] = bool(out["quote_ok"] and out["series_ok"])
-    if out["ok"]:
-        out["hint"] = "Twelve OK – problem nie jest w kluczu."
-    elif out.get("quote_http") in (401, 403) or out.get("series_http") in (401, 403):
-        out["hint"] = (
-            "Klucz odrzucony przez Twelve (401/403). "
-            "Wygeneruj nowy klucz, wklej w Render TWELVE_DATA_API_KEY, Manual Deploy."
-        )
-    elif "credit" in str(out.get("quote_message") or "").lower() or "credit" in str(out.get("series_message") or "").lower():
-        out["hint"] = "Limit kredytów Twelve – doładuj plan lub poczekaj na reset."
-    elif not out["series_ok"]:
-        out["hint"] = "time_series nie zwraca barek – bez tego /analyze zawsze da 404."
-    return out
 
 def test_api_key():
     """Testuje klucz API Twelve Data."""
@@ -458,24 +339,54 @@ def get_historical_prices(ticker, days=500):
 
 
 def get_company_profile(ticker):
-    """Profil spółki – /profile (+ /quote uzupełniająco)."""
+    """
+    Profil spółki – /profile + /statistics.
+    Na planie Free Twelve te endpointy dają 403 – wtedy fallback sektora lokalnego
+    (nie blokuje prognoz 1M/3M). Logika prognoz = snapshot findash_v4 z 25.08.
+    """
     if not ticker:
         return {}
     sym = _normalize_symbol(ticker)
+    t_key = str(ticker).upper().strip()
     cache_key = _cache_key("profile", sym)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     from urllib.parse import quote
-    url = f"{TWELVE_BASE_URL}/profile?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
-    data = _api_call(url)
-    profile = {}
-    if data and isinstance(data, dict) and data.get("status") != "error":
-        profile = {
+    profile = {"Symbol": sym, "Sector": "Default"}
+    try:
+        profile["Sector"] = sector_mapping.get(t_key, "Default")
+    except Exception:
+        pass
+
+    def _soft_get(path_q):
+        key = (TWELVE_DATA_API_KEY or "").strip()
+        if not key:
+            return None, None
+        url = f"{TWELVE_BASE_URL}{path_q}&apikey={key}" if "?" in path_q else f"{TWELVE_BASE_URL}{path_q}?apikey={key}"
+        try:
+            resp = requests.get(url, timeout=25)
+            if resp.status_code in (401, 403):
+                return None, resp.status_code
+            if resp.status_code != 200:
+                return None, resp.status_code
+            data = resp.json()
+            if isinstance(data, dict) and (data.get("status") == "error" or data.get("code")):
+                return None, data.get("code") or resp.status_code
+            return data if isinstance(data, dict) else None, resp.status_code
+        except Exception:
+            return None, None
+
+    sym_q = quote(sym, safe="/")
+    data, st = _soft_get(f"/profile?symbol={sym_q}")
+    if st in (401, 403):
+        print(f"ℹ️ /profile niedostępne na planie Twelve ({st}) – sektor lokalny dla {t_key}")
+    elif data:
+        profile.update({
             "Symbol": data.get("symbol") or sym,
             "Name": data.get("name"),
-            "Sector": data.get("sector"),
+            "Sector": data.get("sector") or profile.get("Sector"),
             "Industry": data.get("industry"),
             "MarketCapitalization": data.get("market_cap") or data.get("market_capitalization"),
             "Beta": data.get("beta"),
@@ -485,15 +396,16 @@ def get_company_profile(ticker):
             "Employees": data.get("employees"),
             "Exchange": data.get("exchange"),
             "Type": data.get("type"),
-        }
-    # statistics for richer fundamentals
-    url2 = f"{TWELVE_BASE_URL}/statistics?symbol={quote(sym, safe='/')}&apikey={TWELVE_DATA_API_KEY}"
-    stats = _api_call(url2)
-    if stats and isinstance(stats, dict) and "statistics" in stats:
-        st = stats["statistics"]
-        val = st.get("valuations_metrics") or {}
-        fin = st.get("financials") or {}
-        stock = st.get("stock_price_summary") or {}
+        })
+
+    stats, st2 = _soft_get(f"/statistics?symbol={sym_q}")
+    if st2 in (401, 403):
+        print(f"ℹ️ /statistics niedostępne na planie Twelve ({st2})")
+    elif stats and "statistics" in stats:
+        stt = stats["statistics"]
+        val = stt.get("valuations_metrics") or {}
+        fin = stt.get("financials") or {}
+        stock = stt.get("stock_price_summary") or {}
         profile.setdefault("MarketCapitalization", val.get("market_capitalization"))
         profile["pe_ratio"] = val.get("trailing_pe") or val.get("forward_pe")
         profile["ps_ratio"] = val.get("price_to_sales_ttm")
@@ -503,6 +415,7 @@ def get_company_profile(ticker):
         if stock:
             profile["52WeekHigh"] = profile.get("52WeekHigh") or stock.get("fifty_two_week_high")
             profile["52WeekLow"] = profile.get("52WeekLow") or stock.get("fifty_two_week_low")
+
     _cache_set(cache_key, profile)
     return profile
 
@@ -3236,13 +3149,13 @@ def _structural_trend_sign(df, feats=None):
 
 def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
     """
-    Prognoza 1M/3M v5 – priorytet Hit% (kierunek).
-    Ensemble + fund + dryf + twardy direction vote (struktura/mom/historia).
+    Prognoza 1M/3M v4 – priorytet Hit% (kierunek).
+    Ensemble + fund + dryf, potem twardy filtr strukturalny trendu (SMA/ADX).
     """
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v5 | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v4 | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRALNY", 0.0
     df_clean = df.ffill().bfill()
@@ -3269,17 +3182,17 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v5: 1M tech, 3M fund+dryf (jeszcze mocniej niż v4)
+    # v4: 1M bardziej tech, 3M mocniej fund+dryf
     if horizon == '1M':
-        tech_w = min(0.74, base_tech + 0.12)
+        tech_w = min(0.72, base_tech + 0.10)
     else:
-        tech_w = max(0.24, base_tech - 0.20)
+        tech_w = max(0.26, base_tech - 0.18)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.76 if horizon == '1M' else 0.70
+        tech_w *= 0.78 if horizon == '1M' else 0.72
     if regime == 'RANGE':
-        tech_w *= 0.86 if horizon == '1M' else 0.80
+        tech_w *= 0.88 if horizon == '1M' else 0.82
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.84, tech_w + (0.05 if horizon == '1M' else 0.03))
+        tech_w = min(0.82, tech_w + (0.05 if horizon == '1M' else 0.03))
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
@@ -3295,86 +3208,70 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         hist_med_long = hist_med
 
     if horizon == '1M':
-        drift_w = 0.28
+        drift_w = 0.24
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.46
-        mix_prior = 0.55 * hist_med + 0.45 * hist_med_long
+        drift_w = 0.42
+        mix_prior = 0.60 * hist_med + 0.40 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
-    # --- v5 DIRECTION LOCK ---
+    # --- v4 DIRECTION LOCK: struktura trendu (klucz do Hit%) ---
     struct = _structural_trend_sign(df_clean, feats)
     adx = float(feats.get('adx', 20) or 20)
-    # momentum kierunku: 1M=ret20, 3M=ret60 (mniej szumu)
-    mom_dir = feats.get('ret20', 0.0) if horizon == '1M' else feats.get('ret60', feats.get('ret20', 0.0))
 
-    # 1) Silny uptrend – nie shortuj z szumu
-    if struct >= 0.6 and blended_ret < 0:
-        if adx >= 20 or struct >= 0.9 or (hist_med > 0 and mom_dir > 0):
-            mag = max(abs(blended_ret) * 0.35, abs(hist_med) * 0.60, 1.0 if horizon == '1M' else 1.8)
+    # 1) Silny uptrend – nie pozwalaj na wyraźny short z szumu
+    if struct >= 0.6 and regime in ('TREND_UP', 'RANGE') and blended_ret < 0:
+        if adx >= 22 or struct >= 0.9:
+            # odwróć w stronę trendu z magnitude z historii / minimum
+            mag = max(abs(blended_ret) * 0.40, abs(hist_med) * 0.55, 0.8 if horizon == '1M' else 1.5)
             if hist_med > 0:
-                mag = max(mag, abs(hist_med) * 0.75)
+                mag = max(mag, abs(hist_med) * 0.7)
             blended_ret = mag
         else:
-            blended_ret *= 0.25
+            blended_ret *= 0.30
 
-    # 2) Silny downtrend – nie longuj z szumu
-    elif struct <= -0.6 and blended_ret > 0:
-        if adx >= 20 or struct <= -0.9 or (hist_med < 0 and mom_dir < 0):
-            mag = max(abs(blended_ret) * 0.35, abs(hist_med) * 0.60, 1.0 if horizon == '1M' else 1.8)
+    # 2) Silny downtrend – nie pozwalaj na wyraźny long z szumu
+    elif struct <= -0.6 and regime in ('TREND_DOWN', 'RANGE') and blended_ret > 0:
+        if adx >= 22 or struct <= -0.9:
+            mag = max(abs(blended_ret) * 0.40, abs(hist_med) * 0.55, 0.8 if horizon == '1M' else 1.5)
             if hist_med < 0:
-                mag = max(mag, abs(hist_med) * 0.75)
+                mag = max(mag, abs(hist_med) * 0.7)
             blended_ret = -mag
         else:
-            blended_ret *= 0.25
+            blended_ret *= 0.30
 
-    # 3) Tłumienie przeciw reżimowi
+    # 3) Klasyczne tłumienie przeciw trendowi (gdy jeszcze nie odwrócone)
     if regime == 'TREND_UP' and blended_ret < 0:
-        blended_ret *= 0.35
+        blended_ret *= 0.40
         if hist_med > 0:
-            blended_ret = 0.50 * blended_ret + 0.50 * max(hist_med * 0.60, 0.40)
+            blended_ret = 0.55 * blended_ret + 0.45 * max(hist_med * 0.55, 0.35)
     elif regime == 'TREND_DOWN' and blended_ret > 0:
-        blended_ret *= 0.35
+        blended_ret *= 0.40
         if hist_med < 0:
-            blended_ret = 0.50 * blended_ret + 0.50 * min(hist_med * 0.60, -0.40)
+            blended_ret = 0.55 * blended_ret + 0.45 * min(hist_med * 0.55, -0.35)
 
-    # 4) Słaby sygnał + dryf → historia
-    if abs(blended_ret) < 1.20 and abs(hist_med) >= 0.70:
-        blended_ret = 0.25 * blended_ret + 0.75 * np.sign(hist_med) * max(abs(hist_med), 1.0)
+    # 4) Słaby sygnał + wyraźny dryf historyczny → weź kierunek z historii
+    if abs(blended_ret) < 1.15 and abs(hist_med) >= 0.75:
+        blended_ret = 0.30 * blended_ret + 0.70 * np.sign(hist_med) * max(abs(hist_med), 1.0)
 
-    # 5) Głos większości v5: tech + hist + struct + mom (+ fund przy 3M)
+    # 5) Głos większości: ensemble sign vs hist vs structure
+    #    przy sporze ensemble vs (hist+struct) → hist+struct wygrywa
     votes = []
-    if abs(tech_ret) >= 0.5:
+    if abs(tech_ret) >= 0.6:
         votes.append(np.sign(tech_ret))
-    if abs(hist_med) >= 0.5:
+    if abs(hist_med) >= 0.6:
         votes.append(np.sign(hist_med))
-    if abs(struct) >= 0.45:
+    if abs(struct) >= 0.5:
         votes.append(np.sign(struct))
-    if abs(mom_dir) >= 1.0:
-        votes.append(np.sign(mom_dir))
-    if horizon == '3M' and abs(fund_ret) >= 0.8:
-        votes.append(np.sign(fund_ret))
-
     if len(votes) >= 2:
         vote_sum = sum(votes)
-        # silna większość (≥2 w jedną stronę)
-        if abs(vote_sum) >= 2 and np.sign(blended_ret) != np.sign(vote_sum):
-            blended_ret = abs(blended_ret) * np.sign(vote_sum)
-            if abs(blended_ret) < 1.0:
-                blended_ret = np.sign(vote_sum) * (1.2 if horizon == '1M' else 2.0)
-        elif vote_sum != 0 and np.sign(blended_ret) != np.sign(vote_sum) and abs(blended_ret) < 3.0:
+        if vote_sum != 0 and np.sign(blended_ret) != np.sign(vote_sum) and abs(blended_ret) < 3.5:
+            # słaby sygnał przeciwko większości – odwróć
             blended_ret = abs(blended_ret) * np.sign(vote_sum)
             if abs(blended_ret) < 0.9:
                 blended_ret = np.sign(vote_sum) * (1.0 if horizon == '1M' else 1.8)
 
-    # 6) Ostatnia deska: jeśli po wszystkim prawie zero, a struktura/mom jasne → nadaj kierunek
-    if abs(blended_ret) < 0.85:
-        if struct >= 0.6 or (mom_dir > 1.5 and hist_med > 0):
-            blended_ret = 1.1 if horizon == '1M' else 2.0
-        elif struct <= -0.6 or (mom_dir < -1.5 and hist_med < 0):
-            blended_ret = -1.1 if horizon == '1M' else -2.0
-
-    # Wyjątki TYLKO dla trudnych par
+    # Wyjątki TYLKO dla trudnych par (nie zmieniają AAPL/JPM/…)
     t_key = (str(ticker).upper() if ticker else None, horizon)
     special = t_key in _SPECIAL_PRED_CASES if t_key[0] else False
     if special:
@@ -3384,19 +3281,16 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         except Exception as e:
             _log(f"   special case fail: {e}")
 
-    _log(f"   regime={regime} struct={struct:+.1f} mom={mom_dir:+.1f} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
+    _log(f"   regime={regime} struct={struct:+.1f} | tech={tech_ret:+.2f}% fund={fund_ret:+.2f}% "
           f"tech_w={tech_w:.2f} drift_w={drift_w:.2f} special={special} "
           f"→ blend={blended_ret:+.2f}%")
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
           f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
           f"| w={model_weights}")
 
-    # Kalibracja wielkości (znak bez zmian)
+    # Kalibracja wielkości (znak bez zmian → Hit% stabilny, MAE w dół)
     pre_cal = blended_ret
     blended_ret = _calibrate_return_magnitude(blended_ret, df_clean, days_forward, regime)
-    # v5: po kalibracji magnitude NIGDY nie odwracaj znaku ustalonego wyżej
-    if pre_cal != 0 and blended_ret != 0 and np.sign(pre_cal) != np.sign(blended_ret):
-        blended_ret = abs(blended_ret) * np.sign(pre_cal)
     if abs(pre_cal - blended_ret) > 0.05:
         _log(f"   mag-cal: {pre_cal:+.2f}% → {blended_ret:+.2f}%")
 
@@ -3421,14 +3315,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
     change_percent = float(np.clip(blended_ret, -max_change, max_change))
     adjusted_pred = current_price * (1.0 + change_percent / 100.0)
-    # v5: niższy próg kierunku (mniej „NEUTRALNY” gdy model ma znak)
-    if change_percent > 1.8:
+    if change_percent > 2.2:
         direction = "WZROSTOWY"
-    elif change_percent < -1.8:
+    elif change_percent < -2.2:
         direction = "SPADKOWY"
     else:
         direction = "NEUTRALNY"
-    _log(f"✅ PROGNOZA v5: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v4: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
