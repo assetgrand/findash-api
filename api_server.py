@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "hit-maxpoints-30-v1"
+API_BUILD = "crypto-isolated-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -288,26 +288,28 @@ def _precompute_worker() -> None:
 
 
 
-def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: bool = False) -> Dict[str, Any]:
+def _analyze_one(
+    ticker: str,
+    horizon: str = "1M",
+    fast: bool = True,
+    quality: bool = False,
+    sector_override: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Analiza pod Lovable/Render – ZAWSZE z Hit%/MAE (wymagane w produkcie).
-
-    Przyspieszenie bez wywalania Hit%:
-      - cache 15 min (powtórne requesty = instant)
-      - max_points=30 jak desktop (stabilniejszy Hit%; quality=40)
-      - rankingi równolegle
-    Parametr quality zwiększa max_points (dokładniejsza próba, wolniej).
+    sector_override: np. "Crypto" – NIE mutuje core.sector_mapping (akcje bez zmian).
     """
     ticker = ticker.upper().strip()
-    if not ticker or len(ticker) > 12:
+    # BTC/USD = 7 znaków; pozwól do 16 (pary krypto)
+    if not ticker or len(ticker) > 16:
         raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
 
     days = _horizon_days(horizon)
     horizon_label = "3M" if days > 30 else "1M"
-    # cache rozróżnia quality; data kalendarzowa – po nowej sesji nie serwuj wczorajszego %
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
-    cache_key = f"v7|{ticker}|{horizon_label}|{mode}|{day_key}|mp30"
+    # v8: izolacja od rankingu krypto / starych wpisów
+    cache_key = f"v8|{ticker}|{horizon_label}|{mode}|{day_key}|mp30"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -315,7 +317,10 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
         data["cached"] = True
         return data
 
-    sector = core.sector_mapping.get(ticker, "Unknown")
+    if sector_override:
+        sector = sector_override
+    else:
+        sector = core.sector_mapping.get(ticker, "Unknown")
 
     # zawsze 500 dni jak desktop
     df = core.get_historical_prices(ticker, days=500)
@@ -924,18 +929,17 @@ def gov_contracts_company(
 
 
 
+
 # ---------------------------------------------------------------------------
-# CRYPTO (Twelve Data: BTC/USD, ETH/USD, …) – ten sam silnik co akcje
+# CRYPTO – ten sam silnik, BEZ mutacji core.sector_mapping, BEZ parallel spam
 # ---------------------------------------------------------------------------
 CRYPTO_PAIRS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD",
-    "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "MATIC/USD",
-    "LTC/USD", "UNI/USD", "ATOM/USD", "NEAR/USD", "APT/USD",
+    "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "LTC/USD",
 ]
 
 
 def _crypto_symbol(raw: str) -> str:
-    """BTC, BTCUSD, BTC/USD, X:BTCUSD → BTC/USD"""
     s = (raw or "").strip().upper().replace(" ", "")
     if not s:
         raise HTTPException(status_code=400, detail="Empty crypto symbol")
@@ -945,7 +949,6 @@ def _crypto_symbol(raw: str) -> str:
         return s
     if s.endswith("USD") and len(s) > 3 and not s.isalpha():
         return f"{s[:-3]}/USD"
-    # bare base e.g. BTC
     if s.isalpha() and 2 <= len(s) <= 10:
         return f"{s}/USD"
     return s
@@ -953,7 +956,6 @@ def _crypto_symbol(raw: str) -> str:
 
 @app.get("/crypto/tickers")
 def crypto_tickers(prof: Dict[str, Any] = Depends(get_profile)):
-    """Lista par krypto + ostatnia cena (cache Twelve). Plan: standard+."""
     _gate(prof, "crypto")
     items = []
     for pair in CRYPTO_PAIRS:
@@ -965,9 +967,10 @@ def crypto_tickers(prof: Dict[str, Any] = Depends(get_profile)):
         items.append({
             "symbol": pair,
             "base": pair.split("/")[0],
-            "quote": pair.split("/")[-1] if "/" in pair else "USD",
+            "quote": "USD",
             "price": _safe_float(price),
         })
+        time.sleep(0.15)  # nie zjadaj limitów Twelve (akcje muszą działać)
     return {
         "count": len(items),
         "items": items,
@@ -982,10 +985,6 @@ def crypto_analyze(
     refresh: int = Query(0),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """
-    Analiza krypto tym samym modelem co akcje (technika + hit).
-    Symbol: BTC, BTC/USD, ETHUSD …
-    """
     _gate(prof, "crypto")
     try:
         auth.check_analyze_quota(prof)
@@ -993,25 +992,15 @@ def crypto_analyze(
         raise HTTPException(status_code=402, detail=str(e))
 
     pair = _crypto_symbol(symbol)
-    # reuse stock pipeline – sector Unknown is fine
-    if pair not in getattr(core, "sector_mapping", {}):
-        try:
-            if not hasattr(core, "sector_mapping") or core.sector_mapping is None:
-                core.sector_mapping = {}
-            core.sector_mapping[pair] = "Crypto"
-            # also bare base
-            base = pair.split("/")[0]
-            core.sector_mapping[base] = "Crypto"
-        except Exception:
-            pass
-
-    hz = "3M" if _horizon_days(horizon) > 30 else "1M"
     if refresh:
         for k in list(_ANALYZE_CACHE.keys()):
-            if pair.replace("/", "") in k.replace("/", "") or pair in k:
+            if pair in k or pair.replace("/", "") in k.replace("/", ""):
                 _ANALYZE_CACHE.pop(k, None)
 
-    data = _analyze_one(pair, horizon, fast=True, quality=False)
+    # sector_override – zero zapisu do core.sector_mapping
+    data = _analyze_one(
+        pair, horizon, fast=True, quality=False, sector_override="Crypto"
+    )
     data.pop("fast_mode", None)
     data["asset_class"] = "crypto"
     data["symbol"] = pair
@@ -1020,57 +1009,46 @@ def crypto_analyze(
         new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
         prof["analyze_count"] = new_c
 
-    payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields or k in ("asset_class", "symbol")}
-    payload["plan"] = (prof.get("plan") or "demo").lower()
-    payload["analyze_remaining"] = auth.remaining_analyze(prof)
-    # AnalyzeResponse may reject extra keys – return dict is fine for FastAPI
-    return payload
+    data["plan"] = (prof.get("plan") or "demo").lower()
+    data["analyze_remaining"] = auth.remaining_analyze(prof)
+    return data
 
 
 @app.get("/crypto/rankings")
 def crypto_rankings(
     horizon: str = Query("1M"),
-    limit: int = Query(12, ge=1, le=20),
+    limit: int = Query(8, ge=1, le=12),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Ranking krypto po predicted_change_pct."""
+    """Ranking krypto – SEKWENCYJNIE (bez ThreadPool), żeby nie psuć limitów Twelve dla akcji."""
     _gate(prof, "crypto")
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    pairs = CRYPTO_PAIRS[: max(limit, 6)]
+    pairs = CRYPTO_PAIRS[:limit]
     items = []
-
-    def _one(pair: str):
+    for pair in pairs:
         try:
-            if pair not in getattr(core, "sector_mapping", {}):
-                core.sector_mapping[pair] = "Crypto"
-            d = _analyze_one(pair, horizon, fast=True, quality=False)
-            return {
-                "ticker": pair,
-                "current_price": d.get("current_price"),
-                "predicted_change_pct": d.get("predicted_change_pct"),
-                "direction": d.get("direction") or "NEUTRALNY",
-                "sector": "Crypto",
-                "fundamental_rating": d.get("fundamental_rating"),
-                "hit_rate": d.get("hit_rate"),
-            }
+            d = _analyze_one(
+                pair, horizon, fast=True, quality=False, sector_override="Crypto"
+            )
+            if d.get("current_price") is not None:
+                items.append({
+                    "ticker": pair,
+                    "current_price": d.get("current_price"),
+                    "predicted_change_pct": d.get("predicted_change_pct"),
+                    "direction": d.get("direction") or "NEUTRALNY",
+                    "sector": "Crypto",
+                    "fundamental_rating": d.get("fundamental_rating"),
+                    "hit_rate": d.get("hit_rate"),
+                })
         except Exception as e:
             print("crypto rank skip", pair, e)
-            return None
-
-    workers = min(3, len(pairs))  # Twelve rate limits
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_one, p) for p in pairs]
-        for fut in as_completed(futs):
-            row = fut.result()
-            if row and row.get("current_price") is not None:
-                items.append(row)
+        time.sleep(0.35)
     items.sort(
         key=lambda x: (x.get("predicted_change_pct") is not None, x.get("predicted_change_pct") or -999),
         reverse=True,
     )
     return {
         "horizon": "3M" if _horizon_days(horizon) > 30 else "1M",
-        "items": items[:limit],
+        "items": items,
         "disclaimer": "Crypto forecasts use the same technical engine as equities. High risk.",
     }
 
