@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "gov-latest-v1"
+API_BUILD = "hit-maxpoints-30-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -294,7 +294,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
 
     Przyspieszenie bez wywalania Hit%:
       - cache 15 min (powtórne requesty = instant)
-      - max_points=8 w walk-forward (ta sama definicja hitu, mniej okien)
+      - max_points=30 jak desktop (stabilniejszy Hit%; quality=40)
       - rankingi równolegle
     Parametr quality zwiększa max_points (dokładniejsza próba, wolniej).
     """
@@ -307,7 +307,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     # cache rozróżnia quality; data kalendarzowa – po nowej sesji nie serwuj wczorajszego %
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
-    cache_key = f"v6|{ticker}|{horizon_label}|{mode}|{day_key}"
+    cache_key = f"v7|{ticker}|{horizon_label}|{mode}|{day_key}|mp30"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -367,7 +367,7 @@ def _analyze_one(ticker: str, horizon: str = "1M", fast: bool = True, quality: b
     except Exception as e:
         print(f"predict error {ticker}: {e}")
 
-    # Hit% ZAWSZE – ta sama definicja co desktop; mniej okien = szybciej, nie „fałszywy” hit
+    # Hit% jak desktop: default max_points=30 (wcześniej 8 → niestabilne 25% na małych próbkach)
     hit_rate = mae = n_sig = None
     max_pts = 40 if quality else 30
     try:
@@ -923,6 +923,158 @@ def gov_contracts_company(
     return data
 
 
+
+# ---------------------------------------------------------------------------
+# CRYPTO (Twelve Data: BTC/USD, ETH/USD, …) – ten sam silnik co akcje
+# ---------------------------------------------------------------------------
+CRYPTO_PAIRS = [
+    "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD",
+    "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "MATIC/USD",
+    "LTC/USD", "UNI/USD", "ATOM/USD", "NEAR/USD", "APT/USD",
+]
+
+
+def _crypto_symbol(raw: str) -> str:
+    """BTC, BTCUSD, BTC/USD, X:BTCUSD → BTC/USD"""
+    s = (raw or "").strip().upper().replace(" ", "")
+    if not s:
+        raise HTTPException(status_code=400, detail="Empty crypto symbol")
+    if s.startswith("X:") and s.endswith("USD") and len(s) > 5:
+        return f"{s[2:-3]}/USD"
+    if "/" in s:
+        return s
+    if s.endswith("USD") and len(s) > 3 and not s.isalpha():
+        return f"{s[:-3]}/USD"
+    # bare base e.g. BTC
+    if s.isalpha() and 2 <= len(s) <= 10:
+        return f"{s}/USD"
+    return s
+
+
+@app.get("/crypto/tickers")
+def crypto_tickers(prof: Dict[str, Any] = Depends(get_profile)):
+    """Lista par krypto + ostatnia cena (cache Twelve). Plan: standard+."""
+    _gate(prof, "crypto")
+    items = []
+    for pair in CRYPTO_PAIRS:
+        price = None
+        try:
+            price = core.get_live_price(pair)
+        except Exception as e:
+            print("crypto price", pair, e)
+        items.append({
+            "symbol": pair,
+            "base": pair.split("/")[0],
+            "quote": pair.split("/")[-1] if "/" in pair else "USD",
+            "price": _safe_float(price),
+        })
+    return {
+        "count": len(items),
+        "items": items,
+        "disclaimer": "Crypto prices via Twelve Data. Not investment advice.",
+    }
+
+
+@app.get("/crypto/analyze/{symbol:path}")
+def crypto_analyze(
+    symbol: str,
+    horizon: str = Query("1M", description="1M lub 3M"),
+    refresh: int = Query(0),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """
+    Analiza krypto tym samym modelem co akcje (technika + hit).
+    Symbol: BTC, BTC/USD, ETHUSD …
+    """
+    _gate(prof, "crypto")
+    try:
+        auth.check_analyze_quota(prof)
+    except PermissionError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+
+    pair = _crypto_symbol(symbol)
+    # reuse stock pipeline – sector Unknown is fine
+    if pair not in getattr(core, "sector_mapping", {}):
+        try:
+            if not hasattr(core, "sector_mapping") or core.sector_mapping is None:
+                core.sector_mapping = {}
+            core.sector_mapping[pair] = "Crypto"
+            # also bare base
+            base = pair.split("/")[0]
+            core.sector_mapping[base] = "Crypto"
+        except Exception:
+            pass
+
+    hz = "3M" if _horizon_days(horizon) > 30 else "1M"
+    if refresh:
+        for k in list(_ANALYZE_CACHE.keys()):
+            if pair.replace("/", "") in k.replace("/", "") or pair in k:
+                _ANALYZE_CACHE.pop(k, None)
+
+    data = _analyze_one(pair, horizon, fast=True, quality=False)
+    data.pop("fast_mode", None)
+    data["asset_class"] = "crypto"
+    data["symbol"] = pair
+
+    if (prof.get("plan") or "demo").lower() == "demo":
+        new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
+        prof["analyze_count"] = new_c
+
+    payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields or k in ("asset_class", "symbol")}
+    payload["plan"] = (prof.get("plan") or "demo").lower()
+    payload["analyze_remaining"] = auth.remaining_analyze(prof)
+    # AnalyzeResponse may reject extra keys – return dict is fine for FastAPI
+    return payload
+
+
+@app.get("/crypto/rankings")
+def crypto_rankings(
+    horizon: str = Query("1M"),
+    limit: int = Query(12, ge=1, le=20),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Ranking krypto po predicted_change_pct."""
+    _gate(prof, "crypto")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    pairs = CRYPTO_PAIRS[: max(limit, 6)]
+    items = []
+
+    def _one(pair: str):
+        try:
+            if pair not in getattr(core, "sector_mapping", {}):
+                core.sector_mapping[pair] = "Crypto"
+            d = _analyze_one(pair, horizon, fast=True, quality=False)
+            return {
+                "ticker": pair,
+                "current_price": d.get("current_price"),
+                "predicted_change_pct": d.get("predicted_change_pct"),
+                "direction": d.get("direction") or "NEUTRALNY",
+                "sector": "Crypto",
+                "fundamental_rating": d.get("fundamental_rating"),
+                "hit_rate": d.get("hit_rate"),
+            }
+        except Exception as e:
+            print("crypto rank skip", pair, e)
+            return None
+
+    workers = min(3, len(pairs))  # Twelve rate limits
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_one, p) for p in pairs]
+        for fut in as_completed(futs):
+            row = fut.result()
+            if row and row.get("current_price") is not None:
+                items.append(row)
+    items.sort(
+        key=lambda x: (x.get("predicted_change_pct") is not None, x.get("predicted_change_pct") or -999),
+        reverse=True,
+    )
+    return {
+        "horizon": "3M" if _horizon_days(horizon) > 30 else "1M",
+        "items": items[:limit],
+        "disclaimer": "Crypto forecasts use the same technical engine as equities. High risk.",
+    }
+
+
 @app.get("/")
 def root():
     return {
@@ -942,6 +1094,9 @@ def root():
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}?mode=Zrównoważony",
             "GET /signals?mode=Zrównoważony&limit=20",
+            "GET /crypto/tickers",
+            "GET /crypto/analyze/{symbol}?horizon=1M|3M",
+            "GET /crypto/rankings",
             "GET /precompute/status",
             "POST /precompute/run",
             "GET /keepalive",
