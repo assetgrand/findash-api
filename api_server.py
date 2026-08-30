@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "crypto-tech-v1"
+API_BUILD = "crypto-only-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -1041,33 +1041,36 @@ def crypto_rankings(
     limit: int = Query(8, ge=1, le=12),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """
-    Lekki ranking: TYLKO ceny (bez full analyze / hit).
-    Pełna analiza krypto = /crypto/analyze/{symbol} – nie zjada limitów Twelve przy liście.
-    """
+    """Ranking krypto – silnik crypto_technical (NIE equity _analyze_one)."""
     _gate(prof, "crypto")
+    days = _horizon_days(horizon)
+    hz = "3M" if days > 30 else "1M"
     items = []
     for pair in CRYPTO_PAIRS[:limit]:
         try:
-            price = _safe_float(core.get_live_price(pair))
-            items.append({
-                "ticker": pair,
-                "current_price": price,
-                "predicted_change_pct": None,
-                "direction": "—",
-                "sector": "Crypto",
-                "fundamental_rating": None,
-                "hit_rate": None,
-            })
+            raw = core.analyze_crypto_pair(pair, days_forward=days)
+            if raw and raw.get("current_price") is not None:
+                items.append({
+                    "ticker": pair,
+                    "current_price": raw.get("current_price"),
+                    "predicted_change_pct": raw.get("predicted_change_pct"),
+                    "direction": raw.get("direction") or "NEUTRALNY",
+                    "sector": "Crypto",
+                    "fundamental_rating": None,
+                    "hit_rate": raw.get("hit_rate"),
+                })
         except Exception as e:
-            print("crypto rank price", pair, e)
-        time.sleep(0.12)
+            print("crypto rank skip", pair, e)
+        time.sleep(0.25)
+    items.sort(
+        key=lambda x: (x.get("predicted_change_pct") is not None, x.get("predicted_change_pct") or -999),
+        reverse=True,
+    )
     return {
-        "horizon": "3M" if _horizon_days(horizon) > 30 else "1M",
+        "horizon": hz,
         "items": items,
-        "disclaimer": "List prices only. Run Analyze on a symbol for forecast/hit. Protects equity API limits.",
+        "disclaimer": "Crypto technical engine only. Does not affect equity analysis.",
     }
-
 
 
 @app.get("/")

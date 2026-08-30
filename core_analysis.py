@@ -3172,9 +3172,10 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if len(df) < min_len:
         return None
 
-    # Progi istotności (kierunek + ruch). Nie „soft hit” – tylko nieco mniej ostre niż v-ostra.
-    min_move = 1.5 if days_forward <= 30 else 3.0
-    min_pred = 0.8 if days_forward <= 30 else 1.5
+    # Trochę ostrzejsze progi niż wcześniej (2.0 / 3.5)
+    min_move = 2.0 if days_forward <= 30 else 3.5
+    # Prognoza musi być „wyraźna” – inaczej nie liczymy hitu
+    min_pred = 1.0 if days_forward <= 30 else 2.0
 
     df_clean = df.ffill().bfill()
     n = len(df_clean)
