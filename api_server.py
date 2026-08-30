@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "crypto-isolated-v2"
+API_BUILD = "crypto-tech-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -543,37 +543,28 @@ def rankings(
     limit: int = Query(12, ge=1, le=30),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
+    """Ranking sekwencyjnie – bez ThreadPool (stabilniejsze Twelve / hit akcji)."""
     _gate(prof, "rankings")
-    """Ranking po predicted_change_pct – równolegle, bez Hit% (szybko)."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     tick_list = list(getattr(core, "tickers", []))[: max(limit, 6)]
     items: List[RankingItem] = []
-
-    def _one(t: str):
-        hz = "3M" if _horizon_days(horizon) > 30 else "1M"
-        d = _pc_get(t, hz) or _analyze_one(t, horizon, fast=True, quality=False)
-        return RankingItem(
-            ticker=d["ticker"],
-            current_price=d.get("current_price"),
-            predicted_change_pct=d.get("predicted_change_pct"),
-            direction=d.get("direction") or "NEUTRALNY",
-            sector=d.get("sector") or "Unknown",
-            fundamental_rating=d.get("fundamental_rating"),
-            hit_rate=d.get("hit_rate"),
-        )
-
-    # 4 wątki – Polygon Free/Starter znosi równoległość lepiej niż sekwencja × N
-    workers = min(4, max(1, len(tick_list)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_one, t): t for t in tick_list}
-        for fut in as_completed(futs):
-            t = futs[fut]
-            try:
-                items.append(fut.result())
-            except Exception as e:
-                print("rankings skip", t, e)
-
+    for tk in tick_list:
+        try:
+            hz = "3M" if _horizon_days(horizon) > 30 else "1M"
+            d = _pc_get(tk, hz) or _analyze_one(tk, horizon, fast=True, quality=False)
+            items.append(
+                RankingItem(
+                    ticker=d["ticker"],
+                    current_price=d.get("current_price"),
+                    predicted_change_pct=d.get("predicted_change_pct"),
+                    direction=d.get("direction") or "NEUTRALNY",
+                    sector=d.get("sector") or "Unknown",
+                    fundamental_rating=d.get("fundamental_rating"),
+                    hit_rate=d.get("hit_rate"),
+                )
+            )
+        except Exception as e:
+            print("rankings skip", tk, e)
+        time.sleep(0.25)
     items.sort(
         key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999),
         reverse=True,
@@ -992,18 +983,48 @@ def crypto_analyze(
         raise HTTPException(status_code=402, detail=str(e))
 
     pair = _crypto_symbol(symbol)
+    days = _horizon_days(horizon)
+    hz = "3M" if days > 30 else "1M"
     if refresh:
         for k in list(_ANALYZE_CACHE.keys()):
             if pair in k or pair.replace("/", "") in k.replace("/", ""):
                 _ANALYZE_CACHE.pop(k, None)
 
-    # sector_override – zero zapisu do core.sector_mapping
-    data = _analyze_one(
-        pair, horizon, fast=True, quality=False, sector_override="Crypto"
-    )
-    data.pop("fast_mode", None)
-    data["asset_class"] = "crypto"
-    data["symbol"] = pair
+    # Osobny silnik krypto (nie equity _analyze_one) – lepszy hit na coinach
+    cache_key = f"crypto_v1|{pair}|{hz}|{time.strftime('%Y-%m-%d')}"
+    now = time.time()
+    hit = _ANALYZE_CACHE.get(cache_key)
+    if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL and not refresh:
+        data = dict(hit["data"])
+        data["cached"] = True
+    else:
+        raw = core.analyze_crypto_pair(pair, days_forward=days)
+        if not raw or raw.get("current_price") is None:
+            raise HTTPException(status_code=404, detail=f"Brak danych krypto dla {pair}")
+        data = {
+            "ticker": raw.get("symbol") or pair,
+            "symbol": pair,
+            "horizon": hz,
+            "days_forward": days,
+            "current_price": raw.get("current_price"),
+            "predicted_price": raw.get("predicted_price"),
+            "predicted_change_pct": raw.get("predicted_change_pct"),
+            "direction": raw.get("direction") or "NEUTRALNY",
+            "rsi": raw.get("rsi"),
+            "sector": "Crypto",
+            "fundamental_rating": None,
+            "combined_score": raw.get("combined_score"),
+            "hit_rate": raw.get("hit_rate"),
+            "mae": raw.get("mae"),
+            "n_significant": raw.get("n_significant"),
+            "asset_class": "crypto",
+            "engine": raw.get("engine"),
+            "cached": False,
+            "disclaimer": (
+                "Crypto technical model (momentum/EMA/RSI). Not investment advice. High risk."
+            ),
+        }
+        _ANALYZE_CACHE[cache_key] = {"ts": now, "data": dict(data)}
 
     if (prof.get("plan") or "demo").lower() == "demo":
         new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
@@ -1020,37 +1041,33 @@ def crypto_rankings(
     limit: int = Query(8, ge=1, le=12),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Ranking krypto – SEKWENCYJNIE (bez ThreadPool), żeby nie psuć limitów Twelve dla akcji."""
+    """
+    Lekki ranking: TYLKO ceny (bez full analyze / hit).
+    Pełna analiza krypto = /crypto/analyze/{symbol} – nie zjada limitów Twelve przy liście.
+    """
     _gate(prof, "crypto")
-    pairs = CRYPTO_PAIRS[:limit]
     items = []
-    for pair in pairs:
+    for pair in CRYPTO_PAIRS[:limit]:
         try:
-            d = _analyze_one(
-                pair, horizon, fast=True, quality=False, sector_override="Crypto"
-            )
-            if d.get("current_price") is not None:
-                items.append({
-                    "ticker": pair,
-                    "current_price": d.get("current_price"),
-                    "predicted_change_pct": d.get("predicted_change_pct"),
-                    "direction": d.get("direction") or "NEUTRALNY",
-                    "sector": "Crypto",
-                    "fundamental_rating": d.get("fundamental_rating"),
-                    "hit_rate": d.get("hit_rate"),
-                })
+            price = _safe_float(core.get_live_price(pair))
+            items.append({
+                "ticker": pair,
+                "current_price": price,
+                "predicted_change_pct": None,
+                "direction": "—",
+                "sector": "Crypto",
+                "fundamental_rating": None,
+                "hit_rate": None,
+            })
         except Exception as e:
-            print("crypto rank skip", pair, e)
-        time.sleep(0.35)
-    items.sort(
-        key=lambda x: (x.get("predicted_change_pct") is not None, x.get("predicted_change_pct") or -999),
-        reverse=True,
-    )
+            print("crypto rank price", pair, e)
+        time.sleep(0.12)
     return {
         "horizon": "3M" if _horizon_days(horizon) > 30 else "1M",
         "items": items,
-        "disclaimer": "Crypto forecasts use the same technical engine as equities. High risk.",
+        "disclaimer": "List prices only. Run Analyze on a symbol for forecast/hit. Protects equity API limits.",
     }
+
 
 
 @app.get("/")

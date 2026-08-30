@@ -116,13 +116,18 @@ def _cache_key(func_name, *args, **kwargs):
     key_str = func_name + "_" + "_".join(str(a) for a in args) + "_" + "_".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
     return hashlib.md5(key_str.encode()).hexdigest()
 
-def _cache_get(key):
+def _cache_get(key, hours=None):
+    """hours=None → 1h domyślnie; hist_v2 może brać dłużej (stabilniejszy Hit)."""
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=1):  # cache 1h – mniej kredytów Twelve
+            ttl = hours if hours is not None else 1
+            # hist_* – 6h, żeby po limicie Twelve nie liczyć hitu na urywanej historii
+            if hours is None and str(key).startswith("hist"):
+                ttl = 6
+            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=ttl):
                 return data['data']
         except Exception:
             pass
@@ -3167,10 +3172,9 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if len(df) < min_len:
         return None
 
-    # Trochę ostrzejsze progi niż wcześniej (2.0 / 3.5)
-    min_move = 2.0 if days_forward <= 30 else 3.5
-    # Prognoza musi być „wyraźna” – inaczej nie liczymy hitu
-    min_pred = 1.0 if days_forward <= 30 else 2.0
+    # Progi istotności (kierunek + ruch). Nie „soft hit” – tylko nieco mniej ostre niż v-ostra.
+    min_move = 1.5 if days_forward <= 30 else 3.0
+    min_pred = 0.8 if days_forward <= 30 else 1.5
 
     df_clean = df.ffill().bfill()
     n = len(df_clean)
@@ -4025,5 +4029,204 @@ def init_macro_for_api():
         load_macro_csv()
     except Exception as e:
         print("Makro init:", e)
+
+
+
+# ============================================================
+# CRYPTO TECHNICAL ENGINE (osobno od akcji – bez fundamentów equity)
+# Momentum + EMA + RSI regime; hit = ten sam sens (kierunek), inne progi vol
+# ============================================================
+
+def _crypto_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def predict_crypto_technical(df, days_forward=21):
+    """
+    Prognoza % dla krypto – czysta technika (bez score fundamentalnego akcji).
+    Zwraca: (predicted_price, direction, change_pct)
+    """
+    if df is None or len(df) < 60 or "Close" not in df.columns:
+        return None, "NEUTRALNY", None
+    close = df["Close"].astype(float)
+    price = float(close.iloc[-1])
+    if price <= 0:
+        return None, "NEUTRALNY", None
+
+    # momentum
+    def ret(n):
+        if len(close) <= n:
+            return 0.0
+        p0 = float(close.iloc[-n - 1])
+        if p0 <= 0:
+            return 0.0
+        return (price / p0 - 1.0) * 100.0
+
+    m7, m14, m30 = ret(7), ret(14), ret(30)
+    ema12 = float(close.ewm(span=12, adjust=False).mean().iloc[-1])
+    ema26 = float(close.ewm(span=26, adjust=False).mean().iloc[-1])
+    ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1]) if len(close) >= 50 else ema26
+    rsi = _crypto_rsi(close)
+    rsi_v = float(rsi.iloc[-1]) if rsi is not None and not np.isnan(rsi.iloc[-1]) else 50.0
+    vol = float(close.pct_change().tail(20).std() * 100) if len(close) > 25 else 3.0
+
+    # skala horyzontu (krypto: silniejszy short-term momentum)
+    if days_forward <= 30:
+        horiz_scale = 0.55  # ~1M: nie ekstrapoluj całego m30
+        w7, w14, w30 = 0.40, 0.35, 0.25
+    else:
+        horiz_scale = 0.85
+        w7, w14, w30 = 0.20, 0.35, 0.45
+
+    mom = w7 * m7 + w14 * m14 + w30 * m30
+    trend = 0.0
+    if price > ema12 > ema26:
+        trend += 2.0
+    elif price < ema12 < ema26:
+        trend -= 2.0
+    if price > ema50:
+        trend += 1.0
+    elif price < ema50:
+        trend -= 1.0
+
+    # RSI: w trendzie momentum, w range mean-reversion lekko
+    rsi_adj = 0.0
+    if rsi_v >= 70:
+        rsi_adj = -1.2 if abs(m14) < 8 else 0.4  # silny trend kontynuacja lekko
+    elif rsi_v <= 30:
+        rsi_adj = 1.2 if abs(m14) < 8 else -0.4
+
+    raw = horiz_scale * (0.70 * mom + 0.20 * trend * max(vol, 1.5) + 0.10 * rsi_adj * max(vol, 1.5))
+    # clamp – krypto bywa szalone, nie dawaj absurdu
+    cap = 25.0 if days_forward <= 30 else 45.0
+    change_pct = float(np.clip(raw, -cap, cap))
+
+    if abs(change_pct) < 0.8:
+        direction = "NEUTRALNY"
+    elif change_pct > 0:
+        direction = "WZROSTOWY"
+    else:
+        direction = "SPADKOWY"
+
+    pred_price = price * (1.0 + change_pct / 100.0)
+    return round(pred_price, 6), direction, round(change_pct, 2)
+
+
+def backtest_crypto_quality(df, days_forward=21, max_points=24, step=None):
+    """
+    Walk-forward hit dla krypto – ta sama idea (zgodność znaku),
+    progi istotności pod wyższą zmienność.
+    """
+    if df is None or df.empty or len(df) < days_forward + 60:
+        return None
+    # krypto: większy ruch = „istotny”
+    min_move = 3.0 if days_forward <= 30 else 6.0
+    min_pred = 1.5 if days_forward <= 30 else 3.0
+
+    df_clean = df.ffill().bfill()
+    n = len(df_clean)
+    end = n - days_forward - 1
+    if end < 60:
+        return None
+
+    if step is None:
+        step = 8 if days_forward <= 30 else 12
+
+    start_i = max(60, end - max_points * step)
+    indices = list(range(start_i, end + 1, step))
+    if len(indices) < 5:
+        step = max(5, step // 2)
+        start_i = max(60, end - (max_points + 10) * step)
+        indices = list(range(start_i, end + 1, step))
+    if len(indices) < 4:
+        return None
+
+    dir_hits = 0
+    significant = 0
+    errors = []
+
+    for i in indices:
+        hist = df_clean.iloc[: i + 1]
+        if len(hist) < 50:
+            continue
+        try:
+            _, _, pred_ret = predict_crypto_technical(hist, days_forward)
+            if pred_ret is None:
+                continue
+            p0 = float(df_clean["Close"].iloc[i])
+            p1 = float(df_clean["Close"].iloc[i + days_forward])
+            if p0 <= 0:
+                continue
+            actual_ret = (p1 / p0 - 1.0) * 100.0
+            errors.append(abs(float(pred_ret) - actual_ret))
+            if abs(actual_ret) < min_move or abs(float(pred_ret)) < min_pred:
+                continue
+            significant += 1
+            if (actual_ret > 0 and float(pred_ret) > 0) or (actual_ret < 0 and float(pred_ret) < 0):
+                dir_hits += 1
+        except Exception:
+            continue
+
+    if significant < 3:
+        hit = 50.0  # za mało próby – neutralnie, nie kłam wysokim %
+    else:
+        hit = 100.0 * dir_hits / significant
+    mae = float(np.mean(errors)) if errors else None
+    return {
+        "hit_rate": round(float(hit), 1),
+        "mae": round(mae, 2) if mae is not None else None,
+        "n_significant": significant,
+        "engine": "crypto_technical_v1",
+    }
+
+
+def analyze_crypto_pair(symbol, days_forward=21):
+    """Pełna odpowiedź pod API krypto."""
+    sym = str(symbol).strip().upper()
+    df = get_historical_prices(sym, days=500)
+    if df is None or getattr(df, "empty", True):
+        return None
+    df = calculate_indicators_on_df(df) if "calculate_indicators_on_df" in dir() else df
+    try:
+        df = calculate_indicators_on_df(df)
+    except Exception:
+        pass
+    price = float(df["Close"].iloc[-1])
+    pred_price, direction, chg = predict_crypto_technical(df, days_forward)
+    q = backtest_crypto_quality(df, days_forward=days_forward, max_points=24)
+    rsi = None
+    if "RSI" in df.columns:
+        try:
+            rsi = float(df["RSI"].iloc[-1])
+        except Exception:
+            pass
+    if rsi is None:
+        r = _crypto_rsi(df["Close"])
+        try:
+            rsi = float(r.iloc[-1])
+        except Exception:
+            rsi = None
+    return {
+        "ticker": sym,
+        "symbol": sym,
+        "asset_class": "crypto",
+        "current_price": round(price, 6),
+        "predicted_price": pred_price,
+        "predicted_change_pct": chg,
+        "direction": direction or "NEUTRALNY",
+        "rsi": round(rsi, 2) if rsi is not None and not (isinstance(rsi, float) and np.isnan(rsi)) else None,
+        "sector": "Crypto",
+        "fundamental_rating": None,
+        "combined_score": None,
+        "hit_rate": (q or {}).get("hit_rate"),
+        "mae": (q or {}).get("mae"),
+        "n_significant": (q or {}).get("n_significant"),
+        "engine": "crypto_technical_v1",
+    }
+
 
 print("core_analysis loaded (headless, ready for FastAPI)")
