@@ -3475,22 +3475,27 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         max_dd_hist = -25.0
 
     if dd_anchors:
-        risk_anchor = float(np.median(dd_anchors))
+        # p75 ma większą wagę gdy jesteśmy wysoko w range (realistyczniejszy downside)
+        if position_pct >= 85 and hist_dd_p75 is not None:
+            risk_anchor = float(0.45 * abs(float(hist_dd_p75)) + 0.55 * float(np.median(dd_anchors)))
+        else:
+            risk_anchor = float(np.median(dd_anchors))
     else:
         risk_anchor = 22.0 + max(0.0, position_pct - 50) * 0.35
 
-    # składowa pozycyjna (nie dominuje, tylko koryguje)
+    # składowa pozycyjna – korekta, nie drugi "crash score"
     pos_add = 0.0
     if position_pct > 70:
-        pos_add += (position_pct - 70) * 0.35
+        pos_add += (position_pct - 70) * 0.30
     if position_pct > 90:
-        pos_add += (position_pct - 90) * 0.8
-    if dist_to_sma > 10:
-        pos_add += min(8.0, (dist_to_sma - 10) * 0.35)
-    if rsi_val > 70:
-        pos_add += min(5.0, (rsi_val - 70) * 0.35)
+        pos_add += (position_pct - 90) * 0.70
+    if dist_to_sma > 12:
+        pos_add += min(7.0, (dist_to_sma - 12) * 0.30)
+    if rsi_val > 72:
+        pos_add += min(4.0, (rsi_val - 72) * 0.30)
 
-    risk = risk_anchor * 0.70 + pos_add
+    # hist DD dominuje risk of drop (to ma być "ile może spaść", nie klon crash score)
+    risk = risk_anchor * 0.78 + pos_add * 0.85
 
     # jakość / trend: blue-chip w silnym trendzie ≠ max risk
     quality = 0.5
@@ -3519,10 +3524,18 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         risk *= (0.92 + cs / 100.0 * 0.18)
 
     # podłogi / sufity – realistyczne, nie zawsze 60
+    # podłogi: nie poniżej typowego hist DD gdy jesteśmy przy szczycie
+    hist_floor = None
+    if hist_dd_p50 is not None:
+        hist_floor = abs(float(hist_dd_p50)) * (0.85 if position_pct >= 85 else 0.70)
     if position_pct >= 92:
         risk = max(risk, 28.0 + (0 if quality > 0.6 else 5))
+        if hist_floor:
+            risk = max(risk, min(48.0, hist_floor))
     elif position_pct >= 85:
         risk = max(risk, 24.0)
+        if hist_floor:
+            risk = max(risk, min(45.0, hist_floor * 0.95))
     elif position_pct >= 75:
         risk = max(risk, 20.0)
     if position_pct < 30:
@@ -3898,14 +3911,34 @@ def get_3year_perspective(ticker, fundamental_score=None):
             }
             crash_risk_score = 50
 
-        # --- Analogie historyczne (biblioteka krachów) ---
+        # --- Analogie historyczne (biblioteka krachów) – większa waga w crash score ---
         analogies = _analyze_crash_analogies(position_in_10y, dist_sma200, vol_10y)
-        if analogies['best_analogy_type'] == 'SYSTEMIC' and analogies['best_similarity'] >= 55:
-            crash_risk_score = min(100, crash_risk_score + 10)
-        elif analogies['best_analogy_type'] == 'CORRECTION' and analogies['best_similarity'] >= 60:
-            crash_risk_score = min(100, crash_risk_score + 4)
-        elif analogies['risk_tier'] == 'NISKI':
-            crash_risk_score = max(0, crash_risk_score - 5)
+        sim = float(analogies.get('best_similarity') or 0)
+        atype = analogies.get('best_analogy_type') or ''
+        if atype == 'SYSTEMIC' and sim >= 50:
+            # similarity skaluje bonus (nie stałe +10)
+            crash_risk_score = min(100, crash_risk_score + int(8 + (sim - 50) * 0.35))
+        elif atype == 'CORRECTION' and sim >= 55:
+            crash_risk_score = min(100, crash_risk_score + int(3 + (sim - 55) * 0.20))
+        elif analogies.get('risk_tier') == 'NISKI' and position_in_10y < 55:
+            crash_risk_score = max(0, crash_risk_score - 6)
+
+        # Vol przy szczycie range = gorszy setup niż sama vol lub sam range
+        if position_in_10y >= 85 and vol_10y >= 35:
+            crash_risk_score = min(100, crash_risk_score + 6)
+        elif position_in_10y >= 80 and vol_10y >= 45:
+            crash_risk_score = min(100, crash_risk_score + 5)
+
+        # Bliskość ATH (sesje w pobliżu high 3Y)
+        try:
+            near_ath = float((data_3y['Close'] >= high_3y * 0.97).tail(60).mean())
+            if near_ath >= 0.35 and position_in_3y_range >= 85:
+                crash_risk_score = min(100, crash_risk_score + 5)
+        except Exception:
+            pass
+
+        crash_risk_score = int(max(0, min(100, crash_risk_score)))
+
         # zsynchronizuj tier z finalnym score
         if crash_risk_score >= 70 or position_in_10y >= 90:
             analogies['risk_tier'] = "WYSOKI"
@@ -3930,6 +3963,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
         price_percentiles = np.percentile(data_3y['Close'], [10, 25, 75, 90])
         low_25 = float(price_percentiles[1])
         high_75 = float(price_percentiles[2])
+        # wstępne reguły pozycyjne
         if current_price <= low_25 or pos_check < okazja_prog:
             duza_okazja = "TAK"
         if current_price >= high_75 or pos_check > zagrozenie_prog:
@@ -3970,6 +4004,42 @@ def get_3year_perspective(ticker, fundamental_score=None):
         risk_pct = round(float(np.clip(risk_pct * min(downside_mult, 1.15), 8.0, 55.0)), 1)
         upside_pct = round(float(np.clip(upside_pct * min(upside_mult, 1.15), 10.0, 95.0)), 1)
 
+        # Twarde reguły okazja/zagrożenie – spójne z crash + risk of drop
+        if crash_risk_score >= 65 or risk_pct >= 26 or position_in_10y >= 88:
+            duze_zagrozenie = "TAK"
+        if crash_risk_score >= 70 and position_in_10y >= 80:
+            duza_okazja = "NIE"  # nigdy "okazja" przy wysokim crash blisko szczytu
+        if duza_okazja == "TAK" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
+            duza_okazja = "NIE"
+        if (
+            position_in_10y <= 35
+            and crash_risk_score <= 40
+            and upside_pct > risk_pct * 1.15
+        ):
+            duza_okazja = "TAK"
+            if risk_pct < 22 and crash_risk_score < 55:
+                duze_zagrozenie = "NIE"
+
+        # Krótki "why" – UX, zero wpływu na 1M/3M
+        why = []
+        why.append(
+            f"Position in range ~{position_in_3y_range:.0f}% (3Y high {high_3y:.2f} / low {low_3y:.2f})."
+        )
+        why.append(
+            f"Crash risk {crash_risk_score}/100 · tier {analogies.get('risk_tier', '—')}."
+        )
+        if analogies.get('best_analogy'):
+            why.append(
+                f"Closest analogy: {analogies['best_analogy']} (similarity {analogies.get('best_similarity', 0):.0f}%)."
+            )
+        if analogies.get('hist_dd_6m_p50') is not None:
+            why.append(
+                f"Hist. drawdowns (analogy): p50 {analogies['hist_dd_6m_p50']}%, p75 {analogies.get('hist_dd_6m_p75')}%."
+            )
+        why.append(
+            f"Risk of drop ~{risk_pct}% vs upside ~{upside_pct}% (trend: {trend_3y})."
+        )
+
         return {
             'ticker': ticker,
             'current_price': current_price,
@@ -3996,6 +4066,8 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'hist_recovery_months': analogies['hist_recovery_months'],
             'analogy_details': analogies,
             'own_conditional_dd': own_dd,
+            'rationale': why,
+            'engine': 'perspective-3y-v2',
         }
     except Exception as e:
         print(f"Błąd analizy 3-letniej dla {ticker}: {e}")
