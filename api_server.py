@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "signals-cache-v1"
+API_BUILD = "backtest-cache-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -183,6 +183,12 @@ _SIGNALS_CACHE: Dict[str, Any] = {}
 _SIGNALS_LOCK = threading.Lock()
 _SIGNALS_CACHE_TTL = int(os.environ.get("SIGNALS_CACHE_TTL", "3600"))  # 1h
 
+# Backtest forecast/strategy – ten sam model: licz raz, serwuj wielu userom
+_BACKTEST_CACHE: Dict[str, Any] = {}
+_BACKTEST_LOCK = threading.Lock()
+_BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
+
+
 
 # ============================================================
 # PRECOMPUTE + KEEP-ALIVE
@@ -276,6 +282,12 @@ def _precompute_all_once() -> None:
         _precompute_signals_once()
     except Exception as e:
         print("[precompute] signals:", e)
+
+    # Domyślne backtesty (capital=10000, forecast 1M/3M) – strona bierze z cache
+    try:
+        _precompute_backtests_once()
+    except Exception as e:
+        print("[precompute] backtests:", e)
 
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
@@ -645,36 +657,121 @@ def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
 
 
 
+
+def _precompute_backtests_once() -> None:
+    """Strategy + forecast quality dla listy priorytetowej – wspólny cache."""
+    tickers = _ticker_list_for_precompute()[:12]
+    cap = 10000
+    for t in tickers:
+        try:
+            key_s = _bt_cache_key("strategy", t, cap)
+            data_s = reports.strategy_backtest(t, initial_capital=float(cap))
+            if isinstance(data_s, dict):
+                _bt_cache_set(key_s, data_s)
+        except Exception as e:
+            print("[bt-precompute] strategy", t, e)
+        for hz in ("1M", "3M"):
+            try:
+                key_f = _bt_cache_key("forecast", t, hz)
+                data_f = reports.forecast_quality_backtest(t, horizon=hz)
+                if isinstance(data_f, dict):
+                    _bt_cache_set(key_f, data_f)
+            except Exception as e:
+                print("[bt-precompute] forecast", t, hz, e)
+        time.sleep(0.35)
+    print(f"[bt-precompute] done for {len(tickers)} tickers")
+
+def _bt_cache_key(kind: str, *parts: Any) -> str:
+    day = time.strftime("%Y-%m-%d")
+    body = "|".join(str(p) for p in parts)
+    return f"bt|{kind}|{body}|{day}"
+
+
+def _bt_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _BACKTEST_LOCK:
+        row = _BACKTEST_CACHE.get(key)
+        if not row:
+            return None
+        if now - float(row["ts"]) > _BACKTEST_CACHE_TTL:
+            return None
+        out = dict(row["data"])
+        out["cached"] = True
+        out["age_sec"] = int(now - float(row["ts"]))
+        out["cache_ttl_sec"] = _BACKTEST_CACHE_TTL
+        return out
+
+
+def _bt_cache_set(key: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(data)
+    payload["cached"] = False
+    payload["cache_ttl_sec"] = _BACKTEST_CACHE_TTL
+    payload["computed_at"] = int(time.time())
+    with _BACKTEST_LOCK:
+        _BACKTEST_CACHE[key] = {"ts": time.time(), "data": dict(payload)}
+        # proste czyszczenie
+        if len(_BACKTEST_CACHE) > 400:
+            oldest = sorted(_BACKTEST_CACHE.items(), key=lambda kv: kv[1]["ts"])[:100]
+            for k, _ in oldest:
+                _BACKTEST_CACHE.pop(k, None)
+    return payload
+
+
 @app.get("/backtest/forecast/{ticker}")
 def forecast_backtest(
     ticker: str,
     horizon: str = Query("1M"),
+    refresh: int = Query(0, description="1=wymuś przeliczenie"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Walk-forward Hit%% / MAE jak w desktopie."""
+    """Walk-forward Hit%/MAE – wynik cache'owany na serwerze (współdzielony)."""
     _gate(prof, "backtest_forecast")
+    t = ticker.upper().strip()
+    hz = "3M" if _horizon_days(horizon) > 30 else "1M"
+    key = _bt_cache_key("forecast", t, hz)
+    if not refresh:
+        hit = _bt_cache_get(key)
+        if hit is not None:
+            return hit
     try:
-        return reports.forecast_quality_backtest(ticker, horizon=horizon)
+        data = reports.forecast_quality_backtest(t, horizon=hz)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if isinstance(data, dict):
+        return _bt_cache_set(key, data)
+    return data
 
 
 @app.get("/backtest/strategy/{ticker}")
 def strategy_backtest(
     ticker: str,
     capital: float = Query(10000, ge=100, le=1_000_000),
+    refresh: int = Query(0, description="1=wymuś przeliczenie"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Backtest strategii MACD/RSI/ADX + SL/TP."""
+    """
+    Backtest MACD/RSI/ADX + SL/TP.
+    Liczony raz na (ticker, capital, dzień) i serwowany z cache – nie per każdy user refresh.
+    """
     _gate(prof, "backtest_strategy")
+    t = ticker.upper().strip()
+    cap = int(round(float(capital)))
+    key = _bt_cache_key("strategy", t, cap)
+    if not refresh:
+        hit = _bt_cache_get(key)
+        if hit is not None:
+            return hit
     try:
-        return reports.strategy_backtest(ticker, initial_capital=capital)
+        data = reports.strategy_backtest(t, initial_capital=float(cap))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    if isinstance(data, dict):
+        return _bt_cache_set(key, data)
+    return data
 
 
 @app.get("/report/{ticker}")
