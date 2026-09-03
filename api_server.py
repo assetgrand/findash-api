@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "crypto-only-v1"
+API_BUILD = "signals-cache-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -177,6 +177,13 @@ _ANALYZE_CACHE: Dict[str, Any] = {}
 
 _ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
 
+# Signals: wynik skanu trzymany na serwerze – strona tylko czyta (komercyjnie)
+# Hybrid stoi na świecach dziennych → 1h domyślnie; na produkcję można 6h/24h (SIGNALS_CACHE_TTL)
+_SIGNALS_CACHE: Dict[str, Any] = {}
+_SIGNALS_LOCK = threading.Lock()
+_SIGNALS_CACHE_TTL = int(os.environ.get("SIGNALS_CACHE_TTL", "3600"))  # 1h
+
+
 # ============================================================
 # PRECOMPUTE + KEEP-ALIVE
 # Nie zmienia silnika analizy – tylko woła _analyze_one w tle
@@ -264,6 +271,12 @@ def _precompute_all_once() -> None:
                 _PRECOMPUTE_STATUS["last_error"] = msg
         _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
         time.sleep(_PRECOMPUTE_PAUSE)
+    # Po prognozach 1M/3M – odśwież board sygnałów (raz na rundę, nie per user refresh)
+    try:
+        _precompute_signals_once()
+    except Exception as e:
+        print("[precompute] signals:", e)
+
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
     with _PRECOMPUTE_LOCK:
@@ -718,24 +731,75 @@ def hybrid_analyze(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/signals")
-def signals(
-    mode: str = Query("Zrównoważony"),
-    limit: int = Query(20, ge=1, le=50),
-    prof: Dict[str, Any] = Depends(get_profile),
-):
-    """Skaner sygnałów Hybrid po domyślnej liście tickerów (plan Pro)."""
-    _gate(prof, "signals")
-    tickers = list(getattr(core, "tickers", []))[:limit]
+def _signals_cache_key(mode: str, limit: int) -> str:
+    m = (mode or "Zrównoważony").strip()
+    return f"signals|{m}|{int(limit)}"
+
+
+def _build_signals_payload(mode: str, limit: int) -> Dict[str, Any]:
+    """Pełny skan hybrid – wołany rzadko (cache / precompute), nie przy każdym odświeżeniu UI."""
+    tickers = list(getattr(core, "tickers", []) or [])[: max(int(limit), 1)]
     items = hybrid.scan_signals(tickers=tickers, mode=mode)
     return {
         "mode": mode,
         "count": len(items),
         "items": items,
+        "cached": False,
+        "cache_ttl_sec": _SIGNALS_CACHE_TTL,
+        "computed_at": int(time.time()),
         "disclaimer": (
-            "Sygnały hybrydowe to narzędzie techniczne, nie rekomendacja inwestycyjna."
+            "Hybrid signals are a technical tool, not investment advice. "
+            "Server caches the scan; the page only displays the last result."
         ),
     }
+
+
+def _precompute_signals_once() -> None:
+    """Odśwież sygnały dla 3 trybów – po rundzie 1M/3M albo gdy cache pusty."""
+    modes = ("Agresywny", "Zrównoważony", "Bezpieczny")
+    limit = min(20, max(len(getattr(core, "tickers", []) or []), 8))
+    for mode in modes:
+        try:
+            payload = _build_signals_payload(mode, limit)
+            key = _signals_cache_key(mode, limit)
+            with _SIGNALS_LOCK:
+                _SIGNALS_CACHE[key] = {"ts": time.time(), "data": payload}
+            print(f"[signals-cache] refreshed mode={mode} count={payload.get('count')}")
+        except Exception as e:
+            print(f"[signals-cache] error mode={mode}: {e}")
+        time.sleep(0.5)
+
+
+@app.get("/signals")
+def signals(
+    mode: str = Query("Zrównoważony"),
+    limit: int = Query(20, ge=1, le=50),
+    refresh: int = Query(0, description="1=wymuś przeliczenie (admin/ops)"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """
+    Skaner sygnałów Hybrid (Pro).
+    Komercyjnie: wynik liczony rzadko i trzymany w cache; UI tylko odczytuje.
+    """
+    _gate(prof, "signals")
+    mode = (mode or "Zrównoważony").strip()
+    key = _signals_cache_key(mode, limit)
+    now = time.time()
+
+    if not refresh:
+        with _SIGNALS_LOCK:
+            row = _SIGNALS_CACHE.get(key)
+            if row and (now - float(row["ts"])) < _SIGNALS_CACHE_TTL:
+                out = dict(row["data"])
+                out["cached"] = True
+                out["age_sec"] = int(now - float(row["ts"]))
+                return out
+
+    # Brak cache / wygasł / refresh=1 → policz raz i zapisz
+    payload = _build_signals_payload(mode, limit)
+    with _SIGNALS_LOCK:
+        _SIGNALS_CACHE[key] = {"ts": now, "data": dict(payload)}
+    return payload
 
 
 
