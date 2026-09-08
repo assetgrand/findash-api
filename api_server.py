@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "backtest-cache-v1"
+API_BUILD = "trusted-ip-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -67,13 +67,31 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Auth + plany (Demo / Standard / Pro)
 # ---------------------------------------------------------------------------
+def _client_ip(request: Request) -> str:
+    """IP za proxy (Render) z X-Forwarded-For."""
+    xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip") or request.headers.get("X-Real-IP")
+    if xri:
+        return xri.strip()
+    try:
+        if request.client and request.client.host:
+            return str(request.client.host)
+    except Exception:
+        pass
+    return "unknown"
+
+
 async def get_profile(
+    request: Request,
     authorization: Optional[str] = Header(None),
     x_dev_email: Optional[str] = Header(None, alias="X-Dev-Email"),
 ) -> Dict[str, Any]:
     """
     Wymaga Bearer <supabase_access_token> gdy AUTH_REQUIRED=1.
     Lokalnie: DEV_AUTH_BYPASS=1 + nagłówek X-Dev-Email.
+    Przy autentycznym userze: rejestracja / kontrola zaufanego IP.
     """
     if not auth.AUTH_REQUIRED:
         return {
@@ -87,7 +105,11 @@ async def get_profile(
     # Dev bypass
     if auth.DEV_AUTH_BYPASS and x_dev_email:
         uid = "dev-" + str(abs(hash(x_dev_email.lower().strip())) % (10**12))
-        return auth.ensure_profile(uid, email=x_dev_email.strip())
+        prof = auth.ensure_profile(uid, email=x_dev_email.strip())
+        try:
+            return auth.apply_trusted_ip(prof, _client_ip(request))
+        except PermissionError as e:
+            raise HTTPException(status_code=403, detail=str(e))
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -100,7 +122,10 @@ async def get_profile(
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Nieprawidłowy token: {e}")
     try:
-        return auth.ensure_profile(user["id"], email=user.get("email"))
+        prof = auth.ensure_profile(user["id"], email=user.get("email"))
+        return auth.apply_trusted_ip(prof, _client_ip(request))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Profil: {e}")
 
@@ -1265,4 +1290,3 @@ def root():
             "GET /report/{ticker}/pdf",
             "GET /report/{ticker}/xlsx",
         ],
-    }
