@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "trusted-ip-v1"
+API_BUILD = "trusted-ip-v1-fix"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -1264,29 +1264,29 @@ def root():
     return {
         "service": "FinDash Analysis API",
         "docs": "/docs",
+        "build": API_BUILD,
         "endpoints": [
             "GET /health",
             "GET /me",
-            "GET /gov/contracts?days=30&limit=40",
-            "GET /gov/contracts/latest?days=30",
-            "GET /gov/contracts/company/{name}",
+            "GET /gov/contracts",
             "GET /plans",
             "GET /tickers",
             "GET /analyze/{ticker}?horizon=1M|3M",
             "GET /rankings?horizon=1M&limit=12",
             "GET /fundamentals/{ticker}",
             "GET /perspective-3y/{ticker}",
-            "GET /hybrid/{ticker}?mode=Zrównoważony",
-            "GET /signals?mode=Zrównoważony&limit=20",
+            "GET /hybrid/{ticker}",
+            "GET /signals",
             "GET /crypto/tickers",
-            "GET /crypto/analyze/{symbol}?horizon=1M|3M",
+            "GET /crypto/analyze/{symbol}",
             "GET /crypto/rankings",
             "GET /precompute/status",
             "POST /precompute/run",
             "GET /keepalive",
-            "GET /backtest/forecast/{ticker}?horizon=1M|3M",
-            "GET /backtest/strategy/{ticker}?capital=10000",
+            "GET /backtest/forecast/{ticker}",
+            "GET /backtest/strategy/{ticker}",
             "GET /report/{ticker}",
             "GET /report/{ticker}/pdf",
             "GET /report/{ticker}/xlsx",
         ],
+    }
