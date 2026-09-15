@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "trusted-ip-v1-fix"
+API_BUILD = "rankings-bottom-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -591,16 +591,29 @@ def analyze(
 def rankings(
     horizon: str = Query("1M"),
     limit: int = Query(12, ge=1, le=30),
+    order: str = Query("top", description="top | bottom — najwyższy / najniższy forecast %"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Ranking sekwencyjnie – bez ThreadPool (stabilniejsze Twelve / hit akcji)."""
+    """
+    Ranking sekwencyjnie – bez ThreadPool.
+    order=top  → Top N po predicted_change_pct (malejąco)
+    order=bottom → Bottom N (rosnąco) — ta sama lista tickerów.
+    """
     _gate(prof, "rankings")
-    tick_list = list(getattr(core, "tickers", []))[: max(limit, 6)]
+    order_l = (order or "top").strip().lower()
+    if order_l not in ("top", "bottom"):
+        order_l = "top"
+    # Pełna watchlista (nie ucinaj przed sortem — top i bottom z tego samego uniwersum)
+    tick_list = list(getattr(core, "tickers", []) or [])
+    if not tick_list:
+        tick_list = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM"]
     items: List[RankingItem] = []
+    hz = "3M" if _horizon_days(horizon) > 30 else "1M"
     for tk in tick_list:
         try:
-            hz = "3M" if _horizon_days(horizon) > 30 else "1M"
-            d = _pc_get(tk, hz) or _analyze_one(tk, horizon, fast=True, quality=False)
+            d = _pc_get(tk, hz) or _analyze_one(tk, hz, fast=True, quality=False)
+            if not d or d.get("current_price") is None:
+                continue
             items.append(
                 RankingItem(
                     ticker=d["ticker"],
@@ -615,14 +628,16 @@ def rankings(
         except Exception as e:
             print("rankings skip", tk, e)
         time.sleep(0.25)
+    # top = najwyższy %, bottom = najniższy %
     items.sort(
-        key=lambda x: (x.predicted_change_pct is not None, x.predicted_change_pct or -999),
-        reverse=True,
+        key=lambda x: (
+            x.predicted_change_pct is not None,
+            x.predicted_change_pct if x.predicted_change_pct is not None else (999 if order_l == "bottom" else -999),
+        ),
+        reverse=(order_l == "top"),
     )
     items = items[:limit]
-    return RankingsResponse(
-        horizon="3M" if _horizon_days(horizon) > 30 else "1M", items=items
-    )
+    return RankingsResponse(horizon=hz, items=items)
 
 
 @app.get("/fundamentals/{ticker}")
@@ -1272,7 +1287,7 @@ def root():
             "GET /plans",
             "GET /tickers",
             "GET /analyze/{ticker}?horizon=1M|3M",
-            "GET /rankings?horizon=1M&limit=12",
+            "GET /rankings?horizon=1M|3M&limit=12&order=top|bottom",
             "GET /fundamentals/{ticker}",
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}",
