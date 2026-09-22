@@ -99,7 +99,7 @@ FONT_MONO = ("Consolas", 10)
 # ============================================================
 
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_TWELVE_DATA"
-# kompatybilność ze starym env (opcjonalNO)
+# kompatybilność ze starym env (optional)
 if TWELVE_DATA_API_KEY in ("", "WPISZ_KLUCZ_TWELVE_DATA"):
     TWELVE_DATA_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or TWELVE_DATA_API_KEY
 
@@ -117,7 +117,7 @@ def _cache_key(func_name, *args, **kwargs):
     return hashlib.md5(key_str.encode()).hexdigest()
 
 def _cache_get(key, hours=None):
-    """hours=None → 1h domyślNO; hist_v2 może brać dłużej (stabilNOjszy Hit)."""
+    """hours=None → 1h default; hist_v2 może brać dłużej (more stable Hit)."""
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     if os.path.exists(path):
         try:
@@ -208,7 +208,7 @@ def test_api_key():
             print(f"✅ KLUCZ DZIAŁA!")
             print(f"   📈 AAPL: ${price}")
             return True
-        print(f"❌ NOznana odpowiedź API: {str(data)[:200]}")
+        print(f"❌ Unknown odpowiedź API: {str(data)[:200]}")
         return False
     except Exception as e:
         print(f"❌ Błąd: {e}")
@@ -1785,7 +1785,7 @@ def get_technical_signal(df):
 
         signals = []
 
-if rsi_val < 30:
+        if rsi_val < 30:
             signals.append("RSI: OVERSOLD")
         elif rsi_val > 70:
             signals.append("RSI: OVERBOUGHT")
@@ -1829,6 +1829,7 @@ if rsi_val < 30:
             signals.append("CMF: NEGATIVE (distribution)")
         if not signals:
             return "NO SIGNAL"
+
 
         return " | ".join(signals[:6])
     except Exception as e:
@@ -2080,23 +2081,23 @@ def get_3year_perspective(ticker, fundamental_score=None):
         # Dynamiczne progi dla okazji/zagrożenia
         if volatility > 40:  # wysoka zmienność
             okazja_prog = 20
-            zagrozeNO_prog = 80
+            threat_threshold = 80
         elif volatility > 25:
             okazja_prog = 25
-            zagrozeNO_prog = 75
+            threat_threshold = 75
         else:
             okazja_prog = 30
-            zagrozeNO_prog = 70
+            threat_threshold = 70
         
         duza_okazja = "NO"
-        duze_zagrozeNO = "NO"
+        big_threat = "NO"
         
         # Sprawdź czy cena jest w dolnym percentylu (okazja)
         if current_price <= low_25 or pos_check < okazja_prog:
             duza_okazja = "YES"
         # Sprawdź czy cena jest w górnym percentylu (zagrożeNO)
-        if current_price >= high_75 or pos_check > zagrozeNO_prog:
-            duze_zagrozeNO = "YES"
+        if current_price >= high_75 or pos_check > threat_threshold:
+            big_threat = "YES"
 
         upside_mult, downside_mult = get_volume_spike_multipliers(data_3y, data_10y if has_10y else None)
         
@@ -2120,7 +2121,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozeNO': duze_zagrozeNO,
+            'big_threat': big_threat,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
@@ -2379,13 +2380,13 @@ def get_3year_perspective(ticker, fundamental_score=None):
             crash_risk_score = 50
 
         duza_okazja = "NO"
-        duze_zagrozeNO = "NO"
+        big_threat = "NO"
         pos_check = crash_details['position_in_10y'] if has_10y else position_in_3y_range
         dist_check = crash_details['dist_from_sma200_pct']
         if dist_check < -15 or pos_check < 25:
             duza_okazja = "YES"
         if dist_check > 25 or pos_check > 75:
-            duze_zagrozeNO = "YES"
+            big_threat = "YES"
 
         upside_mult, downside_mult = get_volume_spike_multipliers(data_3y, data_10y if has_10y else None)
         
@@ -2409,7 +2410,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozeNO': duze_zagrozeNO,
+            'big_threat': big_threat,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
@@ -2587,7 +2588,7 @@ def _build_training_set(df, horizon_days, max_samples=200):
         if future <= 0 or feats['close'] <= 0:
             continue
         fwd_ret = (future / feats['close'] - 1.0) * 100.0
-        # lekka normalizacja ekstremów (winsor) – stabilNOjsze dopasowaNO
+        # lekka normalizacja ekstremów (winsor) – more stable fit
         fwd_ret = float(np.clip(fwd_ret, -45.0, 45.0))
         X_list.append([feats[k] for k in FEATURE_KEYS])
         y_list.append(fwd_ret)
@@ -3818,11 +3819,11 @@ def get_3year_perspective(ticker, fundamental_score=None):
         volatility = float(daily_returns.std() * np.sqrt(252) * 100) if len(daily_returns) > 10 else 20.0
 
         if volatility > 40:
-            okazja_prog, zagrozeNO_prog = 20, 80
+            okazja_prog, threat_threshold = 20, 80
         elif volatility > 25:
-            okazja_prog, zagrozeNO_prog = 25, 75
+            okazja_prog, threat_threshold = 25, 75
         else:
-            okazja_prog, zagrozeNO_prog = 30, 70
+            okazja_prog, threat_threshold = 30, 70
 
         sma200 = data_3y['Close'].rolling(200).mean().iloc[-1]
         trend_3y = "UNKNOWN"
@@ -3975,7 +3976,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
         )
 
         duza_okazja = "NO"
-        duze_zagrozeNO = "NO"
+        big_threat = "NO"
         pos_check = position_in_10y
         price_percentiles = np.percentile(data_3y['Close'], [10, 25, 75, 90])
         low_25 = float(price_percentiles[1])
@@ -3983,8 +3984,8 @@ def get_3year_perspective(ticker, fundamental_score=None):
         # wstępne reguły pozycyjne
         if current_price <= low_25 or pos_check < okazja_prog:
             duza_okazja = "YES"
-        if current_price >= high_75 or pos_check > zagrozeNO_prog:
-            duze_zagrozeNO = "YES"
+        if current_price >= high_75 or pos_check > threat_threshold:
+            big_threat = "YES"
 
         returns_3y = data_3y['Close'].pct_change().dropna()
         if len(returns_3y) > 50:
@@ -4023,7 +4024,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
 
         # Twarde reguły okazja/zagrożeNO – spójne z crash + risk of drop
         if crash_risk_score >= 65 or risk_pct >= 26 or position_in_10y >= 88:
-            duze_zagrozeNO = "YES"
+            big_threat = "YES"
         if crash_risk_score >= 70 and position_in_10y >= 80:
             duza_okazja = "NO"  # nigdy "okazja" przy HIGHm crash blisko szczytu
         if duza_okazja == "YES" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
@@ -4035,7 +4036,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
         ):
             duza_okazja = "YES"
             if risk_pct < 22 and crash_risk_score < 55:
-                duze_zagrozeNO = "NO"
+                big_threat = "NO"
 
         # Krótki "why" – UX, zero wpływu na 1M/3M
         why = []
@@ -4065,7 +4066,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozeNO': duze_zagrozeNO,
+            'big_threat': big_threat,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
@@ -4087,7 +4088,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'engine': 'perspective-3y-v3',
         }
     except Exception as e:
-        print(f"Błąd analizy 3-letNOj dla {ticker}: {e}")
+        print(f"Błąd analizy 3-year dla {ticker}: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -4164,7 +4165,7 @@ def predict_crypto_technical(df, days_forward=21):
     rsi_v = float(rsi.iloc[-1]) if rsi is not None and not np.isnan(rsi.iloc[-1]) else 50.0
     vol = float(close.pct_change().tail(20).std() * 100) if len(close) > 25 else 3.0
 
-    # skala horyzontu (krypto: silNOjszy short-term momentum)
+    # skala horyzontu (krypto: stronger short-term momentum)
     if days_forward <= 30:
         horiz_scale = 0.55  # ~1M: NO ekstrapoluj całego m30
         w7, w14, w30 = 0.40, 0.35, 0.25

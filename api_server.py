@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "rankings-bottom-v1"
+API_BUILD = "en-labels-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -145,7 +145,7 @@ class AnalyzeResponse(BaseModel):
     price_as_of: Optional[str] = None  # data ostatniego zamknięcia (Polygon daily)
     predicted_price: Optional[float] = None
     predicted_change_pct: Optional[float] = None
-    direction: str = "NEUTRALNY"
+    direction: str = "NEUTRAL"
     rsi: Optional[float] = None
     sector: str = "Unknown"
     fundamental_rating: Optional[str] = None
@@ -166,7 +166,7 @@ class RankingItem(BaseModel):
     ticker: str
     current_price: Optional[float] = None
     predicted_change_pct: Optional[float] = None
-    direction: str = "NEUTRALNY"
+    direction: str = "NEUTRAL"
     sector: str = "Unknown"
     fundamental_rating: Optional[str] = None
     hit_rate: Optional[float] = None
@@ -403,7 +403,7 @@ def _analyze_one(
         fund_rating = fa.get("fundamental_rating")
         combined = _safe_float(fa.get("combined_score"))
 
-    pred_price, direction, chg = None, "NEUTRALNY", None
+    pred_price, direction, chg = None, "NEUTRAL", None
     try:
         pred_price, direction, chg = core.predict_with_technical_influence(
             df, fa or {}, days, sector, ticker=ticker, quiet=True
@@ -449,7 +449,7 @@ def _analyze_one(
         "price_as_of": as_of,  # data zamknięcia z Polygon (nie „live tick”)
         "predicted_price": round(pred_price, 4) if pred_price is not None else None,
         "predicted_change_pct": round(chg, 2) if chg is not None else None,
-        "direction": direction or "NEUTRALNY",
+        "direction": direction or "NEUTRAL",
         "rsi": round(rsi, 2) if rsi is not None else None,
         "sector": sector,
         "fundamental_rating": fund_rating,
@@ -619,7 +619,7 @@ def rankings(
                     ticker=d["ticker"],
                     current_price=d.get("current_price"),
                     predicted_change_pct=d.get("predicted_change_pct"),
-                    direction=d.get("direction") or "NEUTRALNY",
+                    direction=d.get("direction") or "NEUTRAL",
                     sector=d.get("sector") or "Unknown",
                     fundamental_rating=d.get("fundamental_rating"),
                     hit_rate=d.get("hit_rate"),
@@ -855,7 +855,7 @@ def report_xlsx(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
 @app.get("/hybrid/{ticker}")
 def hybrid_analyze(
     ticker: str,
-    mode: str = Query("Zrównoważony", description="Agresywny | Zrównoważony | Bezpieczny"),
+    mode: str = Query("BALANCED", description="AGGRESIVE | BALANCED | PASSIVE"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Hybrid Analyzer – score, próg, sygnał KUPNO/SPRZEDAŻ (plan Pro)."""
@@ -869,7 +869,7 @@ def hybrid_analyze(
 
 
 def _signals_cache_key(mode: str, limit: int) -> str:
-    m = (mode or "Zrównoważony").strip()
+    m = (mode or "BALANCED").strip()
     return f"signals|{m}|{int(limit)}"
 
 
@@ -893,7 +893,7 @@ def _build_signals_payload(mode: str, limit: int) -> Dict[str, Any]:
 
 def _precompute_signals_once() -> None:
     """Odśwież sygnały dla 3 trybów – po rundzie 1M/3M albo gdy cache pusty."""
-    modes = ("Agresywny", "Zrównoważony", "Bezpieczny")
+    modes = ("AGGRESIVE", "BALANCED", "PASSIVE")
     limit = min(20, max(len(getattr(core, "tickers", []) or []), 8))
     for mode in modes:
         try:
@@ -909,7 +909,7 @@ def _precompute_signals_once() -> None:
 
 @app.get("/signals")
 def signals(
-    mode: str = Query("Zrównoważony"),
+    mode: str = Query("BALANCED"),
     limit: int = Query(20, ge=1, le=50),
     refresh: int = Query(0, description="1=wymuś przeliczenie (admin/ops)"),
     prof: Dict[str, Any] = Depends(get_profile),
@@ -919,7 +919,7 @@ def signals(
     Komercyjnie: wynik liczony rzadko i trzymany w cache; UI tylko odczytuje.
     """
     _gate(prof, "signals")
-    mode = (mode or "Zrównoważony").strip()
+    mode = (mode or "BALANCED").strip()
     key = _signals_cache_key(mode, limit)
     now = time.time()
 
@@ -1210,7 +1210,7 @@ def crypto_analyze(
             "current_price": raw.get("current_price"),
             "predicted_price": raw.get("predicted_price"),
             "predicted_change_pct": raw.get("predicted_change_pct"),
-            "direction": raw.get("direction") or "NEUTRALNY",
+            "direction": raw.get("direction") or "NEUTRAL",
             "rsi": raw.get("rsi"),
             "sector": "Crypto",
             "fundamental_rating": None,
@@ -1255,7 +1255,7 @@ def crypto_rankings(
                     "ticker": pair,
                     "current_price": raw.get("current_price"),
                     "predicted_change_pct": raw.get("predicted_change_pct"),
-                    "direction": raw.get("direction") or "NEUTRALNY",
+                    "direction": raw.get("direction") or "NEUTRAL",
                     "sector": "Crypto",
                     "fundamental_rating": None,
                     "hit_rate": raw.get("hit_rate"),
