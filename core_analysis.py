@@ -99,7 +99,7 @@ FONT_MONO = ("Consolas", 10)
 # ============================================================
 
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip() or os.environ.get("POLYGON_API_KEY", "").strip() or "WPISZ_KLUCZ_TWELVE_DATA"
-# kompatybilność ze starym env (opcjonalnie)
+# kompatybilność ze starym env (opcjonalNO)
 if TWELVE_DATA_API_KEY in ("", "WPISZ_KLUCZ_TWELVE_DATA"):
     TWELVE_DATA_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip() or TWELVE_DATA_API_KEY
 
@@ -117,14 +117,14 @@ def _cache_key(func_name, *args, **kwargs):
     return hashlib.md5(key_str.encode()).hexdigest()
 
 def _cache_get(key, hours=None):
-    """hours=None → 1h domyślnie; hist_v2 może brać dłużej (stabilniejszy Hit)."""
+    """hours=None → 1h domyślNO; hist_v2 może brać dłużej (stabilNOjszy Hit)."""
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             ttl = hours if hours is not None else 1
-            # hist_* – 6h, żeby po limicie Twelve nie liczyć hitu na urywanej historii
+            # hist_* – 6h, żeby po limicie Twelve NO liczyć hitu na urywanej historii
             if hours is None and str(key).startswith("hist"):
                 ttl = 6
             if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=ttl):
@@ -154,7 +154,7 @@ def _normalize_symbol(ticker: str) -> str:
     return t
 
 def _api_call(url, max_retries=3):
-    """Wykonuje zapytanie do Twelve Data API."""
+    """Wykonuje zapytaNO do Twelve Data API."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
@@ -184,14 +184,14 @@ def test_api_key():
     print("-" * 60)
 
     if key in ("WPISZ_KLUCZ_TWELVE_DATA", "TWOJ_KLUCZ_POLYGON", "") or len(key) < 8:
-        print("❌❌❌ NIE WPISAŁEŚ KLUCZA API TWELVE DATA!")
+        print("❌❌❌ NO WPISAŁEŚ KLUCZA API TWELVE DATA!")
         print('   TWELVE_DATA_API_KEY = "twoj_klucz"')
         print("📌 https://twelvedata.com/")
         input("Naciśnij ENTER, aby zakończyć...")
         sys.exit(1)
 
     url = f"{TWELVE_BASE_URL}/quote?symbol=AAPL&apikey={key}"
-    print("⏳ Wysyłam zapytanie do Twelve Data...")
+    print("⏳ Wysyłam zapytaNO do Twelve Data...")
     try:
         resp = requests.get(url, timeout=30)
         print(f"📡 Status HTTP: {resp.status_code}")
@@ -208,21 +208,21 @@ def test_api_key():
             print(f"✅ KLUCZ DZIAŁA!")
             print(f"   📈 AAPL: ${price}")
             return True
-        print(f"❌ Nieznana odpowiedź API: {str(data)[:200]}")
+        print(f"❌ NOznana odpowiedź API: {str(data)[:200]}")
         return False
     except Exception as e:
         print(f"❌ Błąd: {e}")
         return False
 
 def _run_startup_api_check():
-    """Przy imporcie z FastAPI nie przerywamy procesu – tylko log."""
+    """Przy imporcie z FastAPI NO przerywamy procesu – tylko log."""
     try:
         ok = test_api_key()
     except Exception as e:
         print("test_api_key:", e)
         return False
     if not ok:
-        print("⚠️ TWELVE_DATA_API_KEY / POLYGON_API_KEY – klucz nie działa lub pusty")
+        print("⚠️ TWELVE_DATA_API_KEY / POLYGON_API_KEY – klucz NO działa lub pusty")
         return False
     print("✅ KLUCZ TWELVE DATA ZATWIERDZONY")
     return True
@@ -232,7 +232,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
 # ============================================================
-# FUNKCJE TWELVE DATA - POBIERANIE DANYCH
+# FUNKCJE TWELVE DATA - POBIERANO DANYCH
 # ============================================================
 
 def get_live_price(ticker):
@@ -263,7 +263,7 @@ def get_historical_prices(ticker, days=500):
         return pd.DataFrame()
 
     sym = _normalize_symbol(ticker)
-    # prosimy o wystarczająco barek sesyjnych (nie kalendarz 1:1)
+    # prosimy o wystarczająco barek sesyjnych (NO kalendarz 1:1)
     calendar_days = max(int(days), 400)
     outputsize = max(250, min(int(calendar_days * 0.85) + 50, 5000))
 
@@ -299,7 +299,7 @@ def get_historical_prices(ticker, days=500):
         f"&apikey={TWELVE_DATA_API_KEY}"
     )
     data = _api_call(url)
-    # fallback bez start/end (niektóre plany)
+    # fallback bez start/end (NOktóre plany)
     if not data or "values" not in data or not data["values"]:
         url2 = (
             f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"
@@ -522,7 +522,7 @@ def _to_scalar(val, default=0.0):
         return default
 
 # ============================================================
-# ZARZĄDZANIE CACHE MAKRO
+# ZARZĄDZANO CACHE MAKRO
 # ============================================================
 
 MACRO_CACHE_FILE = "macro_cache_meta.json"
@@ -625,7 +625,7 @@ def ensure_macro_csv():
     all_data = {}
 
     for country in countries:
-        print(f"Pobieranie danych makro dla {country}...")
+        print(f"PobieraNO danych makro dla {country}...")
         api_data = fetch_macro_data_api(country)
         fallback = get_fallback_macro(country)
         for key in ['gdp_growth', 'inflation', 'unemployment', 'interest_rate',
@@ -667,7 +667,7 @@ def get_macro_indicators(country_code='US'):
     if country_code in macro_data_cache:
         return macro_data_cache[country_code]
     else:
-        print(f"OSTRZEŻENIE: Brak danych makro dla {country_code}")
+        print(f"OSTRZEŻENO: Brak danych makro dla {country_code}")
         return None
 
 def ensure_macro_data_up_to_date():
@@ -677,12 +677,12 @@ def ensure_macro_data_up_to_date():
             ensure_macro_csv()
             update_macro_cache_timestamp()
         except Exception as e:
-            print("Aktualizacja makro nie powiodła się:", e)
+            print("Aktualizacja makro NO powiodła się:", e)
     else:
         print("Dane makro są aktualne.")
 
 # ============================================================
-# ZARZĄDZANIE PORTFELEM
+# ZARZĄDZANO PORTFELEM
 # ============================================================
 
 portfolio_positions = []
@@ -738,7 +738,7 @@ def save_watchlist():
         json.dump(watchlist, f, indent=2)
 
 # ============================================================
-# MAPOWANIE SPÓŁEK NA SEKTORY I KRAJE
+# MAPOWANO SPÓŁEK NA SEKTORY I KRAJE
 # ============================================================
 
 sector_mapping = {
@@ -798,7 +798,7 @@ country_mapping = {
 }
 
 country_names = {
-    'US': 'USA', 'DE': 'Niemcy', 'JP': 'Japonia', 'NL': 'Holandia',
+    'US': 'USA', 'DE': 'NOmcy', 'JP': 'Japonia', 'NL': 'Holandia',
     'TW': 'Tajwan', 'PL': 'Polska', 'UK': 'Wielka Brytania',
     'FR': 'Francja', 'CH': 'Szwajcaria', 'EU': 'Unia Europejska',
     'IT': 'Włochy'
@@ -1071,7 +1071,7 @@ def calculate_indicators_on_df(df):
 
 def calculate_country_score(macro_data):
     """
-    Score makro 0–100. Braki (None/NaN) = neutral 55, NIE zero.
+    Score makro 0–100. Braki (None/NaN) = neutral 55, NO zero.
     Skala dopasowana do rozwiniętych gospodarek (USA ~2% PKB = dobry wynik).
     """
     if macro_data is None:
@@ -1092,7 +1092,7 @@ def calculate_country_score(macro_data):
         'manufacturing_pmi': 0.12, 'retail_sales_growth': 0.05
     }
 
-    # --- PKB: 2.0% = ~85, 2.5%+ = 100 (wcześniej 5% = 100 było zbyt ostre) ---
+    # --- PKB: 2.0% = ~85, 2.5%+ = 100 (wcześNOj 5% = 100 było zbyt ostre) ---
     gdp = _v('gdp_growth')
     if gdp is None:
         gdp_score = 55
@@ -1105,7 +1105,7 @@ def calculate_country_score(macro_data):
     else:
         gdp_score = max(0, 40 + gdp * 15)        # recesja
 
-    # --- Inflacja: komfort 1.5–3.5 (nie tylko 1.5–2.5) ---
+    # --- Inflacja: komfort 1.5–3.5 (NO tylko 1.5–2.5) ---
     inf = _v('inflation')
     if inf is None:
         inflation_score = 55
@@ -1118,14 +1118,14 @@ def calculate_country_score(macro_data):
     else:  # > 4.5
         inflation_score = max(0, 80 - (inf - 4.5) * 12)
 
-    # --- Bezrobocie: 4% = ~80, 3% = ~88 (wcześniej *10 było za twarde) ---
+    # --- Bezrobocie: 4% = ~80, 3% = ~88 (wcześNOj *10 było za twarde) ---
     une = _v('unemployment')
     if une is None:
         unemployment_score = 55
     else:
         unemployment_score = max(0, min(100, 100 - (une - 3.0) * 8))
 
-    # --- Stopy: komfort 2–5.5 (po cyklu podwyżek USA ~5% nie jest „katastrofą”) ---
+    # --- Stopy: komfort 2–5.5 (po cyklu podwyżek USA ~5% NO jest „katastrofą”) ---
     rate = _v('interest_rate')
     if rate is None:
         interest_score = 55
@@ -1476,7 +1476,7 @@ def get_comprehensive_fundamental_analysis(ticker):
             analyst_revision_score * 0.05 +
             recommendation_momentum_score * 0.05
         )
-        # Przy niepełnych fundach spółki nie karz makro (free plan / braki API)
+        # Przy NOpełnych fundach spółki NO karz makro (free plan / braki API)
         missing_ratio = 0.0
         try:
             keys = ['P/E', 'ROE', 'Revenue Growth', 'Profit Margin', 'Debt/Equity']
@@ -1490,7 +1490,7 @@ def get_comprehensive_fundamental_analysis(ticker):
     else:
         comprehensive_company_score = None
         basic_company_score = None
-        # Bez danych spółki → rating ≈ makro kraju (USA nie spada do SŁABA przez brak fundów)
+        # Bez danych spółki → rating ≈ makro kraju (USA NO spada do SŁABA przez brak fundów)
         combined_score = country_score * 0.90 + 60 * 0.10
 
     def _rating_from_score(sc):
@@ -1540,7 +1540,7 @@ sector_tech_weight = {
     'Communication Services': 0.65,
     'Consumer Cyclical': 0.60,
     'Financial Services': 0.55,
-    'Healthcare': 0.50,          # mniej techniki
+    'Healthcare': 0.50,          # mNOj techniki
     'Consumer Defensive': 0.45,  # więcej fundamentów
     'Energy': 0.50,
     'Automotive': 0.55,
@@ -1638,12 +1638,12 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     Uwzględnia: regresję liniową, RSI, MACD, SMA50, SMA200, momentum, wolumen, ATR.
     """
     if df is None or df.empty or len(df) < 5:
-        return 0.0, "NEUTRALNY", 0.0
+        return 0.0, "NEUTRAL", 0.0
         
     df_clean = df.ffill().bfill().dropna()
     if len(df_clean) < 10:
         current_p = float(df['Close'].iloc[-1]) if not df.empty and 'Close' in df.columns else 0.0
-        return current_p, "NEUTRALNY", 0.0
+        return current_p, "NEUTRAL", 0.0
 
     # ========== WSKAŹNIKI TECHNICZNE ==========
     # 1. Regresja liniowa na cenach
@@ -1654,7 +1654,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     future_index = np.array([[len(prices) + days_forward]])
     base_pred = model.predict(future_index)[0][0]
     
-    # 2. Średnie kroczące
+    # 2. ŚredNO kroczące
     sma50 = df_clean['Close'].rolling(50).mean().iloc[-1] if len(df_clean) >= 50 else df_clean['Close'].iloc[-1]
     sma200 = df_clean['Close'].rolling(200).mean().iloc[-1] if len(df_clean) >= 200 else df_clean['Close'].iloc[-1]
     current_price = float(df_clean['Close'].iloc[-1])
@@ -1688,7 +1688,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     adjusted_pred = float(base_pred) * final_factor
     
     if current_price <= 0:
-        return 0.0, "NEUTRALNY", 0.0
+        return 0.0, "NEUTRAL", 0.0
 
     # ========== KOREKTA O DODATKOWE WSKAŹNIKI ==========
     # Korekta o SMA50 (jeśli cena daleko od SMA50)
@@ -1709,7 +1709,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     elif momentum_20 < -10:
         adjusted_pred *= 1.03
     
-    # Korekta o wolumen (duży wolumen = potwierdzenie trendu)
+    # Korekta o wolumen (duży wolumen = potwierdzeNO trendu)
     if volume_ratio > 1.8:
         adjusted_pred *= 1.03
     elif volume_ratio > 1.3:
@@ -1723,7 +1723,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
     change_percent = ((adjusted_pred - current_price) / current_price) * 100
 
-    # Ograniczenie zmiany (historyczne maksimum)
+    # OgraniczeNO zmiany (historyczne maksimum)
     try:
         hist_cap = get_max_historical_change(df, days_forward, percentile=90)
     except:
@@ -1744,11 +1744,11 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     adjusted_pred = current_price * (1 + change_percent / 100)
 
     if change_percent > 3:
-        direction = "WZROSTOWY"
+        direction = "UPTREND"
     elif change_percent < -3:
-        direction = "SPADKOWY"
+        direction = "DOWNTREND"
     else:
-        direction = "NEUTRALNY"
+        direction = "NEUTRAL"
         print(f"📊 PROGNOZA: {adjusted_pred:.2f} (zmiana: {change_percent:.2f}%)")
     
     return float(adjusted_pred), direction, float(change_percent)
@@ -1785,60 +1785,50 @@ def get_technical_signal(df):
 
         signals = []
 
-        if rsi_val < 30:
-            signals.append("RSI: WYPRZEDANIE")
+if rsi_val < 30:
+            signals.append("RSI: OVERSOLD")
         elif rsi_val > 70:
-            signals.append("RSI: WYKUPIENIE")
-
+            signals.append("RSI: OVERBOUGHT")
         if macd_val > macd_signal_val:
-            signals.append("MACD: SYGNAŁ KUPNA")
+            signals.append("MACD: BUY SIGNAL")
         elif macd_val < macd_signal_val:
-            signals.append("MACD: SYGNAŁ SPRZEDAŻY")
-
+            signals.append("MACD: SELL SIGNAL")
         if close_val < bb_lower_val:
-            signals.append("BB: CENA PONIŻEJ DOLNEGO PASMA")
+            signals.append("BB: PRICE BELOW LOWER BAND")
         elif close_val > bb_upper_val:
-            signals.append("BB: CENA POWYŻEJ GÓRNEGO PASMA")
-
+            signals.append("BB: PRICE ABOVE UPPER BAND")
         if stoch_k_val < 20 and stoch_d_val < 20:
-            signals.append("STOCH: WYPRZEDANIE")
+            signals.append("STOCH: OVERSOLD")
         elif stoch_k_val > 80 and stoch_d_val > 80:
-            signals.append("STOCH: WYKUPIENIE")
-
+            signals.append("STOCH: OVERBOUGHT")
         if williams_r_val < -80:
-            signals.append("WILLIAMS %R: WYPRZEDANIE")
+            signals.append("WILLIAMS %R: OVERSOLD")
         elif williams_r_val > -20:
-            signals.append("WILLIAMS %R: WYKUPIENIE")
-
+            signals.append("WILLIAMS %R: OVERBOUGHT")
         if cci_val < -100:
-            signals.append("CCI: WYPRZEDANIE")
+            signals.append("CCI: OVERSOLD")
         elif cci_val > 100:
-            signals.append("CCI: WYKUPIENIE")
-
+            signals.append("CCI: OVERBOUGHT")
         if close_val > vwap_val:
-            signals.append("VWAP: CENA POWYŻEJ ŚREDNIEJ")
+            signals.append("VWAP: PRICE ABOVE AVERAGE")
         elif close_val < vwap_val:
-            signals.append("VWAP: CENA PONIŻEJ ŚREDNIEJ")
-
+            signals.append("VWAP: PRICE BELOW AVERAGE")
         if adx_val > 25:
-            signals.append(f"ADX: SILNY TREND ({adx_val:.1f})")
+            signals.append(f"ADX: STRONG TREND ({adx_val:.1f})")
         elif adx_val > 20:
-            signals.append(f"ADX: UMIARKOWANY TREND ({adx_val:.1f})")
+            signals.append(f"ADX: MEDIUM TREND ({adx_val:.1f})")
         else:
-            signals.append(f"ADX: SŁABY TREND ({adx_val:.1f})")
-
+            signals.append(f"ADX: WEAK TREND ({adx_val:.1f})")
         if mfi_val < 20:
-            signals.append("MFI: WYPRZEDANIE")
+            signals.append("MFI: OVERSOLD")
         elif mfi_val > 80:
-            signals.append("MFI: WYKUPIENIE")
-
+            signals.append("MFI: OVERBOUGHT")
         if cmf_val > 0.1:
-            signals.append("CMF: DODATNI (akumulacja)")
+            signals.append("CMF: POSITIVE (accumulation)")
         elif cmf_val < -0.1:
-            signals.append("CMF: UJEMNY (dystrybucja)")
-
+            signals.append("CMF: NEGATIVE (distribution)")
         if not signals:
-            return "BRAK SYGNAŁU"
+            return "NO SIGNAL"
 
         return " | ".join(signals[:6])
     except Exception as e:
@@ -1910,12 +1900,12 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
         upside_base = upside_base * (1.20 - (crash_risk_score / 100) * 0.40)
 
     momentum_upside = 0.0
-    if "WZROSTOWY" in trend:
+    if "UPTREND" in trend:
         if high_ctx > 0 and current_price < high_ctx:
             pct_to_high = ((high_ctx - current_price) / current_price) * 100
         else:
             pct_to_high = 0.0
-        if "SILNIE" in trend:
+        if "STRONG" in trend:
             momentum_upside = max(5.0, pct_to_high * 0.4)
         else:
             momentum_upside = max(2.0, pct_to_high * 0.2)
@@ -1937,10 +1927,10 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
     elif position_pct < 50:
         risk = min(risk, 35.0)
 
-    if "WZROSTOWY" in trend:
-        upside += 10.0 if "SILNIE" in trend else 5.0
-    elif "SPADKOWY" in trend:
-        risk += 10.0 if "SILNIE" in trend else 5.0
+    if "UPTREND" in trend:
+        upside += 10.0 if "STRONG" in trend else 5.0
+    elif "DOWNTREND" in trend:
+        risk += 10.0 if "STRONG" in trend else 5.0
 
     risk = max(5.0, min(60.0, risk))
     upside = max(5.0, min(80.0, upside))
@@ -2005,7 +1995,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             if not data_10y.empty and len(data_10y) >= 200:
                 has_10y = True
         except Exception as e:
-            print(f"Ostrzeżenie 10y {ticker}: {e}")
+            print(f"OstrzeżeNO 10y {ticker}: {e}")
 
         current_price = data_3y['Close'].iloc[-1]
         high_3y = data_3y['High'].max()
@@ -2016,18 +2006,18 @@ def get_3year_perspective(ticker, fundamental_score=None):
         is_index = ticker.startswith('^') or ticker in ['^GSPC', '^N225', '^NDX', '^DJI', '^FCHI', '^FTSE', '^GDAXI', '^STOXX50E']
 
         sma200 = data_3y['Close'].rolling(200).mean().iloc[-1]
-        trend_3y = "NIEZNANY"
+        trend_3y = "UNKNOWN"
         if not np.isnan(sma200):
             if current_price > sma200 * 1.08:
-                trend_3y = "SILNIE WZROSTOWY"
+                trend_3y = "STRONG UPTREND"
             elif current_price > sma200 * 1.03:
-                trend_3y = "WZROSTOWY"
+                trend_3y = "UPTREND"
             elif current_price < sma200 * 0.92:
-                trend_3y = "SILNIE SPADKOWY"
+                trend_3y = "STRONG DOWNTREND"
             elif current_price < sma200 * 0.97:
-                trend_3y = "SPADKOWY"
+                trend_3y = "DOWNTREND"
             else:
-                trend_3y = "BOCZNY"
+                trend_3y = "SIDEWAYS"
 
         crash_risk_score = 50
         crash_details = {}
@@ -2083,30 +2073,30 @@ def get_3year_perspective(ticker, fundamental_score=None):
         high_75 = price_percentiles[2]
         high_90 = price_percentiles[3]
         
-        # Oblicz zmienność (odchylenie standardowe dziennych zwrotów)
+        # Oblicz zmienność (odchyleNO standardowe dziennych zwrotów)
         daily_returns = data_3y['Close'].pct_change().dropna()
         volatility = daily_returns.std() * np.sqrt(252) * 100  # roczna zmienność w %
         
         # Dynamiczne progi dla okazji/zagrożenia
         if volatility > 40:  # wysoka zmienność
             okazja_prog = 20
-            zagrozenie_prog = 80
+            zagrozeNO_prog = 80
         elif volatility > 25:
             okazja_prog = 25
-            zagrozenie_prog = 75
+            zagrozeNO_prog = 75
         else:
             okazja_prog = 30
-            zagrozenie_prog = 70
+            zagrozeNO_prog = 70
         
-        duza_okazja = "NIE"
-        duze_zagrozenie = "NIE"
+        duza_okazja = "NO"
+        duze_zagrozeNO = "NO"
         
         # Sprawdź czy cena jest w dolnym percentylu (okazja)
         if current_price <= low_25 or pos_check < okazja_prog:
-            duza_okazja = "TAK"
-        # Sprawdź czy cena jest w górnym percentylu (zagrożenie)
-        if current_price >= high_75 or pos_check > zagrozenie_prog:
-            duze_zagrozenie = "TAK"
+            duza_okazja = "YES"
+        # Sprawdź czy cena jest w górnym percentylu (zagrożeNO)
+        if current_price >= high_75 or pos_check > zagrozeNO_prog:
+            duze_zagrozeNO = "YES"
 
         upside_mult, downside_mult = get_volume_spike_multipliers(data_3y, data_10y if has_10y else None)
         
@@ -2130,14 +2120,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozenie': duze_zagrozenie,
+            'duze_zagrozeNO': duze_zagrozeNO,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
             'crash_details': crash_details,
         }
     except Exception as e:
-        print(f"Błąd analizy 3-letniej dla {ticker}: {e}")
+        print(f"Analysis error for {ticker}: {e}")
         return None
 
 # ============================================================
@@ -2206,12 +2196,12 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
         upside_base = upside_base * (1.20 - (crash_risk_score / 100) * 0.40)
 
     momentum_upside = 0.0
-    if "WZROSTOWY" in trend:
+    if "UPTREND" in trend:
         if high_ctx > 0 and current_price < high_ctx:
             pct_to_high = ((high_ctx - current_price) / current_price) * 100
         else:
             pct_to_high = 0.0
-        if "SILNIE" in trend:
+        if "STRONG" in trend:
             momentum_upside = max(5.0, pct_to_high * 0.4)
         else:
             momentum_upside = max(2.0, pct_to_high * 0.2)
@@ -2233,10 +2223,10 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
     elif position_pct < 50:
         risk = min(risk, 35.0)
 
-    if "WZROSTOWY" in trend:
-        upside += 10.0 if "SILNIE" in trend else 5.0
-    elif "SPADKOWY" in trend:
-        risk += 10.0 if "SILNIE" in trend else 5.0
+    if "UPTREND" in trend:
+        upside += 10.0 if "STRONG" in trend else 5.0
+    elif "DOWNTREND" in trend:
+        risk += 10.0 if "STRONG" in trend else 5.0
 
     risk = max(5.0, min(60.0, risk))
     upside = max(5.0, min(80.0, upside))
@@ -2301,7 +2291,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             if not data_10y.empty and len(data_10y) >= 200:
                 has_10y = True
         except Exception as e:
-            print(f"Ostrzeżenie 10y {ticker}: {e}")
+            print(f"OstrzeżeNO 10y {ticker}: {e}")
 
         current_price = data_3y['Close'].iloc[-1]
         high_3y = data_3y['High'].max()
@@ -2312,18 +2302,18 @@ def get_3year_perspective(ticker, fundamental_score=None):
         is_index = ticker.startswith('^') or ticker in ['^GSPC', '^N225', '^NDX', '^DJI', '^FCHI', '^FTSE', '^GDAXI', '^STOXX50E']
 
         sma200 = data_3y['Close'].rolling(200).mean().iloc[-1]
-        trend_3y = "NIEZNANY"
+        trend_3y = "UNKNOWN"
         if not np.isnan(sma200):
             if current_price > sma200 * 1.08:
-                trend_3y = "SILNIE WZROSTOWY"
+                trend_3y = "STRONG UPTREND"
             elif current_price > sma200 * 1.03:
-                trend_3y = "WZROSTOWY"
+                trend_3y = "UPTREND"
             elif current_price < sma200 * 0.92:
-                trend_3y = "SILNIE SPADKOWY"
+                trend_3y = "STRONG DOWNTREND"
             elif current_price < sma200 * 0.97:
-                trend_3y = "SPADKOWY"
+                trend_3y = "DOWNTREND"
             else:
-                trend_3y = "BOCZNY"
+                trend_3y = "SIDEWAYS"
 
         crash_risk_score = 50
         crash_details = {}
@@ -2344,19 +2334,19 @@ def get_3year_perspective(ticker, fundamental_score=None):
                 sma_score = max(0, min(100, (dist_sma200 - 10) * 3.0))
                 vol_score = min(100, (vol_10y / 80) * 100)
                 dd_score = min(100, (abs(max_dd_10y) / 70) * 100)
-                                # Oblicz trend (nachylenie SMA200)
+                                # Oblicz trend (nachyleNO SMA200)
                 sma200_values = data_10y['Close'].rolling(200).mean().dropna()
                 if len(sma200_values) > 50:
                     trend_slope = (sma200_values.iloc[-1] - sma200_values.iloc[-50]) / sma200_values.iloc[-50] * 100
                 else:
                     trend_slope = 0
-                # Jeśli trend jest wzrostowy, zmniejsz ryzyko, jeśli spadkowy – zwiększ
+                # Jeśli trend jest UPTREND, zmNOjsz ryzyko, jeśli DOWNTREND – zwiększ
                 trend_factor = max(0, min(20, -trend_slope * 2))  # -10% trendu daje +20 do score
                 
                 # Nowe wagi: większy nacisk na zmienność i drawdown
                 crash_risk_score = int(
                     pos_score * 0.25 +      # pozycja w zakresie
-                    sma_score * 0.20 +      # odchylenie od SMA200
+                    sma_score * 0.20 +      # odchyleNO od SMA200
                     vol_score * 0.20 +      # zmienność
                     dd_score * 0.20 +       # max drawdown
                     trend_factor * 0.15     # trend
@@ -2388,14 +2378,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
             }
             crash_risk_score = 50
 
-        duza_okazja = "NIE"
-        duze_zagrozenie = "NIE"
+        duza_okazja = "NO"
+        duze_zagrozeNO = "NO"
         pos_check = crash_details['position_in_10y'] if has_10y else position_in_3y_range
         dist_check = crash_details['dist_from_sma200_pct']
         if dist_check < -15 or pos_check < 25:
-            duza_okazja = "TAK"
+            duza_okazja = "YES"
         if dist_check > 25 or pos_check > 75:
-            duze_zagrozenie = "TAK"
+            duze_zagrozeNO = "YES"
 
         upside_mult, downside_mult = get_volume_spike_multipliers(data_3y, data_10y if has_10y else None)
         
@@ -2419,14 +2409,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozenie': duze_zagrozenie,
+            'duze_zagrozeNO': duze_zagrozeNO,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
             'crash_details': crash_details,
         }
     except Exception as e:
-        print(f"Błąd analizy 3-letniej dla {ticker}: {e}")
+        print(f"ANALYSIS ERROR FOR {ticker}: {e}")
         return None
 
 # ============================================================
@@ -2577,11 +2567,11 @@ FEATURE_KEYS = [
 
 
 def _build_training_set(df, horizon_days, max_samples=200):
-    """Zbiór treningowy z krokiem ~horizon/3 – mniej nachodzących etykiet (mniej szumu)."""
+    """Zbiór treningowy z krokiem ~horizon/3 – mNOj nachodzących etykiet (mNOj szumu)."""
     n = len(df)
     if n < horizon_days + 40:
         return None, None
-    # krok zmniejsza overlap etykiet forward-return (uczciwszy sygnał dla Ridge/GB)
+    # krok zmNOjsza overlap etykiet forward-return (uczciwszy sygnał dla Ridge/GB)
     step = max(1, min(5, horizon_days // 4))
     span = max_samples * step
     start = max(40, n - horizon_days - span)
@@ -2597,11 +2587,11 @@ def _build_training_set(df, horizon_days, max_samples=200):
         if future <= 0 or feats['close'] <= 0:
             continue
         fwd_ret = (future / feats['close'] - 1.0) * 100.0
-        # lekka normalizacja ekstremów (winsor) – stabilniejsze dopasowanie
+        # lekka normalizacja ekstremów (winsor) – stabilNOjsze dopasowaNO
         fwd_ret = float(np.clip(fwd_ret, -45.0, 45.0))
         X_list.append([feats[k] for k in FEATURE_KEYS])
         y_list.append(fwd_ret)
-        # świeższe próbki ważniejsze (recency weight)
+        # świeższe próbki ważNOjsze (recency weight)
         w_list.append(0.55 + 0.45 * ((j + 1) / max(len(idxs), 1)))
     if len(X_list) < 30:
         return None, None, None
@@ -2676,11 +2666,11 @@ def _calibrate_return_magnitude(pred_ret, df, days_forward, regime='RANGE'):
     """
     Kalibracja WIELKOŚCI prognozy bez zmiany kierunku (znak zostaje).
 
-    Cel: obniżyć MAE, nie ruszając Hit%.
+    Cel: obniżyć MAE, NO ruszając Hit%.
     - Znak = z modelu (kierunek).
     - |pred| zbliżamy do typowego historycznego ruchu w TYM samym kierunku
       (mediana |return| conditional + lekki blend z modelem).
-    - Unikamy zarówno zbyt małych prognoz (główne źródło wysokiego MAE
+    - Unikamy zarówno zbyt małych prognoz (główne źródło HIGHego MAE
       przy Hit 100%), jak i ekstremów.
     """
     try:
@@ -2720,7 +2710,7 @@ def _calibrate_return_magnitude(pred_ret, df, days_forward, regime='RANGE'):
             target = 0.45 * typical + 0.55 * p60
             model_w = 0.48
 
-        # Gdy model mocno niedoszacowuje wielkości (częsty przypadek przy Hit 100% + MAE 30-50%)
+        # Gdy model mocno NOdoszacowuje wielkości (częsty przypadek przy Hit 100% + MAE 30-50%)
         if pred_mag < 0.55 * target:
             model_w = min(model_w, 0.28)
         elif pred_mag > 1.35 * p75:
@@ -2729,7 +2719,7 @@ def _calibrate_return_magnitude(pred_ret, df, days_forward, regime='RANGE'):
 
         calibrated_mag = model_w * pred_mag + (1.0 - model_w) * target
 
-        # Soft caps – nie wyjdź poza rozsądny percentyl historii
+        # Soft caps – NO wyjdź poza rozsądny percentyl historii
         hard_cap = max(p75 * 1.15, target * 1.25)
         if days_forward <= 30:
             hard_cap = min(hard_cap, 22.0)
@@ -2737,7 +2727,7 @@ def _calibrate_return_magnitude(pred_ret, df, days_forward, regime='RANGE'):
             hard_cap = min(hard_cap, 40.0)
         calibrated_mag = float(np.clip(calibrated_mag, 0.0, hard_cap))
 
-        # Minimalna wielkość gdy model ma wyraźny kierunek – żeby nie spłaszczyć sygnału
+        # Minimalna wielkość gdy model ma wyraźny kierunek – żeby NO spłaszczyć sygnału
         if pred_mag >= 1.5:
             floor = min(pred_mag, max(1.2, 0.45 * typical))
             calibrated_mag = max(calibrated_mag, floor)
@@ -2807,7 +2797,7 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, silniejszy prior przy sporze."""
+    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, STRONGjszy prior przy sporze."""
     built = _build_training_set(df, days_forward)
     if built[0] is None:
         X, y, sw = None, None, None
@@ -2860,7 +2850,7 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     agree = _model_agreement_penalty(preds)
     blended *= agree
     prior = _historical_drift(df, days_forward)
-    # przy niskiej zgodności modeli mocniej kotwica historyczna (kierunek z rynku, nie szum ML)
+    # przy LOWej zgodności modeli mocNOj kotwica historyczna (kierunek z rynku, NO szum ML)
     shrink_s = 0.28 if days_forward <= 30 else 0.22
     if agree < 0.75:
         shrink_s += 0.12
@@ -2924,7 +2914,7 @@ def _local_direction_accuracy(df, days_forward, max_points=14, step=8):
             if p_past <= 0:
                 continue
             mom = p0 / p_past - 1.0
-            # hist median proxy: średnia z kilku wcześniejszych okien
+            # hist median proxy: średnia z kilku wcześNOjszych okien
             pred = mom * 0.5
             if abs(actual) < 0.005 and abs(pred) < 0.01:
                 hits += 1
@@ -2958,8 +2948,8 @@ def _vol_scale_for_ticker(df):
 
 
 
-# Wyjątki per spółka/horyzont – NIE ruszają reszty uniwersu
-# (TSLA 1M, UNH 3M, V 3M bywały systematycznie słabe)
+# Wyjątki per spółka/horyzont – NO ruszają reszty uniwersu
+# (TSLA 1M, UNH 3M, V 3M bywały systematyczNO słabe)
 _SPECIAL_PRED_CASES = {
     ('TSLA', '1M'),
     ('UNH', '3M'),
@@ -2972,9 +2962,9 @@ _SPECIAL_PRED_CASES = {
 
 def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
     """
-    Stabilniejsza reguła TYLKO dla trudnych par ticker/horyzont:
+    StabilNOjsza reguła TYLKO dla trudnych par ticker/horyzont:
     SMA50/SMA200 + dłuższy drift + fund. Bez ensemble/momentum.
-    MSFT: mocniejszy bias trendowy (grind-up), mniej agresywne odwrócenia.
+    MSFT: mocNOjszy bias trendowy (grind-up), mNOj agresywne odwrócenia.
     """
     close = float(df['Close'].iloc[-1])
     sma50 = float(df['Close'].rolling(50).mean().iloc[-1]) if len(df) >= 50 else close
@@ -2993,13 +2983,13 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
 
     # --- MSFT-only: quality compounder prior ---
     if t == 'MSFT':
-        # lekki dodatni prior gdy brak sygnału (historycznie grind-up)
+        # lekki dodatni prior gdy brak sygnału (historyczNO grind-up)
         if abs(long_med) < 0.35:
             long_med = 1.2 if days_forward <= 30 else 3.0
-        # w silnym uptrendzie nie pozwalaj na mocny short bias z szumu
+        # w silnym uptrendzie NO pozwalaj na mocny short bias z szumu
         if trend_sign > 0 and long_med < 0:
             long_med = 0.4 * long_med  # tłumij negatywny drift
-        # w downtrendzie poniżej obu SMA – respektuj spadek, ale łagodniej
+        # w downtrendzie poniżej obu SMA – respektuj spadek, ale łagodNOj
         if trend_sign < 0 and close < sma200:
             mag = max(abs(long_med), 1.2)
             pred = 0.55 * trend_sign * mag + 0.30 * long_med + 0.15 * fund_ret
@@ -3007,7 +2997,7 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
         mag = max(abs(long_med), 1.0)
         # więcej wagi na trend strukturalny niż na krótki drift
         pred = 0.55 * trend_sign * mag + 0.30 * long_med + 0.15 * fund_ret
-        # floor: w uptrendzie nie schodź poniżej lekkiego plusa przy dobrych fundach
+        # floor: w uptrendzie NO schodź poniżej lekkiego plusa przy dobrych fundach
         if trend_sign > 0 and fund_ret >= 0 and pred < 0.3:
             pred = 0.3 + 0.25 * max(fund_ret, 0)
         return float(pred)
@@ -3028,20 +3018,20 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
             print(*a, **k)
     _log(f"🔍 ENSEMBLE v3b | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
-        return 0.0, "NEUTRALNY", 0.0
+        return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
     if 'Close' not in df_clean.columns or len(df_clean) < 15:
         current_p = float(df['Close'].iloc[-1]) if not df.empty else 0.0
-        return current_p, "NEUTRALNY", 0.0
+        return current_p, "NEUTRAL", 0.0
     current_price = float(df_clean['Close'].iloc[-1])
     if current_price <= 0:
-        return 0.0, "NEUTRALNY", 0.0
+        return 0.0, "NEUTRAL", 0.0
 
     horizon = '1M' if days_forward <= 30 else '3M'
     regime = _detect_market_regime(df_clean)
     feats = _extract_features_row(df_clean, len(df_clean) - 1)
     if feats is None:
-        return current_price, "NEUTRALNY", 0.0
+        return current_price, "NEUTRAL", 0.0
 
     tech_ret, model_preds, model_weights = _ensemble_expected_return(
         df_clean, days_forward, sector, regime, feats
@@ -3098,7 +3088,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     if abs(blended_ret) < 1.2 and abs(hist_med) >= 0.8:
         blended_ret = 0.35 * blended_ret + 0.65 * np.sign(hist_med) * max(abs(hist_med), 1.0)
 
-    # Wyjątki TYLKO dla trudnych par (nie zmieniają AAPL/JPM/…)
+    # Wyjątki TYLKO dla trudnych par (NO zmieniają AAPL/JPM/…)
     t_key = (str(ticker).upper() if ticker else None, horizon)
     special = t_key in _SPECIAL_PRED_CASES if t_key[0] else False
     if special:
@@ -3143,11 +3133,11 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     change_percent = float(np.clip(blended_ret, -max_change, max_change))
     adjusted_pred = current_price * (1.0 + change_percent / 100.0)
     if change_percent > 2.5:
-        direction = "WZROSTOWY"
+        direction = "UPTREND"
     elif change_percent < -2.5:
-        direction = "SPADKOWY"
+        direction = "DOWNTREND"
     else:
-        direction = "NEUTRALNY"
+        direction = "NEUTRAL"
     _log(f"✅ PROGNOZA v2: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
@@ -3156,11 +3146,11 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 def backtest_forecast_quality(df, days_forward=21, sector='Default',
                               fund_score=50, step=None, max_points=30, ticker=None):
     """
-    Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mniej inflacji).
+    Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mNOj inflacji).
 
     Hit tylko gdy:
       1) |actual| >= min_move
-      2) |pred|   >= min_pred   (prognoza nie jest „płaska”)
+      2) |pred|   >= min_pred   (prognoza NO jest „płaska”)
       3) ten sam znak actual i pred
 
     Bez soft_hit i bez fallbacku na łagodną definicję przy małej próbie.
@@ -3172,9 +3162,9 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if len(df) < min_len:
         return None
 
-    # Trochę ostrzejsze progi niż wcześniej (2.0 / 3.5)
+    # Trochę ostrzejsze progi niż wcześNOj (2.0 / 3.5)
     min_move = 2.0 if days_forward <= 30 else 3.5
-    # Prognoza musi być „wyraźna” – inaczej nie liczymy hitu
+    # Prognoza musi być „wyraźna” – inaczej NO liczymy hitu
     min_pred = 1.0 if days_forward <= 30 else 2.0
 
     df_clean = df.ffill().bfill()
@@ -3247,11 +3237,11 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if total < min_total or not errors:
         return None
 
-    # Brak soft-fallbacku: za mało istotnych prób → nie udawaj wysokiego Hit%
+    # Brak soft-fallbacku: za mało istotnych prób → NO udawaj HIGHego Hit%
     if significant >= 5:
         dir_rate = 100.0 * dir_hits / significant
     elif significant >= 3:
-        dir_rate = 100.0 * dir_hits / significant  # raportuj, ale UI i tak zobaczy n_sig
+        dir_rate = 100.0 * dir_hits / significant  # raportuj, ale UI i YES zobaczy n_sig
     else:
         return None  # za mało twardych przypadków → brak Hit% zamiast zawyżonego
 
@@ -3332,12 +3322,12 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
         upside_base = upside_base * (1.20 - (crash_risk_score / 100) * 0.40)
 
     momentum_upside = 0.0
-    if "WZROSTOWY" in trend:
+    if "UPTREND" in trend:
         if high_ctx > 0 and current_price < high_ctx:
             pct_to_high = ((high_ctx - current_price) / current_price) * 100
         else:
             pct_to_high = 0.0
-        if "SILNIE" in trend:
+        if "STRONG" in trend:
             momentum_upside = max(5.0, pct_to_high * 0.4)
         else:
             momentum_upside = max(2.0, pct_to_high * 0.2)
@@ -3359,10 +3349,10 @@ def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
     elif position_pct < 50:
         risk = min(risk, 35.0)
 
-    if "WZROSTOWY" in trend:
-        upside += 10.0 if "SILNIE" in trend else 5.0
-    elif "SPADKOWY" in trend:
-        risk += 10.0 if "SILNIE" in trend else 5.0
+    if "UPTREND" in trend:
+        upside += 10.0 if "STRONG" in trend else 5.0
+    elif "DOWNTREND" in trend:
+        risk += 10.0 if "STRONG" in trend else 5.0
 
     risk = max(5.0, min(60.0, risk))
     upside = max(5.0, min(80.0, upside))
@@ -3421,9 +3411,9 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
                                hist_dd_p50=None, hist_dd_p75=None, own_dd_p50=None):
     """
     Ryzyko + potencjał 3Y – kalibracja pod produkt:
-    - ryzyko kotwiczone o historyczne DD (analogie + własna historia), nie tylko score
+    - ryzyko kotwiczone o historyczne DD (analogie + własna historia), NO tylko score
     - quality/trend obniża ekstremalne risk przy ATH (AAPL ≠ meme)
-    - upside realistyczny, tłumiony blisko szczytu, ale nie zerowany
+    - upside realistyczny, tłumiony blisko szczytu, ale NO zerowany
     """
     if data_10y is not None and not data_10y.empty and len(data_10y) >= 200:
         data_ctx = data_10y
@@ -3475,7 +3465,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         max_dd_hist = -25.0
 
     if dd_anchors:
-        # p75 ma większą wagę gdy jesteśmy wysoko w range (realistyczniejszy downside)
+        # p75 ma większą wagę gdy jesteśmy wysoko w range (realistyczNOjszy downside)
         if position_pct >= 85 and hist_dd_p75 is not None:
             risk_anchor = float(0.45 * abs(float(hist_dd_p75)) + 0.55 * float(np.median(dd_anchors)))
         else:
@@ -3483,7 +3473,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
     else:
         risk_anchor = 22.0 + max(0.0, position_pct - 50) * 0.35
 
-    # składowa pozycyjna – korekta, nie drugi "crash score"
+    # składowa pozycyjna – korekta, NO drugi "crash score"
     pos_add = 0.0
     if position_pct > 70:
         pos_add += (position_pct - 70) * 0.30
@@ -3494,7 +3484,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
     if rsi_val > 72:
         pos_add += min(4.0, (rsi_val - 72) * 0.30)
 
-    # hist DD dominuje risk of drop (to ma być "ile może spaść", nie klon crash score)
+    # hist DD dominuje risk of drop (to ma być "ile może spaść", NO klon crash score)
     risk = risk_anchor * 0.78 + pos_add * 0.85
 
     # jakość / trend: blue-chip w silnym trendzie ≠ max risk
@@ -3502,13 +3492,13 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
     if fundamental_score is not None:
         quality = float(np.clip(float(fundamental_score) / 100.0, 0.15, 0.95))
     trend_s = trend or ""
-    if "SILNIE WZROSTOWY" in trend_s:
+    if "STRONG UPTREND" in trend_s:
         risk *= 0.88
-    elif "WZROSTOWY" in trend_s:
+    elif "UPTREND" in trend_s:
         risk *= 0.93
-    elif "SILNIE SPADKOWY" in trend_s:
+    elif "STRONG DOWNTREND" in trend_s:
         risk *= 1.12
-    # niska vol + wysoka jakość → mniej dramatycznego risk
+    # niska vol + wysoka jakość → mNOj dramatycznego risk
     if vol_ann < 22 and quality > 0.55:
         risk *= 0.90
     elif vol_ann > 40:
@@ -3519,12 +3509,12 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         risk *= 1.08
 
     if crash_risk_score is not None:
-        # score lekko dokręca, nie dyktuje
+        # score lekko dokręca, NO dyktuje
         cs = float(crash_risk_score)
         risk *= (0.92 + cs / 100.0 * 0.18)
 
-    # podłogi / sufity – realistyczne, nie zawsze 60
-    # podłogi: nie poniżej typowego hist DD gdy jesteśmy przy szczycie
+    # podłogi / sufity – realistyczne, NO zawsze 60
+    # podłogi: NO poniżej typowego hist DD gdy jesteśmy przy szczycie
     hist_floor = None
     if hist_dd_p50 is not None:
         hist_floor = abs(float(hist_dd_p50)) * (0.85 if position_pct >= 85 else 0.70)
@@ -3546,7 +3536,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
     if is_index:
         risk *= 0.82
 
-    risk = float(np.clip(risk, 8.0, 55.0))  # sufit 55 – zostawia bufor, mniej "wszystko na max"
+    risk = float(np.clip(risk, 8.0, 55.0))  # sufit 55 – zostawia bufor, mNOj "wszystko na max"
 
     # --- UPSIDE ---
     hist_upside = 26.0
@@ -3554,7 +3544,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         if len(close) >= 800:
             fwd = (close.shift(-756) / close - 1.0).dropna() * 100
             if len(fwd) >= 30:
-                # ostrożniej: bliżej mediany niż p75 (mniej rozczarowań)
+                # ostrożNOj: bliżej mediany niż p75 (mNOj rozczarowań)
                 hist_upside = float(0.70 * np.percentile(fwd, 50) + 0.30 * np.percentile(fwd, 70))
                 hist_upside = float(np.clip(hist_upside, 10.0, 100.0))
         elif len(close) >= 400:
@@ -3571,13 +3561,13 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
         mr_boost += min(12.0, abs(dist_to_sma + 8) * 0.5)
 
     trend_boost = 0.0
-    if "SILNIE WZROSTOWY" in trend_s:
+    if "STRONG UPTREND" in trend_s:
         trend_boost = 8.0
-    elif "WZROSTOWY" in trend_s:
+    elif "UPTREND" in trend_s:
         trend_boost = 5.0
-    elif "SILNIE SPADKOWY" in trend_s:
+    elif "STRONG DOWNTREND" in trend_s:
         trend_boost = -6.0
-    elif "SPADKOWY" in trend_s:
+    elif "DOWNTREND" in trend_s:
         trend_boost = -3.0
 
     fund_boost = 0.0
@@ -3586,7 +3576,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
 
     damp = 1.0
     if position_pct > 95:
-        damp = 0.48  # praktycznie ATH – mocniej gaś upside
+        damp = 0.48  # praktyczNO ATH – mocNOj gaś upside
     elif position_pct > 92:
         damp = 0.55
     elif position_pct > 85:
@@ -3604,7 +3594,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
 
     upside = float(np.clip(upside, 10.0, 95.0))
 
-    # przy samym szczycie: upside nie powinien mocno przebijać ryzyka (uczciwy R/R)
+    # przy samym szczycie: upside NO powiNOn mocno przebijać ryzyka (uczciwy R/R)
     if position_pct >= 90 and upside > risk * 1.05:
         upside = risk * 1.05
     elif position_pct >= 80 and upside > risk * 1.25:
@@ -3618,7 +3608,7 @@ def compute_risk_and_upside_3y(current_price, low_3y, high_3y, data_3y,
 # ============================================================
 # HISTORYCZNE KRACHY / KOREKTY – PROFIL RYNKOWY (kalibracja)
 # Wartości = typowy stan *przed* eventem + typowe skutki (indeks US).
-# To NIE jest prognoza daty krachu – tylko mapa analogii.
+# To NO jest prognoza daty krachu – tylko mapa analogii.
 # ============================================================
 
 HISTORICAL_CRASH_EVENTS = [
@@ -3728,15 +3718,15 @@ def _analyze_crash_analogies(position_pct, dist_sma200, vol_ann):
     dd75 = sum(s * e['dd_6m_p75'] for s, e in top) / w_sum
     max_dd = sum(s * e['max_dd_pct'] for s, e in top) / w_sum
 
-    # risk tier: pozycja + similarity (spójniej z crash score)
+    # risk tier: pozycja + similarity (spójNOj z crash score)
     if position_pct >= 90 or (position_pct >= 85 and best_sim >= 50):
-        risk_tier = "WYSOKI"
+        risk_tier = "HIGH"
     elif position_pct >= 75 or (position_pct >= 70 and best_sim >= 45):
-        risk_tier = "PODWYŻSZONY"
+        risk_tier = "MEDIUM-HIGH"
     elif position_pct <= 30 and best_sim < 40:
-        risk_tier = "NISKI"
+        risk_tier = "LOW"
     else:
-        risk_tier = "UMIARKOWANY"
+        risk_tier = "MEDIUM"
 
     return {
         'best_analogy': best_ev['name'],
@@ -3758,7 +3748,7 @@ def _analyze_crash_analogies(position_pct, dist_sma200, vol_ann):
 def _own_history_conditional_dd(data, position_now, window_fwd=126, min_samples=8):
     """
     Z historii spółki: gdy pozycja w zakresie była podobna (±12 pp),
-    jaki był późniejszy max drawdown w ~6 miesiącach.
+    jaki był późNOjszy max drawdown w ~6 miesiącach.
     """
     if data is None or len(data) < window_fwd + 100:
         return None
@@ -3812,7 +3802,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             if not data_10y.empty and len(data_10y) >= 200:
                 has_10y = True
         except Exception as e:
-            print(f"Ostrzeżenie 10y {ticker}: {e}")
+            print(f"OstrzeżeNO 10y {ticker}: {e}")
 
         current_price = float(data_3y['Close'].iloc[-1])
         high_3y = float(data_3y['High'].max())
@@ -3828,25 +3818,25 @@ def get_3year_perspective(ticker, fundamental_score=None):
         volatility = float(daily_returns.std() * np.sqrt(252) * 100) if len(daily_returns) > 10 else 20.0
 
         if volatility > 40:
-            okazja_prog, zagrozenie_prog = 20, 80
+            okazja_prog, zagrozeNO_prog = 20, 80
         elif volatility > 25:
-            okazja_prog, zagrozenie_prog = 25, 75
+            okazja_prog, zagrozeNO_prog = 25, 75
         else:
-            okazja_prog, zagrozenie_prog = 30, 70
+            okazja_prog, zagrozeNO_prog = 30, 70
 
         sma200 = data_3y['Close'].rolling(200).mean().iloc[-1]
-        trend_3y = "NIEZNANY"
+        trend_3y = "UNKNOWN"
         if not np.isnan(sma200):
             if current_price > sma200 * 1.08:
-                trend_3y = "SILNIE WZROSTOWY"
+                trend_3y = "STRONG UPTREND"
             elif current_price > sma200 * 1.03:
-                trend_3y = "WZROSTOWY"
+                trend_3y = "UPTREND"
             elif current_price < sma200 * 0.92:
-                trend_3y = "SILNIE SPADKOWY"
+                trend_3y = "STRONG DOWNTREND"
             elif current_price < sma200 * 0.97:
-                trend_3y = "SPADKOWY"
+                trend_3y = "DOWNTREND"
             else:
-                trend_3y = "BOCZNY"
+                trend_3y = "SIDEWAYS"
 
         crash_risk_score = 50
         crash_details = {}
@@ -3903,7 +3893,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
                 'trend_slope_pct': round(float(trend_slope), 2),
             }
         except Exception as e:
-            print(f"Błąd crash-checker {ticker}: {e}")
+            print(f"CRASH-CHECKER ERROR {ticker}: {e}")
             crash_details = {
                 'high_10y': high_3y, 'low_10y': low_3y,
                 'position_in_10y': round(position_in_3y_range, 1),
@@ -3913,7 +3903,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             }
             crash_risk_score = 50
 
-        # --- Analogie historyczne – bonus z LIMITEM (nie winduj CSCO do ~80 samym GFC) ---
+        # --- Analogie historyczne – bonus z LIMITEM (NO winduj CSCO do ~80 samym GFC) ---
         analogies = _analyze_crash_analogies(position_in_10y, dist_sma200, vol_10y)
         sim = float(analogies.get('best_similarity') or 0)
         atype = analogies.get('best_analogy_type') or ''
@@ -3923,7 +3913,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
         elif atype == 'CORRECTION' and sim >= 55:
             analogy_bonus = int(2 + (sim - 55) * 0.12)  # ~2..8
         analogy_bonus = int(max(0, min(12, analogy_bonus)))  # CAP +12
-        if analogies.get('risk_tier') == 'NISKI' and position_in_10y < 55:
+        if analogies.get('risk_tier') == 'LOW' and position_in_10y < 55:
             analogy_bonus -= 5
         crash_risk_score = int(crash_risk_score + analogy_bonus)
 
@@ -3943,11 +3933,11 @@ def get_3year_perspective(ticker, fundamental_score=None):
         except Exception:
             pass
 
-        # Quality / niska vol + silny trend: nie traktuj jak meme przy tym samym range
+        # Quality / niska vol + silny trend: NO traktuj jak meme przy tym samym range
         # (AAPL/CSCO/JPM ≠ NVDA-vol)
-        if trend_3y == "SILNIE WZROSTOWY" and vol_10y < 30 and position_in_10y < 92:
+        if trend_3y == "STRONG UPTREND" and vol_10y < 30 and position_in_10y < 92:
             crash_risk_score = int(crash_risk_score * 0.90)
-        elif trend_3y == "SILNIE WZROSTOWY" and vol_10y < 28:
+        elif trend_3y == "STRONG UPTREND" and vol_10y < 28:
             crash_risk_score = int(crash_risk_score * 0.93)
         if fundamental_score is not None:
             try:
@@ -3957,7 +3947,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             except Exception:
                 pass
 
-        # podłogi przy ekstremum – zostają, ale nie windowane analogią bez limitu
+        # podłogi przy ekstremum – zostają, ale NO windowane analogią bez limitu
         if position_in_10y >= 94:
             crash_risk_score = max(crash_risk_score, 68)
         elif position_in_10y >= 90:
@@ -3967,14 +3957,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
 
         # tier
         if crash_risk_score >= 72 or position_in_10y >= 92:
-            analogies['risk_tier'] = "WYSOKI"
+            analogies['risk_tier'] = "HIGH"
         elif crash_risk_score >= 55 or position_in_10y >= 80:
-            analogies['risk_tier'] = "PODWYŻSZONY"
+            analogies['risk_tier'] = "MEDIUM-HIGH"
         elif crash_risk_score <= 30 and position_in_10y <= 35:
-            analogies['risk_tier'] = "NISKI"
+            analogies['risk_tier'] = "LOW"
         else:
-            if analogies.get('risk_tier') not in ("WYSOKI", "PODWYŻSZONY", "NISKI"):
-                analogies['risk_tier'] = "UMIARKOWANY"
+            if analogies.get('risk_tier') not in ("HIGH", "MEDIUM-HIGH", "LOW"):
+                analogies['risk_tier'] = "MEDIUM"
         crash_details['crash_risk_score'] = crash_risk_score
         crash_details['analogy_bonus_capped'] = analogy_bonus
 
@@ -3984,17 +3974,17 @@ def get_3year_perspective(ticker, fundamental_score=None):
             position_in_10y,
         )
 
-        duza_okazja = "NIE"
-        duze_zagrozenie = "NIE"
+        duza_okazja = "NO"
+        duze_zagrozeNO = "NO"
         pos_check = position_in_10y
         price_percentiles = np.percentile(data_3y['Close'], [10, 25, 75, 90])
         low_25 = float(price_percentiles[1])
         high_75 = float(price_percentiles[2])
         # wstępne reguły pozycyjne
         if current_price <= low_25 or pos_check < okazja_prog:
-            duza_okazja = "TAK"
-        if current_price >= high_75 or pos_check > zagrozenie_prog:
-            duze_zagrozenie = "TAK"
+            duza_okazja = "YES"
+        if current_price >= high_75 or pos_check > zagrozeNO_prog:
+            duze_zagrozeNO = "YES"
 
         returns_3y = data_3y['Close'].pct_change().dropna()
         if len(returns_3y) > 50:
@@ -4027,25 +4017,25 @@ def get_3year_perspective(ticker, fundamental_score=None):
             hist_dd_p75=analogies.get('hist_dd_6m_p75'),
             own_dd_p50=own_p50,
         )
-        # volume spike: lekkie, nie wywraca skali
+        # volume spike: lekkie, NO wywraca skali
         risk_pct = round(float(np.clip(risk_pct * min(downside_mult, 1.15), 8.0, 55.0)), 1)
         upside_pct = round(float(np.clip(upside_pct * min(upside_mult, 1.15), 10.0, 95.0)), 1)
 
-        # Twarde reguły okazja/zagrożenie – spójne z crash + risk of drop
+        # Twarde reguły okazja/zagrożeNO – spójne z crash + risk of drop
         if crash_risk_score >= 65 or risk_pct >= 26 or position_in_10y >= 88:
-            duze_zagrozenie = "TAK"
+            duze_zagrozeNO = "YES"
         if crash_risk_score >= 70 and position_in_10y >= 80:
-            duza_okazja = "NIE"  # nigdy "okazja" przy wysokim crash blisko szczytu
-        if duza_okazja == "TAK" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
-            duza_okazja = "NIE"
+            duza_okazja = "NO"  # nigdy "okazja" przy HIGHm crash blisko szczytu
+        if duza_okazja == "YES" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
+            duza_okazja = "NO"
         if (
             position_in_10y <= 35
             and crash_risk_score <= 40
             and upside_pct > risk_pct * 1.15
         ):
-            duza_okazja = "TAK"
+            duza_okazja = "YES"
             if risk_pct < 22 and crash_risk_score < 55:
-                duze_zagrozenie = "NIE"
+                duze_zagrozeNO = "NO"
 
         # Krótki "why" – UX, zero wpływu na 1M/3M
         why = []
@@ -4075,7 +4065,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'position_in_range': round(position_in_3y_range, 1),
             'trend_3y': trend_3y,
             'duza_okazja': duza_okazja,
-            'duze_zagrozenie': duze_zagrozenie,
+            'duze_zagrozeNO': duze_zagrozeNO,
             'risk_of_drop_pct': risk_pct,
             'upside_potential_pct': upside_pct,
             'crash_risk_score': crash_risk_score,
@@ -4097,7 +4087,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'engine': 'perspective-3y-v3',
         }
     except Exception as e:
-        print(f"Błąd analizy 3-letniej dla {ticker}: {e}")
+        print(f"Błąd analizy 3-letNOj dla {ticker}: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -4151,11 +4141,11 @@ def predict_crypto_technical(df, days_forward=21):
     Zwraca: (predicted_price, direction, change_pct)
     """
     if df is None or len(df) < 60 or "Close" not in df.columns:
-        return None, "NEUTRALNY", None
+        return None, "NEUTRAL", None
     close = df["Close"].astype(float)
     price = float(close.iloc[-1])
     if price <= 0:
-        return None, "NEUTRALNY", None
+        return None, "NEUTRAL", None
 
     # momentum
     def ret(n):
@@ -4174,9 +4164,9 @@ def predict_crypto_technical(df, days_forward=21):
     rsi_v = float(rsi.iloc[-1]) if rsi is not None and not np.isnan(rsi.iloc[-1]) else 50.0
     vol = float(close.pct_change().tail(20).std() * 100) if len(close) > 25 else 3.0
 
-    # skala horyzontu (krypto: silniejszy short-term momentum)
+    # skala horyzontu (krypto: silNOjszy short-term momentum)
     if days_forward <= 30:
-        horiz_scale = 0.55  # ~1M: nie ekstrapoluj całego m30
+        horiz_scale = 0.55  # ~1M: NO ekstrapoluj całego m30
         w7, w14, w30 = 0.40, 0.35, 0.25
     else:
         horiz_scale = 0.85
@@ -4201,16 +4191,16 @@ def predict_crypto_technical(df, days_forward=21):
         rsi_adj = 1.2 if abs(m14) < 8 else -0.4
 
     raw = horiz_scale * (0.70 * mom + 0.20 * trend * max(vol, 1.5) + 0.10 * rsi_adj * max(vol, 1.5))
-    # clamp – krypto bywa szalone, nie dawaj absurdu
+    # clamp – krypto bywa szalone, NO dawaj absurdu
     cap = 25.0 if days_forward <= 30 else 45.0
     change_pct = float(np.clip(raw, -cap, cap))
 
     if abs(change_pct) < 0.8:
-        direction = "NEUTRALNY"
+        direction = "NEUTRAL"
     elif change_pct > 0:
-        direction = "WZROSTOWY"
+        direction = "UPTREND"
     else:
-        direction = "SPADKOWY"
+        direction = "DOWNTREND"
 
     pred_price = price * (1.0 + change_pct / 100.0)
     return round(pred_price, 6), direction, round(change_pct, 2)
@@ -4272,7 +4262,7 @@ def backtest_crypto_quality(df, days_forward=21, max_points=24, step=None):
             continue
 
     if significant < 3:
-        hit = 50.0  # za mało próby – neutralnie, nie kłam wysokim %
+        hit = 50.0  # za mało próby – neutralnie, nie kłam HIGHm %
     else:
         hit = 100.0 * dir_hits / significant
     mae = float(np.mean(errors)) if errors else None
@@ -4317,7 +4307,7 @@ def analyze_crypto_pair(symbol, days_forward=21):
         "current_price": round(price, 6),
         "predicted_price": pred_price,
         "predicted_change_pct": chg,
-        "direction": direction or "NEUTRALNY",
+        "direction": direction or "NEUTRAL",
         "rsi": round(rsi, 2) if rsi is not None and not (isinstance(rsi, float) and np.isnan(rsi)) else None,
         "sector": "Crypto",
         "fundamental_rating": None,

@@ -16,12 +16,12 @@ import core_analysis as core
 def calculate_hybrid_indicators(
     data: pd.DataFrame,
     ticker: str,
-    mode: str = "Zrównoważony",
+    mode: str = "BALANCED",
 ) -> Tuple[pd.DataFrame, float, str]:
     """Pełna logika Hybrid z desktopu – bez UI."""
     data = data.copy()
     if data.empty or "Close" not in data.columns:
-        raise ValueError("Brak danych OHLC")
+        raise ValueError("NONE danych OHLC")
 
     if "Volume" not in data.columns:
         data["Volume"] = 0.0
@@ -177,8 +177,8 @@ def calculate_hybrid_indicators(
     data.loc[data["%K"] > 80, "Score"] -= 0.5
     data["Score"] = data["Score"].clip(lower=0, upper=16)
 
-    mode = mode if mode in ("Agresywny", "Zrównoważony", "Bezpieczny") else "Zrównoważony"
-    base_threshold = {"Agresywny": 4.0, "Zrównoważony": 5.5, "Bezpieczny": 7.0}[mode]
+    mode = mode if mode in ("AGGRESIVE", "BALANCED", "PASSIVE") else "BALANCED"
+    base_threshold = {"AGGRESIVE": 4.0, "BALANCED": 5.5, "PASSIVE": 7.0}[mode]
 
     sector = core.sector_mapping.get(ticker, "Default")
     sector_mult_map = {
@@ -232,11 +232,11 @@ def _sf(x: Any) -> Optional[float]:
         return None
 
 
-def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
+def analyze_hybrid(ticker: str, mode: str = "BALANCED") -> Dict[str, Any]:
     ticker = ticker.upper().strip()
     df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
-        raise ValueError(f"Brak danych dla {ticker}")
+        raise ValueError(f"NONE DATA FOR {ticker}")
 
     data, threshold, sector = calculate_hybrid_indicators(df, ticker, mode)
     last = data.iloc[-1]
@@ -247,13 +247,13 @@ def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
     vol_ratio = (vol / vol_avg) if vol_avg else 1.0
     stop_loss = (price - 2 * atr) if atr > 0 else price * 0.95
 
-    signal = "BRAK"
+    signal = "NONE"
     signal_price = None
     if pd.notna(last.get("Buy_Signal")):
-        signal = "KUPNO"
+        signal = "BUY"
         signal_price = _sf(last["Buy_Signal"])
     elif pd.notna(last.get("Sell_Signal")):
-        signal = "SPRZEDAŻ"
+        signal = "SELL"
         signal_price = _sf(last["Sell_Signal"])
 
     # ostatnie sygnały w oknie 25 sesji
@@ -264,13 +264,13 @@ def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
     if len(last_buy) or len(last_sell):
         if len(last_buy) and len(last_sell):
             if last_buy.index[-1] >= last_sell.index[-1]:
-                recent = {"type": "KUPNO", "price": _sf(last_buy.iloc[-1]), "date": str(last_buy.index[-1].date())}
+                recent = {"type": "BUY", "price": _sf(last_buy.iloc[-1]), "date": str(last_buy.index[-1].date())}
             else:
-                recent = {"type": "SPRZEDAŻ", "price": _sf(last_sell.iloc[-1]), "date": str(last_sell.index[-1].date())}
+                recent = {"type": "SELL", "price": _sf(last_sell.iloc[-1]), "date": str(last_sell.index[-1].date())}
         elif len(last_buy):
-            recent = {"type": "KUPNO", "price": _sf(last_buy.iloc[-1]), "date": str(last_buy.index[-1].date())}
+            recent = {"type": "BUY", "price": _sf(last_buy.iloc[-1]), "date": str(last_buy.index[-1].date())}
         else:
-            recent = {"type": "SPRZEDAŻ", "price": _sf(last_sell.iloc[-1]), "date": str(last_sell.index[-1].date())}
+            recent = {"type": "SELL", "price": _sf(last_sell.iloc[-1]), "date": str(last_sell.index[-1].date())}
 
     return {
         "ticker": ticker,
@@ -304,10 +304,10 @@ def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
 
 def scan_signals(
     tickers: Optional[List[str]] = None,
-    mode: str = "Zrównoważony",
+    mode: str = "BALANCED",
     lookback: int = 25,
 ) -> List[Dict[str, Any]]:
-    """Skan listy tickerów – aktywne KUPNO/SPRZEDAŻ (logika jak w desktopie)."""
+    """Skan listy tickerów – aktywne BUY/SELL (logika jak w desktopie)."""
     tickers = tickers or list(getattr(core, "tickers", []))
     results: List[Dict[str, Any]] = []
 
@@ -328,24 +328,24 @@ def scan_signals(
             price = None
             if len(buy) > 0 and len(sell) > 0:
                 if buy.index[-1] >= sell.index[-1]:
-                    signal, price = "KUPNO", float(buy.iloc[-1])
+                    signal, price = "BUY", float(buy.iloc[-1])
                 else:
-                    signal, price = "SPRZEDAŻ", float(sell.iloc[-1])
+                    signal, price = "SELL", float(sell.iloc[-1])
             elif len(buy) > 0:
-                signal, price = "KUPNO", float(buy.iloc[-1])
+                signal, price = "BUY", float(buy.iloc[-1])
             elif len(sell) > 0:
-                signal, price = "SPRZEDAŻ", float(sell.iloc[-1])
+                signal, price = "SELL", float(sell.iloc[-1])
             else:
                 last = data.iloc[-1]
                 score = float(last.get("Score", 0) or 0)
                 close = float(last["Close"])
                 ema200 = float(last["EMA200"]) if pd.notna(last.get("EMA200")) else close
                 if score >= float(thr) and close > ema200:
-                    signal, price = "KUPNO", close
+                    signal, price = "BUY", close
                 elif score < 2.5 or close < ema200:
                     long_buy = data.tail(60)["Buy_Signal"].dropna()
                     if len(long_buy) > 0:
-                        signal, price = "SPRZEDAŻ", close
+                        signal, price = "SELL", close
 
             if signal is None:
                 continue
