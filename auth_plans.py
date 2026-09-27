@@ -74,7 +74,7 @@ def _env(*names: str) -> str:
 
 
 SUPABASE_URL = _env("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
-SUPABASE_ANON = _env("SUPABASE_ANON_KEY", "SUPABASE_ANON", "NEXT_PUBLIC_SUPABASE_ANON_KEY")
+SUPABASE_ANON = _env("SUPABASE_ANON_KEY", "SUPABASE_ANON", "NEXT_PUBLIC_SUPABASE_ANON_KEY", "SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_PUBLIC_KEY")
 SUPABASE_SERVICE = _env("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_SERVICE_ROLE")
 SUPABASE_JWT_SECRET = _env("SUPABASE_JWT_SECRET", "JWT_SECRET", "SUPABASE_JWT")
 AUTH_REQUIRED = (os.environ.get("AUTH_REQUIRED", "1") or "1").strip() in ("1", "true", "True", "yes")
@@ -149,93 +149,137 @@ def supabase_status() -> dict:
 
 def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     """
-    Weryfikacja sesji Supabase.
-    1) Preferowane: GET /auth/v1/user z Bearer token (działa z ES256 i HS256).
-    2) Fallback: lokalny decode HS256 przy SUPABASE_JWT_SECRET.
+    Weryfikacja JWT Supabase (ES256 / HS256).
+    Kolejność:
+      1) GET /auth/v1/user (anon, potem service_role)
+      2) JWKS ES256/RS256
+      3) HS256 + SUPABASE_JWT_SECRET
     """
     token = (token or "").strip()
     if not token:
         raise ValueError("Pusty token")
 
-    # --- 1) Auth API (najpewniejsze przy Lovable / ES256) ---
-    if SUPABASE_URL and (SUPABASE_ANON or SUPABASE_SERVICE):
-        key = SUPABASE_ANON or SUPABASE_SERVICE
-        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
-        try:
-            r = requests.get(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "apikey": key,
-                },
-                timeout=12,
-            )
-            if r.status_code == 200:
-                data = r.json() if r.content else {}
-                uid = data.get("id")
-                if uid:
-                    return {
-                        "id": uid,
-                        "email": data.get("email"),
-                        "role": (data.get("role") or "authenticated"),
-                    }
-            # 401 = zły/wygasły token — nie idź w HS, jak token jest ES256
-            if r.status_code in (401, 403):
-                raise ValueError(f"Supabase rejected token ({r.status_code})")
-            print("verify_supabase_jwt /user", r.status_code, (r.text or "")[:200])
-        except ValueError:
-            raise
-        except Exception as e:
-            print("verify_supabase_jwt /user network:", e)
+    url_base = (SUPABASE_URL or "").rstrip("/")
+    errors: List[str] = []
 
-    # --- 2) Legacy HS256 ---
+    def _from_user_json(data: Dict[str, Any]) -> Dict[str, Any]:
+        uid = data.get("id")
+        if not uid:
+            raise ValueError("Brak id w odpowiedzi /user")
+        return {
+            "id": uid,
+            "email": data.get("email"),
+            "role": (data.get("role") or "authenticated"),
+        }
+
+    # ----- 1) /auth/v1/user -----
+    if url_base:
+        keys_try = []
+        if SUPABASE_ANON:
+            keys_try.append(("anon", SUPABASE_ANON))
+        if SUPABASE_SERVICE and SUPABASE_SERVICE != SUPABASE_ANON:
+            keys_try.append(("service", SUPABASE_SERVICE))
+        for label, key in keys_try:
+            try:
+                r = requests.get(
+                    f"{url_base}/auth/v1/user",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "apikey": key,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    return _from_user_json(r.json() if r.content else {})
+                errors.append(f"/user[{label}]→{r.status_code}:{(r.text or '')[:120]}")
+            except Exception as e:
+                errors.append(f"/user[{label}] net:{e}")
+
+    # ----- 2) JWKS (ES256 itd.) -----
     try:
-        import jwt  # PyJWT
+        import jwt
+        from jwt import PyJWKClient
     except ImportError as e:
         raise RuntimeError("Zainstaluj PyJWT: pip install PyJWT") from e
 
-    if not SUPABASE_JWT_SECRET:
-        raise RuntimeError(
-            "Nie udało się zweryfikować tokena. Ustaw SUPABASE_URL + SUPABASE_ANON_KEY "
-            "(lub SUPABASE_JWT_SECRET dla HS256)."
-        )
-
     try:
         header = jwt.get_unverified_header(token)
-        alg = (header.get("alg") or "HS256").upper()
-    except Exception:
-        alg = "HS256"
+        alg = (header.get("alg") or "").upper()
+    except Exception as e:
+        raise ValueError(f"Nieczytelny JWT: {e}") from e
 
-    if not alg.startswith("HS"):
-        raise RuntimeError(
-            f"Token alg={alg}: ustaw poprawne SUPABASE_URL i SUPABASE_ANON_KEY na Renderze "
-            f"(weryfikacja przez /auth/v1/user)."
-        )
+    if url_base and alg and not alg.startswith("HS"):
+        jwks_url = f"{url_base}/auth/v1/.well-known/jwks.json"
+        try:
+            # wymuś requests (lepszy DNS niż urllib na części hostów)
+            jwks = requests.get(jwks_url, timeout=15)
+            if jwks.status_code != 200:
+                errors.append(f"jwks→{jwks.status_code}")
+            else:
+                client = PyJWKClient(jwks_url, cache_keys=True)
+                key = client.get_signing_key_from_jwt(token)
+                try:
+                    payload = jwt.decode(
+                        token,
+                        key.key,
+                        algorithms=["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"],
+                        audience="authenticated",
+                    )
+                except jwt.InvalidAudienceError:
+                    payload = jwt.decode(
+                        token,
+                        key.key,
+                        algorithms=["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"],
+                        options={"verify_aud": False},
+                    )
+                uid = payload.get("sub")
+                if not uid:
+                    raise ValueError("Brak sub")
+                email = payload.get("email")
+                meta = payload.get("user_metadata") or {}
+                if not email and isinstance(meta, dict):
+                    email = meta.get("email")
+                return {"id": uid, "email": email, "role": payload.get("role")}
+        except Exception as e:
+            errors.append(f"jwks:{e}")
 
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256", "HS384", "HS512"],
-            audience="authenticated",
-        )
-    except Exception:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256", "HS384", "HS512"],
-            options={"verify_aud": False},
-        )
+    # ----- 3) HS256 secret -----
+    if SUPABASE_JWT_SECRET and (not alg or alg.startswith("HS")):
+        try:
+            try:
+                payload = jwt.decode(
+                    token,
+                    SUPABASE_JWT_SECRET,
+                    algorithms=["HS256", "HS384", "HS512"],
+                    audience="authenticated",
+                )
+            except jwt.InvalidAudienceError:
+                payload = jwt.decode(
+                    token,
+                    SUPABASE_JWT_SECRET,
+                    algorithms=["HS256", "HS384", "HS512"],
+                    options={"verify_aud": False},
+                )
+            uid = payload.get("sub")
+            if uid:
+                email = payload.get("email")
+                meta = payload.get("user_metadata") or {}
+                if not email and isinstance(meta, dict):
+                    email = meta.get("email")
+                return {"id": uid, "email": email, "role": payload.get("role")}
+        except Exception as e:
+            errors.append(f"hs256:{e}")
 
-    uid = payload.get("sub")
-    if not uid:
-        raise ValueError("Brak sub w JWT")
-    email = payload.get("email")
-    if not email:
-        meta = payload.get("user_metadata") or {}
-        if isinstance(meta, dict):
-            email = meta.get("email")
-    return {"id": uid, "email": email, "role": payload.get("role")}
+    raise RuntimeError(
+        "Nie zweryfikowano tokena. "
+        f"SUPABASE_URL={'OK' if url_base else 'BRAK'}, "
+        f"anon={'OK' if SUPABASE_ANON else 'BRAK'}, "
+        f"service={'OK' if SUPABASE_SERVICE else 'BRAK'}, "
+        f"jwt_secret={'OK' if SUPABASE_JWT_SECRET else 'BRAK'}, "
+        f"alg={alg or '?'}. "
+        f"Szczegóły: {' | '.join(errors) if errors else 'brak'}"
+    )
 
 
 def fetch_profile(user_id: str) -> Optional[Dict[str, Any]]:
