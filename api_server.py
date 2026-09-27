@@ -1023,18 +1023,37 @@ class CreateCheckoutBody(BaseModel):
 
 
 @app.post("/billing/create-checkout")
-def create_checkout(
+async def create_checkout(
     body: CreateCheckoutBody,
-    prof: Dict[str, Any] = Depends(get_profile),
+    request: Request,
+    authorization: Optional[str] = Header(None),
 ):
     """
     Tworzy Stripe Checkout Session (subscription).
-    Front przekierowuje usera na data.url.
+    ZAWSZE wymaga Bearer JWT (nawet gdy AUTH_REQUIRED=0), żeby nie było anonymous.
     Metadata: supabase_user_id + plan → webhook ustawia profiles.plan.
     """
     plan = (body.plan or "").lower().strip()
     if plan not in ("standard", "pro"):
         raise HTTPException(status_code=400, detail="plan must be standard or pro")
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Login required: missing Authorization Bearer token",
+        )
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        user = auth.verify_supabase_jwt(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login required: invalid token ({e})")
+    uid = str(user.get("id") or "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Login required: no user id in token")
+    try:
+        prof = auth.ensure_profile(uid, email=user.get("email"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Profile error: {e}")
 
     secret = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
     if not secret or not secret.startswith("sk_"):
@@ -1048,10 +1067,6 @@ def create_checkout(
             status_code=503,
             detail=f"Missing env STRIPE_PRICE_{plan.upper()} (must be price_...)",
         )
-
-    uid = str(prof.get("id") or "")
-    if not uid or uid == "anonymous":
-        raise HTTPException(status_code=401, detail="Login required")
 
     success = (body.success_url or "").strip() or "https://example.com/billing/success"
     cancel = (body.cancel_url or "").strip() or "https://example.com/pricing"
