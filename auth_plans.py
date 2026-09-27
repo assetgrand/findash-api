@@ -149,88 +149,93 @@ def supabase_status() -> dict:
 
 def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     """
-    Dekoduje JWT Supabase.
-    - Legacy: HS256 + SUPABASE_JWT_SECRET
-    - Nowe projekty: ES256/RS256 przez JWKS (SUPABASE_URL)
+    Weryfikacja sesji Supabase.
+    1) Preferowane: GET /auth/v1/user z Bearer token (działa z ES256 i HS256).
+    2) Fallback: lokalny decode HS256 przy SUPABASE_JWT_SECRET.
     """
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("Pusty token")
+
+    # --- 1) Auth API (najpewniejsze przy Lovable / ES256) ---
+    if SUPABASE_URL and (SUPABASE_ANON or SUPABASE_SERVICE):
+        key = SUPABASE_ANON or SUPABASE_SERVICE
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
+        try:
+            r = requests.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": key,
+                },
+                timeout=12,
+            )
+            if r.status_code == 200:
+                data = r.json() if r.content else {}
+                uid = data.get("id")
+                if uid:
+                    return {
+                        "id": uid,
+                        "email": data.get("email"),
+                        "role": (data.get("role") or "authenticated"),
+                    }
+            # 401 = zły/wygasły token — nie idź w HS, jak token jest ES256
+            if r.status_code in (401, 403):
+                raise ValueError(f"Supabase rejected token ({r.status_code})")
+            print("verify_supabase_jwt /user", r.status_code, (r.text or "")[:200])
+        except ValueError:
+            raise
+        except Exception as e:
+            print("verify_supabase_jwt /user network:", e)
+
+    # --- 2) Legacy HS256 ---
     try:
         import jwt  # PyJWT
-        from jwt import PyJWKClient
     except ImportError as e:
         raise RuntimeError("Zainstaluj PyJWT: pip install PyJWT") from e
 
-    def _user_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-        uid = payload.get("sub")
-        if not uid:
-            raise ValueError("Brak sub w JWT")
-        email = payload.get("email")
-        if not email:
-            meta = payload.get("user_metadata") or {}
-            if isinstance(meta, dict):
-                email = meta.get("email")
-        return {
-            "id": uid,
-            "email": email,
-            "role": payload.get("role"),
-        }
+    if not SUPABASE_JWT_SECRET:
+        raise RuntimeError(
+            "Nie udało się zweryfikować tokena. Ustaw SUPABASE_URL + SUPABASE_ANON_KEY "
+            "(lub SUPABASE_JWT_SECRET dla HS256)."
+        )
 
-    # Odczytaj alg z nagłówka (bez weryfikacji)
     try:
         header = jwt.get_unverified_header(token)
         alg = (header.get("alg") or "HS256").upper()
     except Exception:
         alg = "HS256"
 
-    decode_kwargs = {
-        "audience": "authenticated",
-        "options": {"verify_aud": True},
-    }
+    if not alg.startswith("HS"):
+        raise RuntimeError(
+            f"Token alg={alg}: ustaw poprawne SUPABASE_URL i SUPABASE_ANON_KEY na Renderze "
+            f"(weryfikacja przez /auth/v1/user)."
+        )
 
-    # 1) HS* → secret z dashboardu
-    if alg.startswith("HS"):
-        if not SUPABASE_JWT_SECRET:
-            raise RuntimeError("Brak SUPABASE_JWT_SECRET (Settings → API → JWT Secret)")
-        try:
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256", "HS384", "HS512"],
-                **decode_kwargs,
-            )
-            return _user_from_payload(payload)
-        except jwt.InvalidAudienceError:
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256", "HS384", "HS512"],
-                options={"verify_aud": False},
-            )
-            return _user_from_payload(payload)
-
-    # 2) ES256 / RS256 → JWKS z projektu Supabase
-    if not SUPABASE_URL:
-        raise RuntimeError("Brak SUPABASE_URL do weryfikacji JWT (JWKS)")
-    jwks_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
     try:
-        jwks_client = PyJWKClient(jwks_url, cache_keys=True)
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        try:
-            payload = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["ES256", "RS256", "ES384", "RS384", "ES512", "RS512"],
-                **decode_kwargs,
-            )
-        except jwt.InvalidAudienceError:
-            payload = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["ES256", "RS256", "ES384", "RS384", "ES512", "RS512"],
-                options={"verify_aud": False},
-            )
-        return _user_from_payload(payload)
-    except Exception as e:
-        raise RuntimeError(f"JWT JWKS verify failed ({alg}): {e}") from e
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256", "HS384", "HS512"],
+            audience="authenticated",
+        )
+    except Exception:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256", "HS384", "HS512"],
+            options={"verify_aud": False},
+        )
+
+    uid = payload.get("sub")
+    if not uid:
+        raise ValueError("Brak sub w JWT")
+    email = payload.get("email")
+    if not email:
+        meta = payload.get("user_metadata") or {}
+        if isinstance(meta, dict):
+            email = meta.get("email")
+    return {"id": uid, "email": email, "role": payload.get("role")}
 
 
 def fetch_profile(user_id: str) -> Optional[Dict[str, Any]]:
