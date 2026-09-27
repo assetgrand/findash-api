@@ -1011,6 +1011,84 @@ def list_plans():
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Stripe Checkout Session (Standard / Pro)
+# Env: STRIPE_SECRET_KEY, STRIPE_PRICE_STANDARD, STRIPE_PRICE_PRO
+# ---------------------------------------------------------------------------
+class CreateCheckoutBody(BaseModel):
+    plan: str = Field(..., description="standard | pro")
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+
+@app.post("/billing/create-checkout")
+def create_checkout(
+    body: CreateCheckoutBody,
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """
+    Tworzy Stripe Checkout Session (subscription).
+    Front przekierowuje usera na data.url.
+    Metadata: supabase_user_id + plan → webhook ustawia profiles.plan.
+    """
+    plan = (body.plan or "").lower().strip()
+    if plan not in ("standard", "pro"):
+        raise HTTPException(status_code=400, detail="plan must be standard or pro")
+
+    secret = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not secret or not secret.startswith("sk_"):
+        raise HTTPException(status_code=503, detail="STRIPE_SECRET_KEY not configured on server")
+
+    price_standard = (os.environ.get("STRIPE_PRICE_STANDARD") or "").strip()
+    price_pro = (os.environ.get("STRIPE_PRICE_PRO") or "").strip()
+    price_id = price_pro if plan == "pro" else price_standard
+    if not price_id or not price_id.startswith("price_"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Missing env STRIPE_PRICE_{plan.upper()} (must be price_...)",
+        )
+
+    uid = str(prof.get("id") or "")
+    if not uid or uid == "anonymous":
+        raise HTTPException(status_code=401, detail="Login required")
+
+    success = (body.success_url or "").strip() or "https://example.com/billing/success"
+    cancel = (body.cancel_url or "").strip() or "https://example.com/pricing"
+
+    try:
+        import stripe
+        stripe.api_key = secret
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success if "{CHECKOUT_SESSION_ID}" in success else (success.rstrip("/") + "?session_id={CHECKOUT_SESSION_ID}"),
+            cancel_url=cancel,
+            client_reference_id=uid,
+            metadata={
+                "supabase_user_id": uid,
+                "plan": plan,
+            },
+            subscription_data={
+                "metadata": {
+                    "supabase_user_id": uid,
+                    "plan": plan,
+                }
+            },
+            allow_promotion_codes=True,
+        )
+    except Exception as e:
+        print("[stripe] create-checkout error:", e)
+        raise HTTPException(status_code=502, detail=f"Stripe error: {e}")
+
+    return {
+        "url": session.url,
+        "session_id": session.id,
+        "plan": plan,
+    }
+
+
+
 @app.post("/billing/stripe-webhook")
 async def stripe_webhook(request: Request):
     """
@@ -1303,5 +1381,6 @@ def root():
             "GET /report/{ticker}",
             "GET /report/{ticker}/pdf",
             "GET /report/{ticker}/xlsx",
+            "POST /billing/create-checkout",
         ],
     }
