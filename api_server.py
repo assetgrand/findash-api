@@ -1130,19 +1130,60 @@ async def stripe_webhook(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
-    etype = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
-    data_obj = event.get("data", {}).get("object", {}) if isinstance(event, dict) else {}
+    # construct_event zwraca StripeObject, nie zawsze dict
+    if isinstance(event, dict):
+        etype = event.get("type")
+        data_obj = (event.get("data") or {}).get("object") or {}
+    else:
+        etype = getattr(event, "type", None)
+        data = getattr(event, "data", None)
+        data_obj = getattr(data, "object", None) if data is not None else None
+        if data_obj is not None and hasattr(data_obj, "to_dict"):
+            try:
+                data_obj = data_obj.to_dict()
+            except Exception:
+                pass
+        if data_obj is None:
+            data_obj = {}
+
     if etype == "checkout.session.completed":
-        meta = data_obj.get("metadata") or {}
-        uid = meta.get("supabase_user_id") or meta.get("user_id")
-        plan = (meta.get("plan") or "").lower()
+        if isinstance(data_obj, dict):
+            meta = data_obj.get("metadata") or {}
+            client_ref = data_obj.get("client_reference_id")
+        else:
+            meta = getattr(data_obj, "metadata", None) or {}
+            if hasattr(meta, "to_dict"):
+                try:
+                    meta = meta.to_dict()
+                except Exception:
+                    meta = dict(meta) if meta else {}
+            elif meta is not None and not isinstance(meta, dict):
+                try:
+                    meta = dict(meta)
+                except Exception:
+                    meta = {}
+            client_ref = getattr(data_obj, "client_reference_id", None)
+
+        if not isinstance(meta, dict):
+            meta = {}
+
+        uid = (
+            meta.get("supabase_user_id")
+            or meta.get("user_id")
+            or client_ref
+        )
+        plan = (meta.get("plan") or "").lower().strip()
+        print(f"[stripe] checkout.session.completed uid={uid!r} plan={plan!r} meta={meta}")
+
         if uid and plan in auth.VALID_PLANS and plan != "demo":
             try:
-                auth.set_plan(uid, plan)
-                print(f"[stripe] plan={plan} user={uid}")
+                auth.set_plan(str(uid), plan)
+                print(f"[stripe] plan set OK plan={plan} user={uid}")
             except Exception as e:
                 print("[stripe] set_plan error", e)
                 raise HTTPException(status_code=500, detail=str(e))
+        else:
+            print(f"[stripe] skip set_plan (uid/plan incomplete)")
     return {"received": True}
 
 
