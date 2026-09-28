@@ -150,8 +150,8 @@ def supabase_status() -> dict:
 def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     """
     Weryfikacja JWT Supabase (ES256 / HS256).
-    JWKS bierze z iss w tokenie (ten projekt, który wystawił sesję),
-    nie tylko z SUPABASE_URL env — eliminuje mismatch Lovable vs Render.
+    Przy ES256: JWKS z iss tokena + env; jeśli kid nie pasuje,
+    próbuje KAŻDEGO klucza z JWKS (rotacja / mismatch kid).
     """
     token = (token or "").strip()
     if not token:
@@ -159,9 +159,9 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
 
     try:
         import jwt
-        from jwt import PyJWKClient
+        from jwt import algorithms as jwt_algorithms
     except ImportError as e:
-        raise RuntimeError("Zainstaluj PyJWT (+ cryptography): pip install PyJWT cryptography") from e
+        raise RuntimeError("Zainstaluj PyJWT cryptography: pip install PyJWT cryptography") from e
 
     errors: List[str] = []
 
@@ -173,6 +173,17 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     except Exception as e:
         raise ValueError(f"Nieczytelny JWT: {e}") from e
 
+    # wygaśnięcie
+    exp = unverified.get("exp")
+    if exp is not None:
+        try:
+            if int(exp) < int(time.time()) - 30:
+                raise ValueError("Token wygasł — wyloguj się i zaloguj ponownie")
+        except ValueError:
+            raise
+        except Exception:
+            pass
+
     iss = (unverified.get("iss") or "").rstrip("/")
     uid_preview = unverified.get("sub")
     email_preview = unverified.get("email")
@@ -181,10 +192,8 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
         if isinstance(meta, dict):
             email_preview = meta.get("email")
 
-    # Baza URL do JWKS /user: najpierw iss z tokena, potem env
     bases: List[str] = []
     if iss:
-        # iss = https://xxx.supabase.co/auth/v1  →  https://xxx.supabase.co
         base = iss
         if base.endswith("/auth/v1"):
             base = base[: -len("/auth/v1")]
@@ -193,23 +202,19 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     if env_base and env_base not in bases:
         bases.append(env_base)
 
-    def _ok_user(data: Dict[str, Any]) -> Dict[str, Any]:
-        uid = data.get("id") or uid_preview
-        if not uid:
-            raise ValueError("Brak user id")
+    def _result(uid: str, email: Any = None, role: Any = None) -> Dict[str, Any]:
         return {
             "id": uid,
-            "email": data.get("email") or email_preview,
-            "role": (data.get("role") or "authenticated"),
+            "email": email or email_preview,
+            "role": role or "authenticated",
         }
 
-    # ----- 1) /auth/v1/user na każdym base + anon/service -----
+    # 1) /auth/v1/user
     keys_try = []
     if SUPABASE_ANON:
         keys_try.append(("anon", SUPABASE_ANON))
     if SUPABASE_SERVICE and SUPABASE_SERVICE != SUPABASE_ANON:
         keys_try.append(("service", SUPABASE_SERVICE))
-
     for base in bases:
         for label, key in keys_try:
             try:
@@ -223,12 +228,15 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
                     timeout=15,
                 )
                 if r.status_code == 200:
-                    return _ok_user(r.json() if r.content else {})
+                    data = r.json() if r.content else {}
+                    uid = data.get("id") or uid_preview
+                    if uid:
+                        return _result(uid, data.get("email"), data.get("role"))
                 errors.append(f"/user@{base}[{label}]→{r.status_code}")
             except Exception as e:
-                errors.append(f"/user@{base}[{label}] net:{e}")
+                errors.append(f"/user@{base}[{label}]:{e}")
 
-    # ----- 2) JWKS na każdym base (ES256) -----
+    # 2) JWKS — wszystkie klucze z zestawu
     if alg and not alg.startswith("HS"):
         for base in bases:
             jwks_url = f"{base}/auth/v1/.well-known/jwks.json"
@@ -237,39 +245,46 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
                 if jr.status_code != 200:
                     errors.append(f"jwks@{base}→{jr.status_code}")
                     continue
-                body = jr.json() if jr.content else {}
-                kids = [k.get("kid") for k in (body.get("keys") or []) if isinstance(k, dict)]
-                if kid and kid not in kids:
-                    errors.append(f"jwks@{base} brak kid={kid}; ma={kids[:5]}")
-                    continue
-                client = PyJWKClient(jwks_url, cache_keys=True)
-                signing_key = client.get_signing_key_from_jwt(token)
-                try:
-                    payload = jwt.decode(
-                        token,
-                        signing_key.key,
-                        algorithms=["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"],
-                        audience="authenticated",
-                    )
-                except jwt.InvalidAudienceError:
-                    payload = jwt.decode(
-                        token,
-                        signing_key.key,
-                        algorithms=["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"],
-                        options={"verify_aud": False},
-                    )
-                uid = payload.get("sub")
-                if not uid:
-                    raise ValueError("Brak sub")
-                email = payload.get("email") or email_preview
-                meta = payload.get("user_metadata") or {}
-                if not email and isinstance(meta, dict):
-                    email = meta.get("email")
-                return {"id": uid, "email": email, "role": payload.get("role")}
+                jwks = jr.json() if jr.content else {}
+                key_list = jwks.get("keys") or []
+                kids = [k.get("kid") for k in key_list if isinstance(k, dict)]
+                errors.append(f"jwks@{base} kids={kids[:8]} token_kid={kid}")
+
+                algs = ["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"]
+                for jwk in key_list:
+                    if not isinstance(jwk, dict):
+                        continue
+                    try:
+                        if jwk.get("kty") == "EC":
+                            pub = jwt_algorithms.ECAlgorithm.from_jwk(jwk)
+                        elif jwk.get("kty") == "RSA":
+                            pub = jwt_algorithms.RSAAlgorithm.from_jwk(jwk)
+                        else:
+                            continue
+                        try:
+                            payload = jwt.decode(
+                                token,
+                                pub,
+                                algorithms=algs,
+                                audience="authenticated",
+                            )
+                        except jwt.InvalidAudienceError:
+                            payload = jwt.decode(
+                                token,
+                                pub,
+                                algorithms=algs,
+                                options={"verify_aud": False},
+                            )
+                        uid = payload.get("sub")
+                        if uid:
+                            return _result(uid, payload.get("email"), payload.get("role"))
+                    except Exception:
+                        continue
+                errors.append(f"jwks@{base}: żaden klucz nie zweryfikował podpisu")
             except Exception as e:
                 errors.append(f"jwks@{base}:{e}")
 
-    # ----- 3) HS256 -----
+    # 3) HS256
     if SUPABASE_JWT_SECRET and (not alg or alg.startswith("HS")):
         try:
             try:
@@ -288,18 +303,14 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
                 )
             uid = payload.get("sub")
             if uid:
-                return {
-                    "id": uid,
-                    "email": payload.get("email") or email_preview,
-                    "role": payload.get("role"),
-                }
+                return _result(uid, payload.get("email"), payload.get("role"))
         except Exception as e:
             errors.append(f"hs256:{e}")
 
     raise RuntimeError(
         "Nie zweryfikowano tokena. "
         f"iss={iss or '?'}, alg={alg or '?'}, kid={kid or '?'}, "
-        f"env_url={env_base or 'BRAK'}, bases={bases}. "
+        f"sub={uid_preview or '?'}, bases={bases}. "
         f"Szczegóły: {' | '.join(errors) if errors else 'brak'}"
     )
 
@@ -365,19 +376,67 @@ def _normalize_month(prof: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _update_profile(user_id: str, fields: Dict[str, Any]) -> None:
-    if not SUPABASE_URL or not SUPABASE_SERVICE:
-        return
+    if not SUPABASE_URL:
+        raise RuntimeError("Brak SUPABASE_URL — nie można zapisać planu")
+    if not SUPABASE_SERVICE:
+        raise RuntimeError(
+            "Brak SUPABASE_SERVICE_ROLE_KEY na Renderze — set_plan nie zapisze planu"
+        )
     url = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
-    r = requests.patch(url, headers=_sb_headers(True), json=fields, timeout=15)
-    if r.status_code not in (200, 204):
-        print("update_profile", r.status_code, r.text[:200])
+    headers = _sb_headers(True)
+    r = requests.patch(url, headers=headers, json=fields, timeout=15)
+    if r.status_code in (200, 204):
+        # sprawdź czy coś zaktualizowano — pusty wynik = brak wiersza
+        if r.status_code == 200:
+            try:
+                body = r.json() if r.content else []
+                if isinstance(body, list) and len(body) == 0:
+                    # utwórz profil z planem
+                    payload = {"id": user_id, "plan": fields.get("plan", "demo"), **{k: v for k, v in fields.items()}}
+                    pr = requests.post(
+                        f"{SUPABASE_URL}/rest/v1/profiles",
+                        headers=headers,
+                        json=payload,
+                        timeout=15,
+                    )
+                    if pr.status_code not in (200, 201):
+                        raise RuntimeError(f"create profile after empty patch: {pr.status_code} {pr.text[:200]}")
+                return
+            except RuntimeError:
+                raise
+            except Exception:
+                return
+        return
+    # 404 / błąd — spróbuj insert
+    if "plan" in fields:
+        payload = {"id": user_id, **fields}
+        pr = requests.post(
+            f"{SUPABASE_URL}/rest/v1/profiles",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        if pr.status_code in (200, 201):
+            return
+        raise RuntimeError(
+            f"update_profile failed patch={r.status_code} {r.text[:200]} "
+            f"post={pr.status_code} {pr.text[:200]}"
+        )
+    raise RuntimeError(f"update_profile failed: {r.status_code} {r.text[:200]}")
 
 
 def set_plan(user_id: str, plan: str) -> None:
     plan = plan.lower().strip()
     if plan not in VALID_PLANS:
         raise ValueError(f"Nieprawidłowy plan: {plan}")
+    ensure_profile(user_id)
     _update_profile(user_id, {"plan": plan})
+    # weryfikacja odczytem
+    prof = fetch_profile(user_id)
+    if not prof or (prof.get("plan") or "").lower() != plan:
+        raise RuntimeError(
+            f"Plan nie zapisał się w DB (oczekiwano {plan}, jest {prof})"
+        )
 
 
 def increment_analyze(user_id: str, current_count: int) -> int:

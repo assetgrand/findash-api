@@ -1104,6 +1104,88 @@ async def create_checkout(
 
 
 
+
+@app.get("/billing/confirm-session")
+def confirm_session(
+    session_id: str = Query(..., description="Stripe Checkout session id (cs_...)"),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Zapasowe ustawienie planu po powrocie z Stripe (gdy webhook nie dojdzie).
+    Front: /billing/success?session_id=cs_...
+    """
+    session_id = (session_id or "").strip()
+    if not session_id.startswith("cs_"):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    # opcjonalnie zweryfikuj usera z JWT
+    uid_from_jwt = None
+    if authorization and authorization.lower().startswith("bearer "):
+        try:
+            user = auth.verify_supabase_jwt(authorization.split(" ", 1)[1].strip())
+            uid_from_jwt = str(user.get("id") or "")
+        except Exception as e:
+            print("[stripe] confirm jwt:", e)
+
+    secret = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="STRIPE_SECRET_KEY missing")
+
+    try:
+        import stripe
+        stripe.api_key = secret
+        sess = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Stripe retrieve: {e}")
+
+    status = getattr(sess, "payment_status", None) or (sess.get("payment_status") if isinstance(sess, dict) else None)
+    if status not in ("paid", "no_payment_required"):
+        # subscription mode often "paid" after success
+        mode = getattr(sess, "mode", None) or (sess.get("mode") if isinstance(sess, dict) else None)
+        sc = getattr(sess, "status", None) or (sess.get("status") if isinstance(sess, dict) else None)
+        if sc not in ("complete",):
+            raise HTTPException(status_code=400, detail=f"Session not paid/complete (payment_status={status}, status={sc})")
+
+    if isinstance(sess, dict):
+        meta = sess.get("metadata") or {}
+        client_ref = sess.get("client_reference_id")
+    else:
+        meta = getattr(sess, "metadata", None) or {}
+        if hasattr(meta, "to_dict"):
+            try:
+                meta = meta.to_dict()
+            except Exception:
+                meta = dict(meta) if meta else {}
+        elif not isinstance(meta, dict):
+            try:
+                meta = dict(meta)
+            except Exception:
+                meta = {}
+        client_ref = getattr(sess, "client_reference_id", None)
+
+    uid = (meta.get("supabase_user_id") or meta.get("user_id") or client_ref or "")
+    uid = str(uid).strip()
+    plan = (meta.get("plan") or "").lower().strip()
+
+    if uid_from_jwt and uid and uid_from_jwt != uid:
+        raise HTTPException(status_code=403, detail="Session user mismatch")
+    if not uid:
+        uid = uid_from_jwt or ""
+    if not uid:
+        raise HTTPException(status_code=400, detail="No user id in session metadata")
+    if plan not in auth.VALID_PLANS or plan == "demo":
+        raise HTTPException(status_code=400, detail=f"Invalid plan in session: {plan!r}")
+
+    try:
+        auth.set_plan(uid, plan)
+    except Exception as e:
+        print("[stripe] confirm set_plan error", e)
+        raise HTTPException(status_code=500, detail=f"set_plan failed: {e}")
+
+    print(f"[stripe] confirm-session OK plan={plan} user={uid}")
+    return {"ok": True, "plan": plan, "user_id": uid}
+
+
 @app.post("/billing/stripe-webhook")
 async def stripe_webhook(request: Request):
     """
