@@ -1269,6 +1269,90 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
+
+class AdminSetPlanBody(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    plan: str = Field(..., description="demo|standard|pro")
+
+
+def _require_admin(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")) -> None:
+    expected = (os.environ.get("ADMIN_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Ustaw ADMIN_SECRET na Renderze, żeby zarządzać planami",
+        )
+    if not x_admin_secret or x_admin_secret.strip() != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+
+@app.post("/billing/admin/set-plan")
+def admin_set_plan(
+    body: AdminSetPlanBody,
+    x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret"),
+):
+    """
+    Admin: ustaw plan userowi (Render/Supabase profiles = źródło prawdy).
+    Header: X-Admin-Secret: <ADMIN_SECRET z Render>
+    Body JSON: {"user_id":"uuid","plan":"standard"} albo {"email":"...","plan":"pro"}
+    """
+    _require_admin(x_admin_secret)
+    plan = (body.plan or "").lower().strip()
+    if plan not in auth.VALID_PLANS:
+        raise HTTPException(status_code=400, detail="plan must be demo|standard|pro")
+
+    uid = (body.user_id or "").strip()
+    if not uid and body.email:
+        # lookup po email w profiles
+        if not auth.SUPABASE_URL or not auth.SUPABASE_SERVICE:
+            raise HTTPException(status_code=503, detail="Supabase service not configured")
+        import requests as req
+        url = f"{auth.SUPABASE_URL}/rest/v1/profiles?email=eq.{body.email.strip()}&select=id,email,plan"
+        r = req.get(url, headers=auth._sb_headers(True), timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"profiles lookup: {r.status_code} {r.text[:200]}")
+        rows = r.json() or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="No profile with that email")
+        uid = str(rows[0]["id"])
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id or email required")
+
+    try:
+        auth.set_plan(uid, plan)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    prof = auth.fetch_profile(uid) or {"id": uid, "plan": plan}
+    return {"ok": True, "user_id": uid, "plan": (prof.get("plan") or plan), "email": prof.get("email")}
+
+
+@app.get("/billing/admin/profile")
+def admin_get_profile(
+    user_id: Optional[str] = Query(None),
+    email: Optional[str] = Query(None),
+    x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret"),
+):
+    """Admin: podgląd planu. Header X-Admin-Secret."""
+    _require_admin(x_admin_secret)
+    if email and not user_id:
+        import requests as req
+        url = f"{auth.SUPABASE_URL}/rest/v1/profiles?email=eq.{email.strip()}&select=*"
+        r = req.get(url, headers=auth._sb_headers(True), timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=r.text[:300])
+        rows = r.json() or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="not found")
+        return rows[0]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id or email")
+    prof = auth.fetch_profile(user_id)
+    if not prof:
+        raise HTTPException(status_code=404, detail="not found")
+    return prof
+
+
 @app.post("/billing/set-plan-dev")
 def set_plan_dev(
     plan: str = Query(..., description="demo|standard|pro"),

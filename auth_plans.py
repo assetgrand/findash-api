@@ -429,9 +429,22 @@ def set_plan(user_id: str, plan: str) -> None:
     plan = plan.lower().strip()
     if plan not in VALID_PLANS:
         raise ValueError(f"Nieprawidłowy plan: {plan}")
-    ensure_profile(user_id)
-    _update_profile(user_id, {"plan": plan})
-    # weryfikacja odczytem
+    try:
+        ensure_profile(user_id)
+        _update_profile(user_id, {"plan": plan})
+    except Exception as e:
+        msg = str(e)
+        if "23503" in msg or "foreign key" in msg.lower():
+            raise RuntimeError(
+                "profiles.id ma FK do tabeli users, a tego usera tam nie ma. "
+                "W Supabase SQL Editor uruchom: "
+                "ALTER TABLE public.profiles DROP CONSTRAINT IF EXISTS profiles_id_fkey; "
+                "potem ewentualnie: "
+                "ALTER TABLE public.profiles ADD CONSTRAINT profiles_id_fkey "
+                "FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE; "
+                f"Szczegóły: {msg}"
+            ) from e
+        raise
     prof = fetch_profile(user_id)
     if not prof or (prof.get("plan") or "").lower() != plan:
         raise RuntimeError(
