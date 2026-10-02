@@ -83,6 +83,37 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+
+# Krótki cache profilu po tokenie – bez tego każde /analyze = JWT + Supabase + IP
+_PROFILE_MEM_CACHE: Dict[str, Any] = {}
+_PROFILE_MEM_TTL = float(os.environ.get("PROFILE_CACHE_TTL", "120"))  # sekundy
+_PROFILE_MEM_LOCK = threading.Lock()
+
+
+def _profile_cache_get(token: str) -> Optional[Dict[str, Any]]:
+    import hashlib
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:40]
+    with _PROFILE_MEM_LOCK:
+        row = _PROFILE_MEM_CACHE.get(key)
+        if not row:
+            return None
+        if time.time() - row["ts"] > _PROFILE_MEM_TTL:
+            _PROFILE_MEM_CACHE.pop(key, None)
+            return None
+        return dict(row["prof"])
+
+
+def _profile_cache_set(token: str, prof: Dict[str, Any]) -> None:
+    import hashlib
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:40]
+    with _PROFILE_MEM_LOCK:
+        _PROFILE_MEM_CACHE[key] = {"ts": time.time(), "prof": dict(prof)}
+        if len(_PROFILE_MEM_CACHE) > 500:
+            oldest = sorted(_PROFILE_MEM_CACHE.items(), key=lambda kv: kv[1]["ts"])[:100]
+            for k, _ in oldest:
+                _PROFILE_MEM_CACHE.pop(k, None)
+
+
 async def get_profile(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -115,20 +146,29 @@ async def get_profile(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Wymagane logowanie (Authorization: Bearer <token>).",
+            detail="Login required (Authorization: Bearer <token>).",
         )
     token = authorization.split(" ", 1)[1].strip()
+    cached_prof = _profile_cache_get(token)
+    if cached_prof is not None:
+        return cached_prof
     try:
         user = auth.verify_supabase_jwt(token)
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Nieprawidłowy token: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     try:
         prof = auth.ensure_profile(user["id"], email=user.get("email"))
-        return auth.apply_trusted_ip(prof, _client_ip(request))
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        # Trusted IP tylko co cache miss (nie przy każdym analyze)
+        try:
+            prof = auth.apply_trusted_ip(prof, _client_ip(request))
+        except PermissionError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        _profile_cache_set(token, prof)
+        return prof
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Profil: {e}")
+        raise HTTPException(status_code=500, detail=f"Profile: {e}")
 
 
 def _gate(prof: Dict[str, Any], feature: str) -> None:
@@ -201,7 +241,7 @@ def _safe_float(x: Any) -> Optional[float]:
 # Cache (TTL sekundy). Bez tego Free tier Render często timeoutuje.
 _ANALYZE_CACHE: Dict[str, Any] = {}
 
-_ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "900"))  # 15 min
+_ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "3600"))  # 1h
 
 # Signals: wynik skanu trzymany na serwerze – strona tylko czyta (komercyjnie)
 # Hybrid stoi na świecach dziennych → 1h domyślnie; na produkcję można 6h/24h (SIGNALS_CACHE_TTL)
@@ -221,8 +261,8 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # Nie zmienia silnika analizy – tylko woła _analyze_one w tle
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
-_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "0") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # pełna runda co 10 min
+_PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "3600"))  # pełna runda co 1h
 _PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
 _PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
 _PRECOMPUTE_LOCK = threading.Lock()
@@ -252,7 +292,7 @@ def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
 def _pc_get(ticker: str, horizon_label: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Zwraca skopiowane data lub None. max_age domyślnie 2x interval."""
     if max_age is None:
-        max_age = float(_PRECOMPUTE_INTERVAL) * 2.5
+        max_age = max(float(_PRECOMPUTE_INTERVAL) * 3.0, 10800.0)  # min 3h świeżości precompute
     with _PRECOMPUTE_LOCK:
         row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
         if not row:
