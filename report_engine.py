@@ -36,7 +36,7 @@ def forecast_quality_backtest(ticker: str, horizon: str = "1M") -> Dict[str, Any
 
     df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
-        raise ValueError(f"Brak danych dla {ticker}")
+        raise ValueError(f"No data for {ticker}")
     df = core.calculate_indicators_on_df(df)
 
     sector = core.sector_mapping.get(ticker, "Default")
@@ -78,7 +78,7 @@ def strategy_backtest(ticker: str, initial_capital: float = 10000.0) -> Dict[str
     ticker = ticker.upper().strip()
     df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
-        raise ValueError(f"Brak danych dla {ticker}")
+        raise ValueError(f"No data for {ticker}")
     df = core.calculate_indicators_on_df(df)
     if df is None or len(df) < 30:
         raise ValueError("Za mało danych do backtestu strategii")
@@ -230,7 +230,7 @@ def build_report_payload(ticker: str) -> Dict[str, Any]:
             out[key] = {"error": str(e)}
 
     try:
-        out["hybrid"] = hybrid.analyze_hybrid(ticker, mode="Zrównoważony")
+        out["hybrid"] = hybrid.analyze_hybrid(ticker, mode="BALANCED")
     except Exception as e:
         out["hybrid"] = {"error": str(e)}
 

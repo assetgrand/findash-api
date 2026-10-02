@@ -94,10 +94,11 @@ async def get_profile(
     Przy autentycznym userze: rejestracja / kontrola zaufanego IP.
     """
     if not auth.AUTH_REQUIRED:
+        # NIGDY pro na produkcji — bez logowania tylko demo
         return {
             "id": "anonymous",
             "email": None,
-            "plan": "pro",  # tryb otwarty – tylko dev
+            "plan": "demo",
             "analyze_count": 0,
             "analyze_month": auth._month_key(),
         }
@@ -158,7 +159,7 @@ class AnalyzeResponse(BaseModel):
     plan: Optional[str] = None
     disclaimer: str = (
         "To narzędzie analityczne, nie rekomendacja inwestycyjna. "
-        "Prognozy oparte na modelu historycznym; nie uwzględniają zdarzeń losowych."
+        "Forecasts are based on a historical model and do not account for random events."
     )
 
 
@@ -375,7 +376,7 @@ def _analyze_one(
     # zawsze 500 dni jak desktop
     df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
-        raise HTTPException(status_code=404, detail=f"Brak danych cenowych dla {ticker}")
+        raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
 
     df = core.calculate_indicators_on_df(df)
     if df is None or getattr(df, "empty", True):
@@ -649,7 +650,7 @@ def fundamentals(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     if not fa:
-        raise HTTPException(status_code=404, detail="Brak danych fundamentalnych")
+        raise HTTPException(status_code=404, detail="No fundamental data")
     # JSON-serializable
     out = {}
     for k, v in fa.items():
@@ -682,7 +683,7 @@ def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     if not info:
-        raise HTTPException(status_code=404, detail="Brak perspektywy 3Y")
+        raise HTTPException(status_code=404, detail="No 3Y perspective data")
     # uprość zagnieżdżenia
     clean = {}
     for k, v in info.items():
@@ -855,10 +856,10 @@ def report_xlsx(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
 @app.get("/hybrid/{ticker}")
 def hybrid_analyze(
     ticker: str,
-    mode: str = Query("BALANCED", description="AGGRESIVE | BALANCED | PASSIVE"),
+    mode: str = Query("BALANCED", description="AGGRESSIVE | BALANCED | CONSERVATIVE"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Hybrid Analyzer – score, próg, sygnał KUPNO/SPRZEDAŻ (plan Pro)."""
+    """Hybrid Analyzer – score, threshold, BUY/SELL signal (Pro plan)."""
     _gate(prof, "hybrid")
     try:
         return hybrid.analyze_hybrid(ticker, mode=mode)
@@ -893,7 +894,7 @@ def _build_signals_payload(mode: str, limit: int) -> Dict[str, Any]:
 
 def _precompute_signals_once() -> None:
     """Odśwież sygnały dla 3 trybów – po rundzie 1M/3M albo gdy cache pusty."""
-    modes = ("AGGRESIVE", "BALANCED", "PASSIVE")
+    modes = ("AGGRESSIVE", "BALANCED", "CONSERVATIVE")
     limit = min(20, max(len(getattr(core, "tickers", []) or []), 8))
     for mode in modes:
         try:
@@ -1068,8 +1069,22 @@ async def create_checkout(
             detail=f"Missing env STRIPE_PRICE_{plan.upper()} (must be price_...)",
         )
 
-    success = (body.success_url or "").strip() or "https://example.com/billing/success"
-    cancel = (body.cancel_url or "").strip() or "https://example.com/pricing"
+    success = (body.success_url or "").strip()
+    cancel = (body.cancel_url or "").strip() or "https://future-fin-scan.lovable.app/pricing"
+
+    # Zawsze ląduj na /analiza (unikaj /billing/success → 404 na Lovable SPA)
+    if not success or "billing/success" in success:
+        origin = "https://future-fin-scan.lovable.app"
+        if cancel.startswith("http"):
+            try:
+                from urllib.parse import urlparse
+                origin = f"{urlparse(cancel).scheme}://{urlparse(cancel).netloc}"
+            except Exception:
+                pass
+        success = f"{origin}/analiza?session_id={{CHECKOUT_SESSION_ID}}"
+    elif "{CHECKOUT_SESSION_ID}" not in success:
+        sep = "&" if "?" in success else "?"
+        success = f"{success}{sep}session_id={{CHECKOUT_SESSION_ID}}"
 
     try:
         import stripe
@@ -1077,7 +1092,7 @@ async def create_checkout(
         session = stripe.checkout.Session.create(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
-            success_url=success if "{CHECKOUT_SESSION_ID}" in success else (success.rstrip("/") + "?session_id={CHECKOUT_SESSION_ID}"),
+            success_url=success,
             cancel_url=cancel,
             client_reference_id=uid,
             metadata={
@@ -1501,7 +1516,7 @@ def crypto_analyze(
     else:
         raw = core.analyze_crypto_pair(pair, days_forward=days)
         if not raw or raw.get("current_price") is None:
-            raise HTTPException(status_code=404, detail=f"Brak danych krypto dla {pair}")
+            raise HTTPException(status_code=404, detail=f"No crypto data for {pair}")
         data = {
             "ticker": raw.get("symbol") or pair,
             "symbol": pair,

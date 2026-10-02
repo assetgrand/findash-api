@@ -12,16 +12,45 @@ import pandas as pd
 
 import core_analysis as core
 
+def normalize_mode(mode: str) -> str:
+    """Map UI/legacy names → AGGRESSIVE | BALANCED | CONSERVATIVE."""
+    m = (mode or "BALANCED").strip()
+    key = m.lower().replace("ó", "o").replace("ż", "z").replace("ń", "n")
+    aliases = {
+        "agresywny": "AGGRESSIVE",
+        "aggressive": "AGGRESSIVE",
+        "aggresive": "AGGRESSIVE",  # typo from API
+        "zrownowazony": "BALANCED",
+        "zrównoważony": "BALANCED",
+        "balanced": "BALANCED",
+        "bezpieczny": "CONSERVATIVE",
+        "conservative": "CONSERVATIVE",
+        "passive": "CONSERVATIVE",
+        "bezpieczny": "CONSERVATIVE",
+    }
+    # also direct upper keys
+    up = m.upper().replace("Ó", "O")
+    if up in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE"):
+        return up
+    if up == "AGGRESIVE":
+        return "AGGRESSIVE"
+    if up == "PASSIVE":
+        return "CONSERVATIVE"
+    return aliases.get(key, aliases.get(m.lower(), "BALANCED"))
+
+
+
 
 def calculate_hybrid_indicators(
     data: pd.DataFrame,
     ticker: str,
-    mode: str = "Zrównoważony",
+    mode: str = "BALANCED",
 ) -> Tuple[pd.DataFrame, float, str]:
     """Pełna logika Hybrid z desktopu – bez UI."""
+    mode = normalize_mode(mode)
     data = data.copy()
     if data.empty or "Close" not in data.columns:
-        raise ValueError("NONE danych OHLC")
+        raise ValueError("No OHLC data")
 
     if "Volume" not in data.columns:
         data["Volume"] = 0.0
@@ -177,8 +206,9 @@ def calculate_hybrid_indicators(
     data.loc[data["%K"] > 80, "Score"] -= 0.5
     data["Score"] = data["Score"].clip(lower=0, upper=16)
 
-    mode = mode if mode in ("Agresywny", "Zrównoważony", "Bezpieczny") else "Zrównoważony"
-    base_threshold = {"Agresywny": 4.0, "Zrównoważony": 5.5, "Bezpieczny": 7.0}[mode]
+    mode = normalize_mode(mode)
+    mode = mode if mode in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE") else "BALANCED"
+    base_threshold = {"AGGRESSIVE": 4.0, "BALANCED": 5.5, "CONSERVATIVE": 7.0}[mode]
 
     sector = core.sector_mapping.get(ticker, "Default")
     sector_mult_map = {
@@ -232,11 +262,12 @@ def _sf(x: Any) -> Optional[float]:
         return None
 
 
-def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
+def analyze_hybrid(ticker: str, mode: str = "BALANCED") -> Dict[str, Any]:
+    mode = normalize_mode(mode)
     ticker = ticker.upper().strip()
     df = core.get_historical_prices(ticker, days=500)
     if df is None or getattr(df, "empty", True):
-        raise ValueError(f"NONE danych dla {ticker}")
+        raise ValueError(f"No data for {ticker}")
 
     data, threshold, sector = calculate_hybrid_indicators(df, ticker, mode)
     last = data.iloc[-1]
@@ -304,10 +335,10 @@ def analyze_hybrid(ticker: str, mode: str = "Zrównoważony") -> Dict[str, Any]:
 
 def scan_signals(
     tickers: Optional[List[str]] = None,
-    mode: str = "Zrównoważony",
+    mode: str = "BALANCED",
     lookback: int = 25,
 ) -> List[Dict[str, Any]]:
-    """Skan listy tickerów – aktywne BUY/SELL (logika jak w desktopie)."""
+    """Scan ticker list – active BUY/SELL (same logic as desktop)."""
     tickers = tickers or list(getattr(core, "tickers", []))
     results: List[Dict[str, Any]] = []
 
