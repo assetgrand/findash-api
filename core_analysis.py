@@ -3017,7 +3017,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3b | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3c | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3111,6 +3111,43 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     blended_ret = _calibrate_return_magnitude(blended_ret, df_clean, days_forward, regime)
     if abs(pre_cal - blended_ret) > 0.05:
         _log(f"   mag-cal: {pre_cal:+.2f}% → {blended_ret:+.2f}%")
+
+    # v3c: zgodność modeli + lekka korekta biasu (bez zmiany definicji Hit%)
+    # Gdy ridge/gb/heur nie zgadzają się co do znaku → nie forsuj agresywnego kierunku.
+    try:
+        signs = []
+        for k in ("ridge", "gb", "heuristic"):
+            v = model_preds.get(k)
+            if v is None:
+                continue
+            if abs(float(v)) >= 0.4:
+                signs.append(1 if float(v) > 0 else -1)
+        if len(signs) >= 2:
+            if len(set(signs)) > 1:
+                # konflikt modeli → bliżej historycznego dryfu / mniejsza magnitude
+                blended_ret = 0.55 * blended_ret + 0.45 * float(hist_med)
+                blended_ret *= 0.85
+                _log(f"   v3c model-disagree → blend toward drift {blended_ret:+.2f}%")
+            else:
+                # pełna zgoda znaku → lekko wzmocnij (tylko gdy |blend| już niezerowy)
+                if abs(blended_ret) >= 1.0 and signs[0] == (1 if blended_ret > 0 else -1):
+                    blended_ret *= 1.06
+                    _log(f"   v3c model-agree → slight boost {blended_ret:+.2f}%")
+    except Exception as e:
+        _log(f"   v3c agree skip: {e}")
+
+    try:
+        skill = _local_direction_accuracy(df_clean, days_forward)
+        if skill is not None:
+            if skill < 0.42:
+                # Słaby lokalny skill → mocniej historyczny dryf (często poprawia Hit%)
+                blended_ret = 0.40 * blended_ret + 0.60 * float(hist_med)
+                _log(f"   v3c low-skill={skill:.2f} → drift-heavy {blended_ret:+.2f}%")
+            elif skill >= 0.58 and abs(blended_ret) >= 1.0:
+                blended_ret *= 1.04
+                _log(f"   v3c high-skill={skill:.2f} → trust model {blended_ret:+.2f}%")
+    except Exception as e:
+        _log(f"   v3c skill skip: {e}")
 
     try:
         hist_cap = get_max_historical_change(df_clean, days_forward, percentile=88)
