@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "crypto-precompute-v1"
+API_BUILD = "crypto-precompute-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -321,7 +321,7 @@ def _ticker_list_for_precompute() -> List[str]:
 
 
 def _precompute_all_once() -> None:
-    """Jedna pełna runda 1M+3M – tylko _analyze_one, bez zmiany logiki."""
+    """Jedna pełna runda: najpierw krypto (szybkie), potem akcje 1M+3M."""
     tickers = _ticker_list_for_precompute()
     _PRECOMPUTE_STATUS["running"] = True
     _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
@@ -329,6 +329,11 @@ def _precompute_all_once() -> None:
     _PRECOMPUTE_STATUS["last_error"] = None
     if _PRECOMPUTE_STATUS.get("started_ts") is None:
         _PRECOMPUTE_STATUS["started_ts"] = time.time()
+    # Krypto NA START rundy (nie na końcu po 15+ akcjach) – jak reszta „od deploya”
+    try:
+        _precompute_crypto_once()
+    except Exception as e:
+        print("[precompute] crypto first:", e)
     print(f"[precompute] start {len(tickers)} tickerów × 1M/3M")
     for t in tickers:
         _PRECOMPUTE_STATUS["last_ticker"] = t
@@ -348,12 +353,6 @@ def _precompute_all_once() -> None:
         _precompute_signals_once()
     except Exception as e:
         print("[precompute] signals:", e)
-
-    # Krypto 1M/3M – raz na rundę, UI tylko czyta cache (bez Twelve per user)
-    try:
-        _precompute_crypto_once()
-    except Exception as e:
-        print("[precompute] crypto:", e)
 
     # Domyślne backtesty (capital=10000, forecast 1M/3M) – strona bierze z cache
     try:
@@ -529,6 +528,14 @@ def _startup():
     if _PRECOMPUTE_ENABLED:
         threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
         print(f"[precompute] worker ON interval={_PRECOMPUTE_INTERVAL}s")
+        # Osobny szybki wątek: krypto zaraz po starcie dyno (nie czeka na kolejkę akcji)
+        def _crypto_boot():
+            time.sleep(1)
+            try:
+                _precompute_crypto_once()
+            except Exception as e:
+                print("[crypto-boot]", e)
+        threading.Thread(target=_crypto_boot, name="crypto-boot", daemon=True).start()
     else:
         print("[precompute] OFF (PRECOMPUTE_ENABLED=0)")
 
