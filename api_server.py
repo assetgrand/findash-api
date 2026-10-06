@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "en-labels-v1"
+API_BUILD = "crypto-precompute-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -348,6 +348,12 @@ def _precompute_all_once() -> None:
         _precompute_signals_once()
     except Exception as e:
         print("[precompute] signals:", e)
+
+    # Krypto 1M/3M – raz na rundę, UI tylko czyta cache (bez Twelve per user)
+    try:
+        _precompute_crypto_once()
+    except Exception as e:
+        print("[precompute] crypto:", e)
 
     # Domyślne backtesty (capital=10000, forecast 1M/3M) – strona bierze z cache
     try:
@@ -1486,6 +1492,56 @@ CRYPTO_PAIRS = [
 ]
 
 
+
+def _crypto_cache_key(pair: str, hz: str) -> str:
+    return f"crypto_v1|{pair}|{hz}|{time.strftime('%Y-%m-%d')}"
+
+
+def _crypto_payload_from_raw(pair: str, hz: str, days: int, raw: dict) -> dict:
+    return {
+        "ticker": raw.get("symbol") or pair,
+        "symbol": pair,
+        "horizon": hz,
+        "days_forward": days,
+        "current_price": raw.get("current_price"),
+        "predicted_price": raw.get("predicted_price"),
+        "predicted_change_pct": raw.get("predicted_change_pct"),
+        "direction": raw.get("direction") or "NEUTRAL",
+        "rsi": raw.get("rsi"),
+        "sector": "Crypto",
+        "fundamental_rating": None,
+        "combined_score": raw.get("combined_score"),
+        "hit_rate": raw.get("hit_rate"),
+        "mae": raw.get("mae"),
+        "n_significant": raw.get("n_significant"),
+        "asset_class": "crypto",
+        "engine": raw.get("engine"),
+        "cached": False,
+        "disclaimer": (
+            "Crypto technical model (momentum/EMA/RSI). Not investment advice. High risk."
+        ),
+    }
+
+
+def _precompute_crypto_once() -> None:
+    """Policz wszystkie pary krypto 1M+3M i zapisz w _ANALYZE_CACHE."""
+    pairs = list(CRYPTO_PAIRS)
+    print(f"[crypto-precompute] start {len(pairs)} pairs × 1M/3M")
+    now = time.time()
+    for pair in pairs:
+        for hz, days in (("1M", 21), ("3M", 63)):
+            try:
+                raw = core.analyze_crypto_pair(pair, days_forward=days)
+                if not raw or raw.get("current_price") is None:
+                    continue
+                data = _crypto_payload_from_raw(pair, hz, days, raw)
+                key = _crypto_cache_key(pair, hz)
+                _ANALYZE_CACHE[key] = {"ts": now, "data": dict(data)}
+            except Exception as e:
+                print("[crypto-precompute]", pair, hz, e)
+            time.sleep(0.2)
+    print(f"[crypto-precompute] done, cache_size~{len(_ANALYZE_CACHE)}")
+
 def _crypto_symbol(raw: str) -> str:
     s = (raw or "").strip().upper().replace(" ", "")
     if not s:
@@ -1503,25 +1559,30 @@ def _crypto_symbol(raw: str) -> str:
 
 @app.get("/crypto/tickers")
 def crypto_tickers(prof: Dict[str, Any] = Depends(get_profile)):
+    """Lista par + cena z cache analizy (bez live Twelve na każde wejście)."""
     _gate(prof, "crypto")
     items = []
+    now = time.time()
     for pair in CRYPTO_PAIRS:
         price = None
-        try:
-            price = core.get_live_price(pair)
-        except Exception as e:
-            print("crypto price", pair, e)
+        # prefer 1M precompute price
+        for hz in ("1M", "3M"):
+            row = _ANALYZE_CACHE.get(_crypto_cache_key(pair, hz))
+            if row and now - float(row["ts"]) < _ANALYZE_CACHE_TTL:
+                price = row["data"].get("current_price")
+                if price is not None:
+                    break
         items.append({
             "symbol": pair,
             "base": pair.split("/")[0],
             "quote": "USD",
             "price": _safe_float(price),
+            "cached": price is not None,
         })
-        time.sleep(0.15)  # nie zjadaj limitów Twelve (akcje muszą działać)
     return {
         "count": len(items),
         "items": items,
-        "disclaimer": "Crypto prices via Twelve Data. Not investment advice.",
+        "disclaimer": "Crypto prices from server cache (precompute). Not investment advice.",
     }
 
 
@@ -1546,41 +1607,33 @@ def crypto_analyze(
             if pair in k or pair.replace("/", "") in k.replace("/", ""):
                 _ANALYZE_CACHE.pop(k, None)
 
-    # Osobny silnik krypto (nie equity _analyze_one) – lepszy hit na coinach
-    cache_key = f"crypto_v1|{pair}|{hz}|{time.strftime('%Y-%m-%d')}"
+    # Tylko cache z precompute (jak akcje). Live Twelve tylko przy refresh=1 albo zimnym starcie.
+    cache_key = _crypto_cache_key(pair, hz)
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
-    if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL and not refresh:
+    if hit and now - float(hit["ts"]) < _ANALYZE_CACHE_TTL and not refresh:
         data = dict(hit["data"])
         data["cached"] = True
-    else:
+    elif refresh:
         raw = core.analyze_crypto_pair(pair, days_forward=days)
         if not raw or raw.get("current_price") is None:
             raise HTTPException(status_code=404, detail=f"No crypto data for {pair}")
-        data = {
-            "ticker": raw.get("symbol") or pair,
-            "symbol": pair,
-            "horizon": hz,
-            "days_forward": days,
-            "current_price": raw.get("current_price"),
-            "predicted_price": raw.get("predicted_price"),
-            "predicted_change_pct": raw.get("predicted_change_pct"),
-            "direction": raw.get("direction") or "NEUTRAL",
-            "rsi": raw.get("rsi"),
-            "sector": "Crypto",
-            "fundamental_rating": None,
-            "combined_score": raw.get("combined_score"),
-            "hit_rate": raw.get("hit_rate"),
-            "mae": raw.get("mae"),
-            "n_significant": raw.get("n_significant"),
-            "asset_class": "crypto",
-            "engine": raw.get("engine"),
-            "cached": False,
-            "disclaimer": (
-                "Crypto technical model (momentum/EMA/RSI). Not investment advice. High risk."
-            ),
-        }
+        data = _crypto_payload_from_raw(pair, hz, days, raw)
         _ANALYZE_CACHE[cache_key] = {"ts": now, "data": dict(data)}
+        data = dict(data)
+        data["cached"] = False
+    else:
+        # Brak cache – jednorazowe wyliczenie + zapis (kolejni userzy biorą z cache)
+        raw = core.analyze_crypto_pair(pair, days_forward=days)
+        if not raw or raw.get("current_price") is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Crypto {pair} not precomputed yet. Retry in a minute.",
+            )
+        data = _crypto_payload_from_raw(pair, hz, days, raw)
+        _ANALYZE_CACHE[cache_key] = {"ts": now, "data": dict(data)}
+        data = dict(data)
+        data["cached"] = False
 
     if (prof.get("plan") or "demo").lower() == "demo":
         new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
@@ -1597,35 +1650,40 @@ def crypto_rankings(
     limit: int = Query(8, ge=1, le=12),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Ranking krypto – silnik crypto_technical (NIE equity _analyze_one)."""
+    """Ranking krypto z cache precompute – bez Twelve per request."""
     _gate(prof, "crypto")
     days = _horizon_days(horizon)
     hz = "3M" if days > 30 else "1M"
     items = []
-    for pair in CRYPTO_PAIRS[:limit]:
-        try:
-            raw = core.analyze_crypto_pair(pair, days_forward=days)
-            if raw and raw.get("current_price") is not None:
-                items.append({
-                    "ticker": pair,
-                    "current_price": raw.get("current_price"),
-                    "predicted_change_pct": raw.get("predicted_change_pct"),
-                    "direction": raw.get("direction") or "NEUTRAL",
-                    "sector": "Crypto",
-                    "fundamental_rating": None,
-                    "hit_rate": raw.get("hit_rate"),
-                })
-        except Exception as e:
-            print("crypto rank skip", pair, e)
-        time.sleep(0.25)
+    now = time.time()
+    for pair in CRYPTO_PAIRS:
+        key = _crypto_cache_key(pair, hz)
+        row = _ANALYZE_CACHE.get(key)
+        if not row or now - float(row["ts"]) > _ANALYZE_CACHE_TTL:
+            continue
+        d = row["data"]
+        if d.get("current_price") is None:
+            continue
+        items.append({
+            "ticker": pair,
+            "current_price": d.get("current_price"),
+            "predicted_change_pct": d.get("predicted_change_pct"),
+            "direction": d.get("direction") or "NEUTRAL",
+            "sector": "Crypto",
+            "fundamental_rating": None,
+            "hit_rate": d.get("hit_rate"),
+            "cached": True,
+        })
     items.sort(
         key=lambda x: (x.get("predicted_change_pct") is not None, x.get("predicted_change_pct") or -999),
         reverse=True,
     )
+    items = items[:limit]
     return {
         "horizon": hz,
         "items": items,
-        "disclaimer": "Crypto technical engine only. Does not affect equity analysis.",
+        "cached": True,
+        "disclaimer": "Crypto from server precompute cache. Not investment advice.",
     }
 
 
