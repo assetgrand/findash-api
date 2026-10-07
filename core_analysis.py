@@ -2636,17 +2636,24 @@ def _heuristic_momentum_return(feats, regime, days_forward):
 
 
 def _fundamental_expected_return_pct(fundamental_score, horizon, sector=None):
+    """v3e: konserwatywniej – neutralny punkt wyżej (trudniej o plus z samego score)."""
     if fundamental_score is None or (isinstance(fundamental_score, float) and np.isnan(fundamental_score)):
         fundamental_score = 50.0
+    # punkt zero ~58 zamiast 50 → typowy score 50–60 daje lekki minus / near-zero
+    pivot = 58.0
     if horizon == '1M':
-        base = (fundamental_score - 50.0) / 50.0 * 3.0
+        base = (fundamental_score - pivot) / 50.0 * 2.6
     else:
-        base = (fundamental_score - 50.0) / 50.0 * 8.0
+        base = (fundamental_score - pivot) / 50.0 * 6.5
     if sector in {'Healthcare', 'Consumer Defensive', 'Utilities', 'Index'}:
-        base *= 0.55
-    if sector in {'Technology', 'Consumer Cyclical', 'Communication Services', 'Automotive'} and fundamental_score >= 70:
-        base *= 1.12
-    return float(np.clip(base, -9.0, 11.0))
+        base *= 0.50
+    # tech: bez bonusowego podbicia przy wysokim score (wcześniej *1.12)
+    if sector in {'Technology', 'Consumer Cyclical', 'Communication Services', 'Automotive'}:
+        if fundamental_score >= 75:
+            base *= 0.95
+        elif fundamental_score < 55:
+            base *= 1.08  # słabe fundamenty → mocniej w dół
+    return float(np.clip(base, -10.0, 7.5))  # sufit plusów niższy niż podłoga minusów
 
 
 def _historical_drift(df, days_forward):
@@ -3017,7 +3024,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3d | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3e | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3069,28 +3076,57 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
-    # v3d: mniejszy dryf + symetria UP/DOWN (mniej „wszystko na plus”)
+    # v3e: KONSERWATYWNIE – dryf hossy słaby; spadki łatwiej; plusy ścięte
     if horizon == '1M':
-        drift_w = 0.12
-        blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
+        drift_w = 0.06
+        # dodatni hist_med prawie nie dokłada; ujemny mocniej
+        if hist_med >= 0:
+            blended_ret = (1.0 - drift_w * 0.4) * blended_ret + (drift_w * 0.4) * hist_med
+        else:
+            blended_ret = (1.0 - drift_w * 1.4) * blended_ret + (drift_w * 1.4) * hist_med
     else:
-        drift_w = 0.18
-        mix_prior = 0.65 * hist_med + 0.35 * hist_med_long
-        blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
+        drift_w = 0.10
+        mix_prior = 0.55 * hist_med + 0.45 * hist_med_long
+        if mix_prior >= 0:
+            blended_ret = (1.0 - drift_w * 0.35) * blended_ret + (drift_w * 0.35) * mix_prior
+        else:
+            blended_ret = (1.0 - drift_w * 1.3) * blended_ret + (drift_w * 1.3) * mix_prior
 
-    # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
+    # TREND_UP: NIE gasimy spadków (wcześniej *0.70 + dopalacz plus)
+    # TREND_DOWN: mocniej gasimy wzrosty
     if regime == 'TREND_UP' and blended_ret < 0:
-        blended_ret *= 0.70
-        if hist_med > 0:
-            blended_ret = 0.75 * blended_ret + 0.25 * max(hist_med * 0.35, 0.15)
+        blended_ret *= 0.95  # prawie bez tłumienia minusów
     elif regime == 'TREND_DOWN' and blended_ret > 0:
-        blended_ret *= 0.70
+        blended_ret *= 0.45
         if hist_med < 0:
-            blended_ret = 0.75 * blended_ret + 0.25 * min(hist_med * 0.35, -0.15)
+            blended_ret = 0.55 * blended_ret + 0.45 * min(hist_med * 0.5, -0.4)
 
-    # Słabe sygnały: tylko LEKKO w stronę dryfu (nie 65% jak wcześniej)
-    if abs(blended_ret) < 1.0 and abs(hist_med) >= 1.2:
-        blended_ret = 0.70 * blended_ret + 0.30 * np.sign(hist_med) * max(abs(hist_med), 1.0)
+    # Overbought / wyczerpanie momentum → pchanie w dół
+    rsi = float(feats.get('rsi') or 50)
+    pct_b = float(feats.get('pct_b') or 0.5)
+    if rsi >= 68:
+        blended_ret -= 0.8 if horizon == '1M' else 1.4
+    if rsi >= 75:
+        blended_ret -= 0.7 if horizon == '1M' else 1.2
+    if pct_b >= 0.92:
+        blended_ret -= 0.6 if horizon == '1M' else 1.0
+    if feats.get('ret20', 0) > 12 and horizon == '1M':
+        blended_ret -= 0.9  # ostry short-term run-up
+    if feats.get('ret60', 0) > 25 and horizon == '3M':
+        blended_ret -= 1.6
+
+    # Globalny haircut na plusy (konserwatyzm)
+    if blended_ret > 0:
+        blended_ret *= 0.62 if horizon == '1M' else 0.58
+    else:
+        blended_ret *= 1.08 if horizon == '1M' else 1.10  # lekko wzmocnij spadki
+
+    # Słabe sygnały: NIE ciągnij w stronę dodatniego dryfu hossy
+    if abs(blended_ret) < 1.2:
+        if hist_med < -0.8:
+            blended_ret = 0.55 * blended_ret + 0.45 * hist_med
+        elif blended_ret > 0.3:
+            blended_ret *= 0.5  # mały plus → blisko zera / neutral
 
     # Wyjątki TYLKO dla trudnych par (NO zmieniają AAPL/JPM/…)
     t_key = (str(ticker).upper() if ticker else None, horizon)
@@ -3136,13 +3172,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
     change_percent = float(np.clip(blended_ret, -max_change, max_change))
     adjusted_pred = current_price * (1.0 + change_percent / 100.0)
-    if change_percent > 2.5:
+    if change_percent > 3.0:
         direction = "UPTREND"
-    elif change_percent < -2.5:
+    elif change_percent < -1.8:
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v3d: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3e: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
