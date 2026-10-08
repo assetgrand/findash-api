@@ -1433,7 +1433,7 @@ def get_comprehensive_fundamental_analysis(ticker):
     company_fundamentals = get_company_fundamentals(ticker)
     
     if sector == 'Index':
-        _mr = "VERY GOOD" if country_score >= 78 else ("GOOD" if country_score >= 68 else "MODERATE")
+        _mr = "BARDZO DOBRA" if country_score >= 78 else ("DOBRA" if country_score >= 68 else "UMIARKOWANA")
         return {
             'country_code': country_code,
             'country_score': country_score,
@@ -1495,16 +1495,16 @@ def get_comprehensive_fundamental_analysis(ticker):
 
     def _rating_from_score(sc):
         if sc >= 88:
-            return "EXCELLENT", "darkgreen"
+            return "WYBITNA", "darkgreen"
         if sc >= 78:
-            return "VERY GOOD", "green"
+            return "BARDZO DOBRA", "green"
         if sc >= 68:
-            return "GOOD", "lightgreen"
+            return "DOBRA", "lightgreen"
         if sc >= 55:
-            return "MODERATE", "yellow"
+            return "UMIARKOWANA", "yellow"
         if sc >= 42:
-            return "WEAK", "orange"
-        return "VERY WEAK", "red"
+            return "SŁABA", "orange"
+        return "BARDZO SŁABA", "red"
 
     fundamental_rating, color = _rating_from_score(combined_score)
     macro_rating, macro_color = _rating_from_score(country_score)
@@ -1759,12 +1759,12 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
 def get_technical_signal(df):
     if len(df) < 1:
-        return "No data"
+        return "Brak danych"
 
     try:
         valid_data = df.dropna()
         if len(valid_data) == 0:
-            return "No data"
+            return "Brak danych"
 
         current = valid_data.iloc[-1]
 
