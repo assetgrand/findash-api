@@ -2746,13 +2746,18 @@ def _model_agreement_penalty(preds):
     signs = [np.sign(v) if abs(v) >= 0.8 else 0 for v in vals]
     nonzero = [s for s in signs if s != 0]
     if len(nonzero) < 2:
-        return 0.85
+        return 0.80
     if len(set(nonzero)) == 1:
+        # bonus gdy wszystkie 3 zgodne i |pred| wyraźne
+        if len(nonzero) >= 3:
+            return 1.08
         return 1.0
-    return 0.60
+    # pełny rozłam znaków
+    return 0.45
 
 
 def _calibrate_model_weights(X, y, horizon_days, regime):
+    """v3r: wagi z MAE + directional accuracy na holdoucie (Hit-aligned)."""
     prior = REGIME_MODEL_PRIORS.get(regime, REGIME_MODEL_PRIORS['RANGE']).copy()
     if X is None or y is None or len(y) < 45:
         return prior
@@ -2761,38 +2766,65 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
         return prior
     X_tr, X_ho = X[:split], X[split:]
     y_tr, y_ho = y[:split], y[split:]
-    errors = {}
+
+    def _dir_score(pred, actual):
+        # udział zgodnego znaku na |actual|>=1.5 (zbliżone do logiki Hit)
+        ok = 0
+        n = 0
+        for p, a in zip(pred, actual):
+            if abs(a) < 1.5 or abs(p) < 0.8:
+                continue
+            n += 1
+            if (p > 0 and a > 0) or (p < 0 and a < 0):
+                ok += 1
+        if n < 3:
+            return 0.50
+        return ok / n
+
+    mae = {}
+    dhit = {}
     try:
         ridge = Ridge(alpha=1.2)
         ridge.fit(X_tr, y_tr)
-        errors['ridge'] = float(np.mean(np.abs(ridge.predict(X_ho) - y_ho)))
+        pr = ridge.predict(X_ho)
+        mae['ridge'] = float(np.mean(np.abs(pr - y_ho)))
+        dhit['ridge'] = _dir_score(pr, y_ho)
     except Exception:
-        errors['ridge'] = 999.0
+        mae['ridge'], dhit['ridge'] = 999.0, 0.50
     try:
         if len(X_tr) >= 40:
             gb = GradientBoostingRegressor(
-                n_estimators=80, max_depth=3, learning_rate=0.06,
+                n_estimators=100, max_depth=3, learning_rate=0.05,
                 min_samples_leaf=4, subsample=0.85, random_state=42
             )
             gb.fit(X_tr, y_tr)
-            errors['gb'] = float(np.mean(np.abs(gb.predict(X_ho) - y_ho)))
+            pr = gb.predict(X_ho)
+            mae['gb'] = float(np.mean(np.abs(pr - y_ho)))
+            dhit['gb'] = _dir_score(pr, y_ho)
         else:
-            errors['gb'] = 999.0
+            mae['gb'], dhit['gb'] = 999.0, 0.50
     except Exception:
-        errors['gb'] = 999.0
+        mae['gb'], dhit['gb'] = 999.0, 0.50
     try:
         scale = horizon_days / 21.0
-        pred_h = X_ho[:, 9] * 0.35 * scale  # ret20
-        errors['heuristic'] = float(np.mean(np.abs(pred_h - y_ho)))
+        # ret20 is index 9 in FEATURE_KEYS
+        pred_h = X_ho[:, 9] * 0.40 * scale
+        mae['heuristic'] = float(np.mean(np.abs(pred_h - y_ho)))
+        dhit['heuristic'] = _dir_score(pred_h, y_ho)
     except Exception:
-        errors['heuristic'] = 999.0
-    inv = {k: 1.0 / max(v, 0.05) for k, v in errors.items()}
+        mae['heuristic'], dhit['heuristic'] = 999.0, 0.50
+
+    # score = low MAE + high direction hit
+    inv = {}
+    for k in ('ridge', 'gb', 'heuristic'):
+        inv[k] = (1.0 / max(mae[k], 0.08)) * (0.35 + 0.65 * dhit[k])
     total = sum(inv.values()) or 1.0
     data_w = {k: inv[k] / total for k in inv}
     keys = ['ridge', 'gb', 'heuristic']
-    blended = {k: 0.60 * data_w.get(k, 0.33) + 0.40 * prior.get(k, 0.33) for k in keys}
+    # więcej wagi z danych (0.72) gdy holdout coś mówi
+    blended = {k: 0.72 * data_w.get(k, 0.33) + 0.28 * prior.get(k, 0.33) for k in keys}
     for k in blended:
-        blended[k] = max(0.12, min(0.55, blended[k]))
+        blended[k] = max(0.10, min(0.58, blended[k]))
     s = sum(blended.values())
     return {k: blended[k] / s for k in blended}
 
@@ -3017,7 +3049,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3q | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3r | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3080,6 +3112,40 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         # fund vs tech sprzeczne i |tech| duży: ostrożniej
         if fund_ret * tech_ret < 0 and abs(tech_ret) >= 1.5 and abs(fund_ret) >= 1.0:
             blended_ret *= 0.55
+    except Exception:
+        pass
+
+    # v3r: lokalny skill spółki – jeśli ostatnio kierunek działał, trzymaj sygnał;
+    # jeśli lokalnie słabo – ścinaj |pred| (Hit mierzy tylko wyraźne trafienia)
+    try:
+        loc = _local_direction_accuracy(df_clean, days_forward, max_points=16, step=7)
+        if loc is not None:
+            if loc >= 0.62 and abs(blended_ret) >= 1.0:
+                blended_ret *= 1.10
+            elif loc <= 0.42:
+                blended_ret *= 0.40  # model lokalnie słaby → nie forsuj kierunku
+            elif loc <= 0.50:
+                blended_ret *= 0.70
+    except Exception:
+        pass
+
+    # Trend persistence: ADX silny + zgodność mom → wzmocnij znak techniczny
+    try:
+        if feats.get('adx', 0) >= 28 and feats.get('mom_agree', 0) > 0:
+            if regime == 'TREND_UP' and blended_ret > 0:
+                blended_ret *= 1.08
+            elif regime == 'TREND_DOWN' and blended_ret < 0:
+                blended_ret *= 1.08
+        # RANGE: mean-reversion lekko (RSI ekstremum)
+        if regime == 'RANGE':
+            if feats.get('rsi', 50) >= 72 and blended_ret > 0:
+                blended_ret *= 0.55
+            elif feats.get('rsi', 50) <= 28 and blended_ret < 0:
+                blended_ret *= 0.55
+            elif feats.get('rsi', 50) >= 72:
+                blended_ret = min(blended_ret, -0.8)
+            elif feats.get('rsi', 50) <= 28:
+                blended_ret = max(blended_ret, 0.8)
     except Exception:
         pass
 
@@ -3165,7 +3231,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v3q: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3r: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
