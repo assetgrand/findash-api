@@ -418,8 +418,8 @@ def _analyze_one(
     else:
         sector = core.sector_mapping.get(ticker, "Unknown")
 
-    # zawsze 500 dni jak desktop
-    df = core.get_historical_prices(ticker, days=500)
+    # długa historia (~8 lat / floor 2015) – więcej sesji pod Hit/backtest
+    df = core.get_historical_prices(ticker, days=getattr(core, "DEFAULT_HISTORY_DAYS", 2920))
     if df is None or getattr(df, "empty", True):
         raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
 

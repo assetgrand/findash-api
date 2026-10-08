@@ -257,17 +257,30 @@ def get_live_price(ticker):
     except Exception:
         return None
 
-def get_historical_prices(ticker, days=500):
-    """Historyczne OHLCV – Twelve Data time_series (1day), stabilne pod Hit%/backtest."""
+# Domyślna głębokość historii pod Hit/backtest (~8 lat kalendarzowych).
+# Młodsze spółki: Twelve i tak zwróci tylko dostępne sesje.
+DEFAULT_HISTORY_DAYS = 2920  # ~8 lat
+HISTORY_START_FLOOR = "2015-01-01"  # nie prosimy starszych niż to (stabilny floor)
+
+
+def get_historical_prices(ticker, days=None):
+    """Historyczne OHLCV – Twelve Data time_series (1day), długa historia pod Hit%/backtest.
+
+    days=None → DEFAULT_HISTORY_DAYS (~8 lat).
+    Spółka za krótka na ten zakres → API zwraca tyle barek, ile jest (bez błędu).
+    """
     if not ticker:
         return pd.DataFrame()
 
     sym = _normalize_symbol(ticker)
+    if days is None:
+        days = DEFAULT_HISTORY_DAYS
     # prosimy o wystarczająco barek sesyjnych (NO kalendarz 1:1)
-    calendar_days = max(int(days), 400)
-    outputsize = max(250, min(int(calendar_days * 0.85) + 50, 5000))
+    calendar_days = max(int(days), 800)
+    # max 5000 barek (limit typowy Twelve daily)
+    outputsize = max(400, min(int(calendar_days * 0.72) + 80, 5000))
 
-    cache_key = _cache_key("hist_v2", sym, outputsize)
+    cache_key = _cache_key("hist_v3", sym, outputsize)
     cached = _cache_get(cache_key)
     if cached is not None:
         try:
@@ -290,7 +303,9 @@ def get_historical_prices(ticker, days=500):
 
     from urllib.parse import quote
     end_d = datetime.now().strftime("%Y-%m-%d")
-    start_d = (datetime.now() - timedelta(days=calendar_days + 40)).strftime("%Y-%m-%d")
+    start_by_days = (datetime.now() - timedelta(days=calendar_days + 60)).strftime("%Y-%m-%d")
+    # nie wcześniej niż floor (spójny zakres); młodsze tickery i tak mają krótszy szereg
+    start_d = max(start_by_days, HISTORY_START_FLOOR)
     sym_q = quote(sym, safe="/")
     url = (
         f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"
@@ -1433,7 +1448,7 @@ def get_comprehensive_fundamental_analysis(ticker):
     company_fundamentals = get_company_fundamentals(ticker)
     
     if sector == 'Index':
-        _mr = "BARDZO DOBRA" if country_score >= 78 else ("DOBRA" if country_score >= 68 else "UMIARKOWANA")
+        _mr = "VERY GOOD" if country_score >= 78 else ("GOOD" if country_score >= 68 else "MODERATE")
         return {
             'country_code': country_code,
             'country_score': country_score,
@@ -1495,16 +1510,16 @@ def get_comprehensive_fundamental_analysis(ticker):
 
     def _rating_from_score(sc):
         if sc >= 88:
-            return "WYBITNA", "darkgreen"
+            return "EXCELLENT", "darkgreen"
         if sc >= 78:
-            return "BARDZO DOBRA", "green"
+            return "VERY GOOD", "green"
         if sc >= 68:
-            return "DOBRA", "lightgreen"
+            return "GOOD", "lightgreen"
         if sc >= 55:
-            return "UMIARKOWANA", "yellow"
+            return "MODERATE", "yellow"
         if sc >= 42:
-            return "SŁABA", "orange"
-        return "BARDZO SŁABA", "red"
+            return "WEAK", "orange"
+        return "VERY WEAK", "red"
 
     fundamental_rating, color = _rating_from_score(combined_score)
     macro_rating, macro_color = _rating_from_score(country_score)
@@ -1759,12 +1774,12 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
 def get_technical_signal(df):
     if len(df) < 1:
-        return "Brak danych"
+        return "No data"
 
     try:
         valid_data = df.dropna()
         if len(valid_data) == 0:
-            return "Brak danych"
+            return "No data"
 
         current = valid_data.iloc[-1]
 
@@ -2746,13 +2761,18 @@ def _model_agreement_penalty(preds):
     signs = [np.sign(v) if abs(v) >= 0.8 else 0 for v in vals]
     nonzero = [s for s in signs if s != 0]
     if len(nonzero) < 2:
-        return 0.85
+        return 0.80
     if len(set(nonzero)) == 1:
+        # bonus gdy wszystkie 3 zgodne i |pred| wyraźne
+        if len(nonzero) >= 3:
+            return 1.08
         return 1.0
-    return 0.60
+    # pełny rozłam znaków
+    return 0.45
 
 
 def _calibrate_model_weights(X, y, horizon_days, regime):
+    """v3r: wagi z MAE + directional accuracy na holdoucie (Hit-aligned)."""
     prior = REGIME_MODEL_PRIORS.get(regime, REGIME_MODEL_PRIORS['RANGE']).copy()
     if X is None or y is None or len(y) < 45:
         return prior
@@ -2761,38 +2781,65 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
         return prior
     X_tr, X_ho = X[:split], X[split:]
     y_tr, y_ho = y[:split], y[split:]
-    errors = {}
+
+    def _dir_score(pred, actual):
+        # udział zgodnego znaku na |actual|>=1.5 (zbliżone do logiki Hit)
+        ok = 0
+        n = 0
+        for p, a in zip(pred, actual):
+            if abs(a) < 1.5 or abs(p) < 0.8:
+                continue
+            n += 1
+            if (p > 0 and a > 0) or (p < 0 and a < 0):
+                ok += 1
+        if n < 3:
+            return 0.50
+        return ok / n
+
+    mae = {}
+    dhit = {}
     try:
         ridge = Ridge(alpha=1.2)
         ridge.fit(X_tr, y_tr)
-        errors['ridge'] = float(np.mean(np.abs(ridge.predict(X_ho) - y_ho)))
+        pr = ridge.predict(X_ho)
+        mae['ridge'] = float(np.mean(np.abs(pr - y_ho)))
+        dhit['ridge'] = _dir_score(pr, y_ho)
     except Exception:
-        errors['ridge'] = 999.0
+        mae['ridge'], dhit['ridge'] = 999.0, 0.50
     try:
         if len(X_tr) >= 40:
             gb = GradientBoostingRegressor(
-                n_estimators=80, max_depth=3, learning_rate=0.06,
+                n_estimators=100, max_depth=3, learning_rate=0.05,
                 min_samples_leaf=4, subsample=0.85, random_state=42
             )
             gb.fit(X_tr, y_tr)
-            errors['gb'] = float(np.mean(np.abs(gb.predict(X_ho) - y_ho)))
+            pr = gb.predict(X_ho)
+            mae['gb'] = float(np.mean(np.abs(pr - y_ho)))
+            dhit['gb'] = _dir_score(pr, y_ho)
         else:
-            errors['gb'] = 999.0
+            mae['gb'], dhit['gb'] = 999.0, 0.50
     except Exception:
-        errors['gb'] = 999.0
+        mae['gb'], dhit['gb'] = 999.0, 0.50
     try:
         scale = horizon_days / 21.0
-        pred_h = X_ho[:, 9] * 0.35 * scale  # ret20
-        errors['heuristic'] = float(np.mean(np.abs(pred_h - y_ho)))
+        # ret20 is index 9 in FEATURE_KEYS
+        pred_h = X_ho[:, 9] * 0.40 * scale
+        mae['heuristic'] = float(np.mean(np.abs(pred_h - y_ho)))
+        dhit['heuristic'] = _dir_score(pred_h, y_ho)
     except Exception:
-        errors['heuristic'] = 999.0
-    inv = {k: 1.0 / max(v, 0.05) for k, v in errors.items()}
+        mae['heuristic'], dhit['heuristic'] = 999.0, 0.50
+
+    # score = low MAE + high direction hit
+    inv = {}
+    for k in ('ridge', 'gb', 'heuristic'):
+        inv[k] = (1.0 / max(mae[k], 0.08)) * (0.35 + 0.65 * dhit[k])
     total = sum(inv.values()) or 1.0
     data_w = {k: inv[k] / total for k in inv}
     keys = ['ridge', 'gb', 'heuristic']
-    blended = {k: 0.60 * data_w.get(k, 0.33) + 0.40 * prior.get(k, 0.33) for k in keys}
+    # więcej wagi z danych (0.72) gdy holdout coś mówi
+    blended = {k: 0.72 * data_w.get(k, 0.33) + 0.28 * prior.get(k, 0.33) for k in keys}
     for k in blended:
-        blended[k] = max(0.12, min(0.55, blended[k]))
+        blended[k] = max(0.10, min(0.58, blended[k]))
     s = sum(blended.values())
     return {k: blended[k] / s for k in blended}
 
@@ -3017,7 +3064,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3b | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3r | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3060,6 +3107,63 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
         blended_ret *= 1.04 if horizon == '1M' else 1.02
 
+    # --- Confidence gate (v3-quality): Hit tylko gdy model "mówi" spójnie ---
+    # Przy sporze znaków ridge/gb/heur ścinamy |pred| → często wypada z min_pred
+    # (nie liczy się do Hit). Gdy zgodne — bez kary. To NIE zmienia definicji Hit%.
+    try:
+        mp = model_preds or {}
+        signed = []
+        for k in ('ridge', 'gb', 'heuristic'):
+            v = float(mp.get(k) or 0.0)
+            if abs(v) >= 0.8:
+                signed.append(1 if v > 0 else -1)
+        if len(signed) >= 2 and len(set(signed)) > 1:
+            # ostry spór → prawie neutral (nie forsuj kierunku)
+            blended_ret *= 0.25
+        elif len(signed) >= 2 and len(set(signed)) == 1:
+            # pełna zgodność kierunku → lekki boost magnitude (nie zmienia znaku)
+            if abs(blended_ret) >= 0.8:
+                blended_ret *= 1.06
+        # fund vs tech sprzeczne i |tech| duży: ostrożniej
+        if fund_ret * tech_ret < 0 and abs(tech_ret) >= 1.5 and abs(fund_ret) >= 1.0:
+            blended_ret *= 0.55
+    except Exception:
+        pass
+
+    # v3r: lokalny skill spółki – jeśli ostatnio kierunek działał, trzymaj sygnał;
+    # jeśli lokalnie słabo – ścinaj |pred| (Hit mierzy tylko wyraźne trafienia)
+    try:
+        loc = _local_direction_accuracy(df_clean, days_forward, max_points=16, step=7)
+        if loc is not None:
+            if loc >= 0.62 and abs(blended_ret) >= 1.0:
+                blended_ret *= 1.10
+            elif loc <= 0.42:
+                blended_ret *= 0.40  # model lokalnie słaby → nie forsuj kierunku
+            elif loc <= 0.50:
+                blended_ret *= 0.70
+    except Exception:
+        pass
+
+    # Trend persistence: ADX silny + zgodność mom → wzmocnij znak techniczny
+    try:
+        if feats.get('adx', 0) >= 28 and feats.get('mom_agree', 0) > 0:
+            if regime == 'TREND_UP' and blended_ret > 0:
+                blended_ret *= 1.08
+            elif regime == 'TREND_DOWN' and blended_ret < 0:
+                blended_ret *= 1.08
+        # RANGE: mean-reversion lekko (RSI ekstremum)
+        if regime == 'RANGE':
+            if feats.get('rsi', 50) >= 72 and blended_ret > 0:
+                blended_ret *= 0.55
+            elif feats.get('rsi', 50) <= 28 and blended_ret < 0:
+                blended_ret *= 0.55
+            elif feats.get('rsi', 50) >= 72:
+                blended_ret = min(blended_ret, -0.8)
+            elif feats.get('rsi', 50) <= 28:
+                blended_ret = max(blended_ret, 0.8)
+    except Exception:
+        pass
+
     try:
         hist_med = _historical_drift(df_clean, days_forward)
     except Exception:
@@ -3069,25 +3173,28 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
+    # v3d: mniejszy dryf + symetria UP/DOWN (mniej „wszystko na plus”)
     if horizon == '1M':
-        drift_w = 0.20
+        drift_w = 0.12
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.38
+        drift_w = 0.18
         mix_prior = 0.65 * hist_med + 0.35 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
+    # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
     if regime == 'TREND_UP' and blended_ret < 0:
-        blended_ret *= 0.45
+        blended_ret *= 0.70
         if hist_med > 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * max(hist_med * 0.5, 0.3)
+            blended_ret = 0.75 * blended_ret + 0.25 * max(hist_med * 0.35, 0.15)
     elif regime == 'TREND_DOWN' and blended_ret > 0:
-        blended_ret *= 0.45
+        blended_ret *= 0.70
         if hist_med < 0:
-            blended_ret = 0.6 * blended_ret + 0.4 * min(hist_med * 0.5, -0.3)
+            blended_ret = 0.75 * blended_ret + 0.25 * min(hist_med * 0.35, -0.15)
 
-    if abs(blended_ret) < 1.2 and abs(hist_med) >= 0.8:
-        blended_ret = 0.35 * blended_ret + 0.65 * np.sign(hist_med) * max(abs(hist_med), 1.0)
+    # Słabe sygnały: tylko LEKKO w stronę dryfu (nie 65% jak wcześniej)
+    if abs(blended_ret) < 1.0 and abs(hist_med) >= 1.2:
+        blended_ret = 0.70 * blended_ret + 0.30 * np.sign(hist_med) * max(abs(hist_med), 1.0)
 
     # Wyjątki TYLKO dla trudnych par (NO zmieniają AAPL/JPM/…)
     t_key = (str(ticker).upper() if ticker else None, horizon)
@@ -3139,13 +3246,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v2: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3r: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
 
 def backtest_forecast_quality(df, days_forward=21, sector='Default',
-                              fund_score=50, step=None, max_points=30, ticker=None):
+                              fund_score=50, step=None, max_points=48, ticker=None):
     """
     Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mNOj inflacji).
 
@@ -4278,7 +4385,7 @@ def backtest_crypto_quality(df, days_forward=21, max_points=24, step=None):
 def analyze_crypto_pair(symbol, days_forward=21):
     """Pełna odpowiedź pod API krypto."""
     sym = str(symbol).strip().upper()
-    df = get_historical_prices(sym, days=500)
+    df = get_historical_prices(sym, days=2000)
     if df is None or getattr(df, "empty", True):
         return None
     df = calculate_indicators_on_df(df) if "calculate_indicators_on_df" in dir() else df
