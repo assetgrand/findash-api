@@ -3064,7 +3064,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3r | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3h | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3130,29 +3130,63 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         pass
 
-    # v3r: lokalny skill spółki – jeśli ostatnio kierunek działał, trzymaj sygnał;
-    # jeśli lokalnie słabo – ścinaj |pred| (Hit mierzy tylko wyraźne trafienia)
+    # v3h: adaptacja pod TRUDNE spółki (niski lokalny skill / wysoka vol / RANGE)
+    # Cel: mniej losowych strzałów, więcej kotwicy w historii + mean-reversion.
+    # Definicja Hit% bez zmian – słabe sygnały częściej wypadają z min_pred.
+    hard = False
+    loc = None
     try:
-        loc = _local_direction_accuracy(df_clean, days_forward, max_points=16, step=7)
-        if loc is not None:
-            if loc >= 0.62 and abs(blended_ret) >= 1.0:
-                blended_ret *= 1.10
-            elif loc <= 0.42:
-                blended_ret *= 0.40  # model lokalnie słaby → nie forsuj kierunku
-            elif loc <= 0.50:
-                blended_ret *= 0.70
-    except Exception:
-        pass
+        loc = _local_direction_accuracy(df_clean, days_forward, max_points=18, step=6)
+        vol_scale = _vol_scale_for_ticker(df_clean)
+        if loc is not None and loc <= 0.48:
+            hard = True
+        if vol_scale >= 1.18:
+            hard = True
+        if regime in ('HIGH_VOL', 'RANGE') and (loc is None or loc <= 0.55):
+            hard = True
 
-    # Trend persistence: ADX silny + zgodność mom → wzmocnij znak techniczny
+        if loc is not None:
+            if loc >= 0.62 and abs(blended_ret) >= 1.0 and not hard:
+                blended_ret *= 1.10
+            elif loc <= 0.40:
+                hard = True
+    except Exception:
+        vol_scale = 1.0
+
+    if hard:
+        try:
+            # dłuższy dryf jako kotwica (stabilniejszy niż krótkie ML na chaotycznych)
+            hm = _historical_drift(df_clean, days_forward)
+            hm2 = _historical_drift(df_clean, min(days_forward * 2, 126))
+            anchor = 0.55 * hm + 0.45 * hm2
+            # mix: mniej ensemble, więcej historii
+            blended_ret = 0.40 * blended_ret + 0.60 * anchor
+            # RANGE / overbought-oversold: mean reversion
+            rsi = float(feats.get('rsi') or 50)
+            if regime == 'RANGE' or vol_scale >= 1.18:
+                if rsi >= 70:
+                    blended_ret = 0.50 * blended_ret + 0.50 * min(blended_ret, -abs(anchor) * 0.4 - 0.8)
+                elif rsi <= 30:
+                    blended_ret = 0.50 * blended_ret + 0.50 * max(blended_ret, abs(anchor) * 0.4 + 0.8)
+            # finalne ścięcie pewności – tylko wyraźne sygnały wejdą w Hit
+            if abs(blended_ret) < 2.0:
+                blended_ret *= 0.55
+            else:
+                blended_ret *= 0.85
+            _log(f"   HARD-TICKER path loc={loc} vol={vol_scale:.2f} regime={regime} → {blended_ret:+.2f}%")
+        except Exception as e:
+            _log(f"   hard path fail: {e}")
+            blended_ret *= 0.50
+
+    # Trend persistence: ADX silny + zgodność mom → wzmocnij znak techniczny (tylko easy)
     try:
-        if feats.get('adx', 0) >= 28 and feats.get('mom_agree', 0) > 0:
+        if not hard and feats.get('adx', 0) >= 28 and feats.get('mom_agree', 0) > 0:
             if regime == 'TREND_UP' and blended_ret > 0:
                 blended_ret *= 1.08
             elif regime == 'TREND_DOWN' and blended_ret < 0:
                 blended_ret *= 1.08
-        # RANGE: mean-reversion lekko (RSI ekstremum)
-        if regime == 'RANGE':
+        # RANGE easy: mean-reversion lekko (RSI ekstremum)
+        if not hard and regime == 'RANGE':
             if feats.get('rsi', 50) >= 72 and blended_ret > 0:
                 blended_ret *= 0.55
             elif feats.get('rsi', 50) <= 28 and blended_ret < 0:
@@ -3246,7 +3280,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v3r: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3h: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
