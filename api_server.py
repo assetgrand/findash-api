@@ -216,7 +216,7 @@ class RankingItem(BaseModel):
 class RankingsResponse(BaseModel):
     horizon: str
     items: List[RankingItem]
-    disclaimer: str = AnalyzeResponse.model_fields["disclaimer"].default
+    disclaimer: str = "Analytical tool, not investment advice."
 
 
 def _horizon_days(horizon: str) -> int:
@@ -649,49 +649,101 @@ def rankings(
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    Ranking sekwencyjnie – bez ThreadPool.
-    order=top  → Top N po predicted_change_pct (malejąco)
-    order=bottom → Bottom N (rosnąco) — ta sama lista tickerów.
+    Ranking z gotowego cache (precompute / analyze).
+    NIE przelicza wszystkich spółek przy requestcie – jak akcje są w cache, ranking jest natychmiastowy.
+    order=top | bottom
     """
     _gate(prof, "rankings")
     order_l = (order or "top").strip().lower()
     if order_l not in ("top", "bottom"):
         order_l = "top"
-    # Pełna watchlista (nie ucinaj przed sortem — top i bottom z tego samego uniwersum)
     tick_list = list(getattr(core, "tickers", []) or [])
     if not tick_list:
-        tick_list = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM"]
+        tick_list = _ticker_list_for_precompute()
+    # unia z listą precompute (priorytet + core.tickers)
+    seen = set()
+    full = []
+    for t in list(tick_list) + _ticker_list_for_precompute():
+        u = str(t).upper().strip()
+        if u and u not in seen:
+            seen.add(u)
+            full.append(u)
+    tick_list = full
+
     items: List[RankingItem] = []
     hz = "3M" if _horizon_days(horizon) > 30 else "1M"
+    # dłuższa świeżość przy odczycie rankingu (akcje już wczytane = użyj ich)
+    rank_max_age = max(float(_PRECOMPUTE_INTERVAL) * 6.0, 21600.0)
+
+    def _from_analyze_mem(tk: str, hz_lab: str) -> Optional[Dict[str, Any]]:
+        """Szukaj w _ANALYZE_CACHE bez ponownego liczenia."""
+        prefix = f"v8|{tk}|{hz_lab}|"
+        now = time.time()
+        best = None
+        best_ts = 0.0
+        for k, row in list(_ANALYZE_CACHE.items()):
+            if not str(k).startswith(prefix):
+                continue
+            ts = float(row.get("ts") or 0)
+            if now - ts > _ANALYZE_CACHE_TTL * 2:
+                continue
+            if ts >= best_ts and row.get("data"):
+                best_ts = ts
+                best = dict(row["data"])
+        return best
+
     for tk in tick_list:
         try:
-            d = _pc_get(tk, hz) or _analyze_one(tk, hz, fast=True, quality=False)
+            d = _pc_get(tk, hz, max_age=rank_max_age)
+            if not d:
+                d = _from_analyze_mem(tk, hz)
+            # tylko gdy naprawdę brak – jedna szybka próba (nie blokuj całej listy sleepem)
+            if not d:
+                try:
+                    d = _analyze_one(tk, hz, fast=True, quality=False)
+                    if d and d.get("current_price") is not None:
+                        _pc_store(tk, hz, d)
+                except Exception as e:
+                    print("rankings analyze skip", tk, e)
+                    d = None
             if not d or d.get("current_price") is None:
                 continue
             items.append(
                 RankingItem(
-                    ticker=d["ticker"],
-                    current_price=d.get("current_price"),
-                    predicted_change_pct=d.get("predicted_change_pct"),
-                    direction=d.get("direction") or "NEUTRAL",
-                    sector=d.get("sector") or "Unknown",
-                    fundamental_rating=d.get("fundamental_rating"),
-                    hit_rate=d.get("hit_rate"),
+                    ticker=str(d.get("ticker") or tk).upper(),
+                    current_price=_safe_float(d.get("current_price")),
+                    predicted_change_pct=_safe_float(d.get("predicted_change_pct")),
+                    direction=str(d.get("direction") or "NEUTRAL"),
+                    sector=str(d.get("sector") or "Unknown"),
+                    fundamental_rating=(
+                        str(d["fundamental_rating"])
+                        if d.get("fundamental_rating") is not None
+                        else None
+                    ),
+                    hit_rate=_safe_float(d.get("hit_rate")),
                 )
             )
         except Exception as e:
             print("rankings skip", tk, e)
-        time.sleep(0.25)
-    # top = najwyższy %, bottom = najniższy %
+            continue
+
     items.sort(
         key=lambda x: (
             x.predicted_change_pct is not None,
-            x.predicted_change_pct if x.predicted_change_pct is not None else (999 if order_l == "bottom" else -999),
+            x.predicted_change_pct
+            if x.predicted_change_pct is not None
+            else (999.0 if order_l == "bottom" else -999.0),
         ),
         reverse=(order_l == "top"),
     )
     items = items[:limit]
-    return RankingsResponse(horizon=hz, items=items)
+    return RankingsResponse(
+        horizon=hz,
+        items=items,
+        disclaimer=(
+            "Analytical tool, not investment advice. Rankings use cached model forecasts."
+        ),
+    )
 
 
 @app.get("/fundamentals/{ticker}")
