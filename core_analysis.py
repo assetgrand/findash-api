@@ -2456,6 +2456,21 @@ sector_tech_weight = {
     'Default': 0.50,
 }
 
+# 3M: mnożnik udziału techniki (niższy = więcej fundamentów / stabilniejszy kierunek)
+SECTOR_3M_TECH_MULT = {
+    'Technology': 0.90,
+    'Communication Services': 0.90,
+    'Consumer Cyclical': 0.92,
+    'Financial Services': 0.88,
+    'Healthcare': 0.82,
+    'Consumer Defensive': 0.80,
+    'Utilities': 0.78,
+    'Energy': 0.94,
+    'Automotive': 0.92,
+    'Index': 0.86,
+    'Default': 0.90,
+}
+
 REGIME_MODEL_PRIORS = {
     'TREND_UP':   {'ridge': 0.28, 'gb': 0.32, 'heuristic': 0.40},
     'TREND_DOWN': {'ridge': 0.28, 'gb': 0.32, 'heuristic': 0.40},
@@ -2817,8 +2832,20 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
     mae = {}
     dhit = {}
+    # 3M: silniejsza regularyzacja (mniej overfitu na długim horyzoncie)
+    ridge_alpha = 2.0 if horizon_days > 30 else 1.2
+    if horizon_days > 30:
+        gb_kw = dict(
+            n_estimators=70, max_depth=2, learning_rate=0.04,
+            min_samples_leaf=8, subsample=0.80, random_state=42,
+        )
+    else:
+        gb_kw = dict(
+            n_estimators=100, max_depth=3, learning_rate=0.05,
+            min_samples_leaf=4, subsample=0.85, random_state=42,
+        )
     try:
-        ridge = Ridge(alpha=1.2)
+        ridge = Ridge(alpha=ridge_alpha)
         ridge.fit(X_tr, y_tr)
         pr = ridge.predict(X_ho)
         mae['ridge'] = float(np.mean(np.abs(pr - y_ho)))
@@ -2827,10 +2854,7 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
         mae['ridge'], dhit['ridge'] = 999.0, 0.50
     try:
         if len(X_tr) >= 40:
-            gb = GradientBoostingRegressor(
-                n_estimators=100, max_depth=3, learning_rate=0.05,
-                min_samples_leaf=4, subsample=0.85, random_state=42
-            )
+            gb = GradientBoostingRegressor(**gb_kw)
             gb.fit(X_tr, y_tr)
             pr = gb.predict(X_ho)
             mae['gb'] = float(np.mean(np.abs(pr - y_ho)))
@@ -2875,9 +2899,20 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     preds['heuristic'] = _heuristic_momentum_return(feats, regime, days_forward)
     x_now = np.array([[feats[k] for k in FEATURE_KEYS]], dtype=float)
 
+    ridge_alpha = 2.2 if days_forward > 30 else 1.5
+    if days_forward > 30:
+        gb_kw = dict(
+            n_estimators=80, max_depth=2, learning_rate=0.04,
+            min_samples_leaf=8, subsample=0.80, random_state=42,
+        )
+    else:
+        gb_kw = dict(
+            n_estimators=120, max_depth=3, learning_rate=0.05,
+            min_samples_leaf=5, subsample=0.85, random_state=42,
+        )
     try:
         if X is not None and y is not None:
-            ridge = Ridge(alpha=1.5)
+            ridge = Ridge(alpha=ridge_alpha)
             if sw is not None and len(sw) == len(y):
                 ridge.fit(X, y, sample_weight=sw)
             else:
@@ -2890,10 +2925,7 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
 
     try:
         if X is not None and y is not None and len(X) >= 40:
-            gb = GradientBoostingRegressor(
-                n_estimators=120, max_depth=3, learning_rate=0.05,
-                min_samples_leaf=5, subsample=0.85, random_state=42
-            )
+            gb = GradientBoostingRegressor(**gb_kw)
             if sw is not None and len(sw) == len(y):
                 gb.fit(X, y, sample_weight=sw)
             else:
@@ -3090,7 +3122,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3m | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3s | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3117,11 +3149,12 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v3b: rozdział 1M vs 3M (jak desktop main)
+    # 1M vs 3M + sector prior na 3M (więcej fund na defensive / quality)
     if horizon == '1M':
         tech_w = min(0.74, base_tech + 0.12)
     else:
-        tech_w = max(0.28, base_tech - 0.16)
+        mult = SECTOR_3M_TECH_MULT.get(sector, SECTOR_3M_TECH_MULT.get('Default', 0.90))
+        tech_w = max(0.24, (base_tech - 0.16) * mult)
     if regime == 'HIGH_VOL':
         tech_w *= 0.80 if horizon == '1M' else 0.75
     if regime == 'RANGE':
@@ -3306,7 +3339,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v3m: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3s: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
