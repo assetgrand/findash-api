@@ -2582,19 +2582,21 @@ FEATURE_KEYS = [
 ]
 
 
-def _build_training_set(df, horizon_days, max_samples=200):
-    """Zbiór treningowy z krokiem ~horizon/3 – mNOj nachodzących etykiet (mNOj szumu)."""
+def _build_training_set(df, horizon_days, max_samples=None):
+    """Zbiór treningowy – na 3M więcej próbek i słabsza recency (stabilniejszy kierunek)."""
     n = len(df)
     if n < horizon_days + 40:
         return None, None
-    # krok zmNOjsza overlap etykiet forward-return (uczciwszy sygnał dla Ridge/GB)
-    step = max(1, min(5, horizon_days // 4))
+    # 3M: więcej historii w fit; 1M: gęściej, świeżej
+    if max_samples is None:
+        max_samples = 280 if horizon_days > 30 else 200
+    step = max(1, min(6, horizon_days // 5)) if horizon_days > 30 else max(1, min(5, horizon_days // 4))
     span = max_samples * step
     start = max(40, n - horizon_days - span)
     X_list, y_list, w_list = [], [], []
     idxs = list(range(start, n - horizon_days, step))
     if len(idxs) < 30:
-        idxs = list(range(start, n - horizon_days))  # fallback gęstszy
+        idxs = list(range(start, n - horizon_days))
     for j, i in enumerate(idxs):
         feats = _extract_features_row(df, i)
         if feats is None:
@@ -2603,12 +2605,15 @@ def _build_training_set(df, horizon_days, max_samples=200):
         if future <= 0 or feats['close'] <= 0:
             continue
         fwd_ret = (future / feats['close'] - 1.0) * 100.0
-        # lekka normalizacja ekstremów (winsor) – more stable fit
-        fwd_ret = float(np.clip(fwd_ret, -45.0, 45.0))
+        cap = 55.0 if horizon_days > 30 else 45.0
+        fwd_ret = float(np.clip(fwd_ret, -cap, cap))
         X_list.append([feats[k] for k in FEATURE_KEYS])
         y_list.append(fwd_ret)
-        # świeższe próbki ważNOjsze (recency weight)
-        w_list.append(0.55 + 0.45 * ((j + 1) / max(len(idxs), 1)))
+        # 3M: mniej faworyzuj tylko ostatnie miesiące (lepszy kierunek długi)
+        if horizon_days > 30:
+            w_list.append(0.70 + 0.30 * ((j + 1) / max(len(idxs), 1)))
+        else:
+            w_list.append(0.55 + 0.45 * ((j + 1) / max(len(idxs), 1)))
     if len(X_list) < 30:
         return None, None, None
     return np.array(X_list, dtype=float), np.array(y_list, dtype=float), np.array(w_list, dtype=float)
@@ -2616,7 +2621,21 @@ def _build_training_set(df, horizon_days, max_samples=200):
 
 def _heuristic_momentum_return(feats, regime, days_forward):
     scale = days_forward / 21.0
-    mom = 0.25 * feats['ret5'] + 0.35 * feats['ret10'] + 0.25 * feats['ret20'] + 0.15 * feats.get('ret60', 0.0)
+    # 3M: dłuższy momentum ważniejszy (ret5 często szum na 63d)
+    if days_forward > 30:
+        mom = (
+            0.08 * feats['ret5']
+            + 0.17 * feats['ret10']
+            + 0.30 * feats['ret20']
+            + 0.45 * feats.get('ret60', 0.0)
+        )
+    else:
+        mom = (
+            0.25 * feats['ret5']
+            + 0.35 * feats['ret10']
+            + 0.25 * feats['ret20']
+            + 0.15 * feats.get('ret60', 0.0)
+        )
     if feats.get('mom_agree', 0) > 0:
         mom *= 1.12
     mr = 0.0
@@ -2898,22 +2917,29 @@ def _ensemble_expected_return(df, days_forward, sector, regime, feats):
     agree = _model_agreement_penalty(preds)
     blended *= agree
     prior = _historical_drift(df, days_forward)
-    # przy LOWej zgodności modeli mocNOj kotwica historyczna (kierunek z rynku, NO szum ML)
-    shrink_s = 0.28 if days_forward <= 30 else 0.22
+    prior_long = _historical_drift(df, min(days_forward * 2, 126)) if days_forward > 30 else prior
+    # 3M: silniejsza kotwica historii (kierunek z dłuższego okna, mniej szumu ML)
+    if days_forward <= 30:
+        shrink_s = 0.28
+    else:
+        shrink_s = 0.38
+        prior = 0.55 * prior + 0.45 * prior_long
     if agree < 0.75:
-        shrink_s += 0.12
+        shrink_s += 0.14 if days_forward > 30 else 0.12
+    if agree < 0.55:
+        shrink_s += 0.10  # mocny spór modeli → prawie sam prior
     if regime == 'HIGH_VOL':
         shrink_s += 0.08
     elif regime == 'RANGE':
-        shrink_s += 0.05
-    blended = _shrink_prediction(blended, prior, strength=min(0.55, shrink_s))
+        shrink_s += 0.06
+    blended = _shrink_prediction(blended, prior, strength=min(0.62, shrink_s))
     if regime == 'HIGH_VOL':
         blended *= 0.88
     elif regime == 'RANGE':
         blended *= 0.93
-    # 3M: lekko większy udział dłuższego dryfu (ret60 już w features; tu prior)
-    if days_forward > 30 and abs(prior) >= 0.5:
-        blended = 0.88 * blended + 0.12 * prior
+    # 3M: wyraźniejszy udział dryfu strukturalnego
+    if days_forward > 30 and abs(prior) >= 0.4:
+        blended = 0.78 * blended + 0.22 * prior
     return float(blended), preds, weights
 
 
@@ -3064,7 +3090,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3h | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3m | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3207,13 +3233,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
-    # v3d: mniejszy dryf + symetria UP/DOWN (mniej „wszystko na plus”)
+    # v3m: 3M mocniej kotwiczy w dłuższym dryfie (lepszy kierunek, bez zmiany Hit%)
     if horizon == '1M':
         drift_w = 0.12
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.18
-        mix_prior = 0.65 * hist_med + 0.35 * hist_med_long
+        drift_w = 0.26
+        mix_prior = 0.50 * hist_med + 0.50 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
     # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
@@ -3280,7 +3306,7 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         direction = "DOWNTREND"
     else:
         direction = "NEUTRAL"
-    _log(f"✅ PROGNOZA v3h: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
+    _log(f"✅ PROGNOZA v3m: {adjusted_pred:.2f} ({change_percent:+.2f}%) – {direction} | cap±{max_change:.1f}%")
     return float(adjusted_pred), direction, float(change_percent)
 
 
