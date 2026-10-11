@@ -3954,25 +3954,62 @@ def _own_history_conditional_dd(data, position_now, window_fwd=126, min_samples=
 
 
 
-def backtest_perspective_3y_quality(df, forward_days=126, max_points=24, step=None):
+def _perspective_3y_direction_bias(price, sma200, pos, ret_63, ret_126):
     """
-    Walk-forward Hit% dla sygnału kierunku z logiki 3Y (uproszczonej).
+    Kierunek diagnostyczny 3Y (ten sam w live-logice hit i w backteście).
 
-    Na każdym punkcie historii (tylko dane do i):
-      - trend względem SMA200
-      - pozycja w zakresie ~3 lat wstecz
-      - bias: ekstremum range + trend → oczekiwany znak ruchu
-    Porównanie z faktycznym returnem przez `forward_days` sesji (~6m domyślnie).
+    Zasada: NIE shortuj automatycznie blisko ATH przy silnym uptrendzie
+    (to psuło NVDA i podobne). Kontynuacja trendu + momentum;
+    mean-reversion tylko gdy ekstremum range I słabnący momentum.
+    """
+    if price is None or sma200 is None or sma200 <= 0 or price <= 0:
+        return 0
+    ret_63 = 0.0 if ret_63 is None else float(ret_63)
+    ret_126 = 0.0 if ret_126 is None else float(ret_126)
+    pos = 50.0 if pos is None else float(pos)
 
-    To NIE jest ten sam horyzont co „3 lata w przyszłość” (tego nie da się
-    uczciwie backtestować na krótkiej historii), tylko test czy bias 3Y
-    ma wartość predykcyjną na średnim horyzoncie. Uczciwa metryka diagnostyczna.
+    above = price > sma200 * 1.02
+    below = price < sma200 * 0.98
+    mom_up = ret_126 > 4.0 or (ret_63 > 3.0 and ret_126 > 0)
+    mom_dn = ret_126 < -4.0 or (ret_63 < -3.0 and ret_126 < 0)
+    mom_flat = abs(ret_126) <= 4.0 and abs(ret_63) <= 3.0
+
+    # 1) silny trend + zgodne momentum → kontynuacja
+    if above and mom_up:
+        bias = 1
+    elif below and mom_dn:
+        bias = -1
+    # 2) ekstremum range TYLKO ze słabnącym / przeciwnym momentum
+    elif pos >= 90 and (mom_dn or (mom_flat and ret_63 < 0)):
+        bias = -1
+    elif pos <= 20 and (mom_up or (mom_flat and ret_63 > 0)):
+        bias = 1
+    # 3) sam trend względem SMA200
+    elif above and not mom_dn:
+        bias = 1
+    elif below and not mom_up:
+        bias = -1
+    # 4) środek range, momentum rozstrzyga
+    elif mom_up and ret_126 > ret_63 * 0.3:
+        bias = 1
+    elif mom_dn and ret_126 < ret_63 * 0.3:
+        bias = -1
+    else:
+        bias = 0
+    return int(bias)
+
+
+def backtest_perspective_3y_quality(df, forward_days=126, max_points=28, step=None):
+    """
+    Walk-forward Hit% – bias 3Y (trend+momentum, bez ślepego shorta na ATH)
+    vs faktyczny return przez `forward_days` sesji (~6m).
+
+    Uczciwa metryka diagnostyczna; NIE zmienia definicji Hit 1M/3M.
     """
     if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
         return None
     df_clean = df.ffill().bfill()
     n = len(df_clean)
-    # potrzeba: 3y lookback (~504 sesje) + forward
     min_lookback = 252
     if n < min_lookback + forward_days + 30:
         return None
@@ -3982,18 +4019,17 @@ def backtest_perspective_3y_quality(df, forward_days=126, max_points=24, step=No
         return None
 
     if step is None:
-        step = max(15, forward_days // 4)
+        step = max(12, forward_days // 5)
 
     start_i = max(min_lookback, end - max_points * step)
     indices = list(range(start_i, end + 1, step))
     if len(indices) < 6:
-        step = max(10, step // 2)
-        start_i = max(min_lookback, end - (max_points + 8) * step)
+        step = max(8, step // 2)
+        start_i = max(min_lookback, end - (max_points + 10) * step)
         indices = list(range(start_i, end + 1, step))
     if len(indices) < 5:
         return None
 
-    # istotny ruch na ~6m
     min_move = 6.0 if forward_days <= 90 else 8.0
     dir_hits = 0
     significant = 0
@@ -4003,7 +4039,9 @@ def backtest_perspective_3y_quality(df, forward_days=126, max_points=24, step=No
 
     for i in indices:
         try:
-            window = closes.iloc[max(0, i - 756) : i + 1]  # ~3y sesji
+            if i < 200:
+                continue
+            window = closes.iloc[max(0, i - 756) : i + 1]
             if len(window) < min_lookback:
                 continue
             price = float(closes.iloc[i])
@@ -4014,25 +4052,13 @@ def backtest_perspective_3y_quality(df, forward_days=126, max_points=24, step=No
             rng = high - low
             pos = ((price - low) / rng) * 100.0 if rng > 0 else 50.0
 
-            sma_win = closes.iloc[max(0, i - 199) : i + 1]
-            if len(sma_win) < 50:
-                continue
-            sma = float(sma_win.mean())  # przybliżenie SMA200 na dostępnej próbie
-            if len(sma_win) >= 200:
-                sma = float(closes.iloc[i - 199 : i + 1].mean())
+            sma = float(closes.iloc[i - 199 : i + 1].mean())
+            p63 = float(closes.iloc[i - 63]) if i >= 63 else price
+            p126 = float(closes.iloc[i - 126]) if i >= 126 else price
+            ret_63 = (price / p63 - 1.0) * 100.0 if p63 > 0 else 0.0
+            ret_126 = (price / p126 - 1.0) * 100.0 if p126 > 0 else 0.0
 
-            # bias kierunku (ta sama intuicja co outlook: trend + pozycja w range)
-            if pos >= 88:
-                bias = -1  # blisko szczytu zakresu → presja w dół / słabszy upside
-            elif pos <= 25:
-                bias = 1   # nisko w zakresie → presja w górę
-            elif price > sma * 1.03:
-                bias = 1
-            elif price < sma * 0.97:
-                bias = -1
-            else:
-                bias = 0
-
+            bias = _perspective_3y_direction_bias(price, sma, pos, ret_63, ret_126)
             if bias == 0:
                 continue
 
@@ -4060,10 +4086,10 @@ def backtest_perspective_3y_quality(df, forward_days=126, max_points=24, step=No
         "n_significant": int(significant),
         "forward_days": int(forward_days),
         "mae_abs_move": round(float(np.mean(abs_errors)), 2) if abs_errors else None,
-        "engine": "perspective-3y-hit-v1",
+        "engine": "perspective-3y-hit-v2",
         "note": (
-            "Directional hit of 3Y-style bias vs next ~"
-            f"{forward_days} sessions (not a full 3-year crystal ball)."
+            "Directional hit of 3Y bias (trend+momentum) vs next ~"
+            f"{forward_days} sessions. No auto-short at ATH."
         ),
     }
 
@@ -4304,12 +4330,15 @@ def get_3year_perspective(ticker, fundamental_score=None):
         risk_pct = round(float(np.clip(risk_pct * min(downside_mult, 1.15), 8.0, 55.0)), 1)
         upside_pct = round(float(np.clip(upside_pct * min(upside_mult, 1.15), 10.0, 95.0)), 1)
 
-        # Twarde reguły okazja/zagrożeNO – spójne z crash + risk of drop
-        if crash_risk_score >= 65 or risk_pct >= 26 or position_in_10y >= 88:
+        # Reguły okazja/zagrożenie – ryzyko przy ATH zostaje, ale silny uptrend
+        # nie jest automatycznie "tylko zagrożenie bez upside"
+        if crash_risk_score >= 70 or risk_pct >= 28 or position_in_10y >= 92:
             big_threat = "YES"
-        if crash_risk_score >= 70 and position_in_10y >= 80:
-            duza_okazja = "NO"  # nigdy "okazja" przy HIGHm crash blisko szczytu
-        if duza_okazja == "YES" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
+        elif crash_risk_score >= 65 and position_in_10y >= 88:
+            big_threat = "YES"
+        if crash_risk_score >= 72 and position_in_10y >= 85:
+            duza_okazja = "NO"
+        if duza_okazja == "YES" and (crash_risk_score >= 65 or risk_pct >= upside_pct * 1.05):
             duza_okazja = "NO"
         if (
             position_in_10y <= 35
@@ -4319,6 +4348,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
             duza_okazja = "YES"
             if risk_pct < 22 and crash_risk_score < 55:
                 big_threat = "NO"
+        # silny uptrend + nie ekstremalny crash: nie blokuj upside narracji
+        if (
+            trend_3y in ("STRONG UPTREND", "SILNIE WZROSTOWY", "UPTREND", "WZROSTOWY")
+            and crash_risk_score < 75
+            and position_in_10y < 95
+        ):
+            if upside_pct < risk_pct:
+                upside_pct = round(max(upside_pct, risk_pct * 0.95), 1)
 
         # Krótki "why" – UX, zero wpływu na 1M/3M
         why = []
@@ -4382,7 +4419,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'n_significant': (hit_3y or {}).get('n_significant'),
             'hit_forward_days': (hit_3y or {}).get('forward_days'),
             'hit_details': hit_3y,
-            'engine': 'perspective-3y-v3-hit',
+            'engine': 'perspective-3y-v3-hit2',
         }
     except Exception as e:
         print(f"Błąd analizy 3-year dla {ticker}: {e}")
