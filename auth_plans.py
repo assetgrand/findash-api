@@ -105,6 +105,10 @@ def features_for_plan(plan: str) -> List[str]:
 #   plan text default 'demo'
 #   analyze_count int default 0
 #   analyze_month text  -- 'YYYY-MM'
+#   stripe_customer_id text
+#   stripe_subscription_id text
+#   subscription_status text  -- active|past_due|canceled|none
+#   plan_period_end timestamptz  -- koniec opłaconego okresu / next renewal
 # ---------------------------------------------------------------------------
 
 def _sb_headers(service: bool = True) -> Dict[str, str]:
@@ -425,13 +429,18 @@ def _update_profile(user_id: str, fields: Dict[str, Any]) -> None:
     raise RuntimeError(f"update_profile failed: {r.status_code} {r.text[:200]}")
 
 
-def set_plan(user_id: str, plan: str) -> None:
+def set_plan(user_id: str, plan: str, extra: Optional[Dict[str, Any]] = None) -> None:
     plan = plan.lower().strip()
     if plan not in VALID_PLANS:
         raise ValueError(f"Nieprawidłowy plan: {plan}")
+    fields: Dict[str, Any] = {"plan": plan}
+    if extra:
+        for k, v in extra.items():
+            if v is not None:
+                fields[k] = v
     try:
         ensure_profile(user_id)
-        _update_profile(user_id, {"plan": plan})
+        _update_profile(user_id, fields)
     except Exception as e:
         msg = str(e)
         if "23503" in msg or "foreign key" in msg.lower():
@@ -450,6 +459,117 @@ def set_plan(user_id: str, plan: str) -> None:
         raise RuntimeError(
             f"Plan nie zapisał się w DB (oczekiwano {plan}, jest {prof})"
         )
+
+
+def apply_subscription_state(
+    user_id: str,
+    *,
+    plan: Optional[str] = None,
+    status: Optional[str] = None,
+    period_end: Optional[str] = None,
+    customer_id: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    demote_to_demo: bool = False,
+) -> None:
+    """
+    Aktualizacja subskrypcji z webhooka Stripe.
+    demote_to_demo=True → plan=demo (cancel / końcowe failed).
+    """
+    ensure_profile(user_id)
+    fields: Dict[str, Any] = {}
+    if demote_to_demo:
+        fields["plan"] = "demo"
+        fields["subscription_status"] = status or "canceled"
+    elif plan is not None:
+        p = plan.lower().strip()
+        if p in VALID_PLANS:
+            fields["plan"] = p
+    if status is not None:
+        fields["subscription_status"] = str(status).lower().strip()
+    if period_end is not None:
+        fields["plan_period_end"] = period_end
+    if customer_id:
+        fields["stripe_customer_id"] = customer_id
+    if subscription_id:
+        fields["stripe_subscription_id"] = subscription_id
+    if not fields:
+        return
+    _update_profile(user_id, fields)
+
+
+def _parse_period_end_ts(val: Any) -> Optional[float]:
+    """Unix ts lub ISO string → unix float; None jeśli brak."""
+    if val is None or val == "":
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        if s.isdigit():
+            return float(s)
+        # ISO
+        from datetime import datetime as _dt
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return _dt.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def enforce_subscription_access(prof: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cofa plan do demo TYLKO przy wyraźnym sygnale Stripe.
+    Legacy (pro/standard bez stripe pól / status none) → NIE ruszamy.
+    """
+    if not prof:
+        return prof
+    plan = (prof.get("plan") or "demo").lower().strip()
+    if plan == "demo":
+        return prof
+
+    status = (prof.get("subscription_status") or "").lower().strip()
+    # Brak danych subskrypcji (stare konta admin / ręczne pro) — zostaw plan
+    if status in ("", "none", "unknown", "null"):
+        return prof
+
+    # Wyraźne anulowanie / nieopłacone
+    if status in ("canceled", "cancelled", "unpaid", "incomplete_expired"):
+        try:
+            apply_subscription_state(
+                str(prof["id"]),
+                demote_to_demo=True,
+                status=status,
+            )
+            prof = dict(prof)
+            prof["plan"] = "demo"
+            prof["subscription_status"] = status
+        except Exception as e:
+            print("enforce demote", e)
+            prof = dict(prof)
+            prof["plan"] = "demo"
+        return prof
+
+    # Okres minął + past_due (nieudane odnowienie)
+    end_ts = _parse_period_end_ts(prof.get("plan_period_end"))
+    if (
+        end_ts is not None
+        and end_ts < time.time() - 86400
+        and status == "past_due"
+    ):
+        try:
+            apply_subscription_state(
+                str(prof["id"]),
+                demote_to_demo=True,
+                status="expired",
+            )
+            prof = dict(prof)
+            prof["plan"] = "demo"
+            prof["subscription_status"] = "expired"
+        except Exception as e:
+            print("enforce expired", e)
+            prof = dict(prof)
+            prof["plan"] = "demo"
+    return prof
 
 
 def increment_analyze(user_id: str, current_count: int) -> int:
@@ -488,7 +608,9 @@ def remaining_analyze(prof: Dict[str, Any]) -> Optional[int]:
 
 
 def public_me(prof: Dict[str, Any]) -> Dict[str, Any]:
+    prof = enforce_subscription_access(dict(prof) if prof else {})
     plan = (prof.get("plan") or "demo").lower()
+    period_end = prof.get("plan_period_end")
     return {
         "id": prof.get("id"),
         "email": prof.get("email"),
@@ -498,6 +620,10 @@ def public_me(prof: Dict[str, Any]) -> Dict[str, Any]:
         "analyze_month": prof.get("analyze_month") or _month_key(),
         "analyze_remaining": remaining_analyze(prof),
         "analyze_limit_demo": DEMO_ANALYZE_LIMIT,
+        "subscription_status": (prof.get("subscription_status") or ("none" if plan == "demo" else "unknown")),
+        "plan_period_end": period_end,
+        "next_payment_at": period_end,  # alias dla UI
+        "stripe_subscription_id": prof.get("stripe_subscription_id"),
         "trusted_ip": {
             "enabled": TRUSTED_IP_ENABLED,
             "mode": TRUSTED_IP_MODE,

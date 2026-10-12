@@ -1296,30 +1296,71 @@ def confirm_session(
     if plan not in auth.VALID_PLANS or plan == "demo":
         raise HTTPException(status_code=400, detail=f"Invalid plan in session: {plan!r}")
 
+    customer_id = None
+    sub_id = None
+    period_end = None
+    sub_status = "active"
     try:
-        auth.set_plan(uid, plan)
+        if isinstance(sess, dict):
+            customer_id = sess.get("customer")
+            sub_id = sess.get("subscription")
+        else:
+            customer_id = getattr(sess, "customer", None)
+            sub_id = getattr(sess, "subscription", None)
+        if sub_id:
+            sub = stripe.Subscription.retrieve(str(sub_id))
+            sub_d = sub.to_dict() if hasattr(sub, "to_dict") else dict(sub)
+            ts = sub_d.get("current_period_end")
+            if ts:
+                from datetime import datetime, timezone
+                period_end = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+            sub_status = (sub_d.get("status") or "active").lower()
+    except Exception as e:
+        print("[stripe] confirm retrieve sub", e)
+
+    try:
+        auth.apply_subscription_state(
+            uid,
+            plan=plan,
+            status=sub_status,
+            period_end=period_end,
+            customer_id=str(customer_id) if customer_id else None,
+            subscription_id=str(sub_id) if sub_id else None,
+        )
     except Exception as e:
         print("[stripe] confirm set_plan error", e)
         raise HTTPException(status_code=500, detail=f"set_plan failed: {e}")
 
-    print(f"[stripe] confirm-session OK plan={plan} user={uid}")
-    return {"ok": True, "plan": plan, "user_id": uid}
+    print(f"[stripe] confirm-session OK plan={plan} user={uid} until={period_end}")
+    return {
+        "ok": True,
+        "plan": plan,
+        "user_id": uid,
+        "subscription_status": sub_status,
+        "plan_period_end": period_end,
+        "next_payment_at": period_end,
+    }
 
 
 @app.post("/billing/stripe-webhook")
 async def stripe_webhook(request: Request):
     """
-    Stripe Checkout completed → profiles.plan = standard|pro.
-    W Stripe Dashboard: webhook na https://TWOJ-API/billing/stripe-webhook
-    Event: checkout.session.completed
-    Metadata sesji: supabase_user_id, plan
+    Pełny cykl subskrypcji Stripe → profiles.
+
+    Eventy (ustaw w Stripe Dashboard → Webhooks):
+      - checkout.session.completed
+      - customer.subscription.updated
+      - customer.subscription.deleted
+      - invoice.paid
+      - invoice.payment_failed
+
+    URL: https://findash-api-rtxz.onrender.com/billing/stripe-webhook
     """
     secret = os.environ.get("STRIPE_WEBHOOK_SECRET") or ""
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
 
     if not secret:
-        # tryb bez weryfikacji – tylko dev (NIE na prod bez secret)
         try:
             import json
             event = json.loads(payload.decode("utf-8"))
@@ -1332,7 +1373,6 @@ async def stripe_webhook(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
-    # construct_event zwraca StripeObject, nie zawsze dict
     if isinstance(event, dict):
         etype = event.get("type")
         data_obj = (event.get("data") or {}).get("object") or {}
@@ -1348,45 +1388,258 @@ async def stripe_webhook(request: Request):
         if data_obj is None:
             data_obj = {}
 
-    if etype == "checkout.session.completed":
-        if isinstance(data_obj, dict):
-            meta = data_obj.get("metadata") or {}
-            client_ref = data_obj.get("client_reference_id")
-        else:
-            meta = getattr(data_obj, "metadata", None) or {}
-            if hasattr(meta, "to_dict"):
-                try:
-                    meta = meta.to_dict()
-                except Exception:
-                    meta = dict(meta) if meta else {}
-            elif meta is not None and not isinstance(meta, dict):
-                try:
-                    meta = dict(meta)
-                except Exception:
-                    meta = {}
-            client_ref = getattr(data_obj, "client_reference_id", None)
+    def _as_dict(obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "to_dict"):
+            try:
+                return obj.to_dict()
+            except Exception:
+                pass
+        try:
+            return dict(obj)
+        except Exception:
+            return {}
 
-        if not isinstance(meta, dict):
-            meta = {}
+    def _meta(obj: Dict[str, Any]) -> Dict[str, Any]:
+        m = obj.get("metadata") or {}
+        return m if isinstance(m, dict) else _as_dict(m)
 
+    def _uid_from(obj: Dict[str, Any], *extra_meta_sources: Dict[str, Any]) -> Optional[str]:
+        meta = _meta(obj)
+        for src in extra_meta_sources:
+            if src:
+                meta = {**_meta(src), **meta}
         uid = (
             meta.get("supabase_user_id")
             or meta.get("user_id")
-            or client_ref
+            or obj.get("client_reference_id")
         )
-        plan = (meta.get("plan") or "").lower().strip()
-        print(f"[stripe] checkout.session.completed uid={uid!r} plan={plan!r} meta={meta}")
+        return str(uid).strip() if uid else None
 
+    def _iso_from_ts(ts: Any) -> Optional[str]:
+        if ts is None:
+            return None
+        try:
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    def _plan_from_meta(meta: Dict[str, Any]) -> Optional[str]:
+        p = (meta.get("plan") or "").lower().strip()
+        return p if p in ("standard", "pro") else None
+
+    data_obj = _as_dict(data_obj)
+
+    try:
+        import stripe as stripe_mod
+        stripe_mod.api_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    except Exception:
+        stripe_mod = None  # type: ignore
+
+    # ----- checkout.session.completed -----
+    if etype == "checkout.session.completed":
+        meta = _meta(data_obj)
+        uid = _uid_from(data_obj)
+        plan = _plan_from_meta(meta)
+        customer_id = data_obj.get("customer")
+        sub_id = data_obj.get("subscription")
+        period_end = None
+        status = "active"
+        if sub_id and stripe_mod and getattr(stripe_mod, "api_key", None):
+            try:
+                sub = stripe_mod.Subscription.retrieve(str(sub_id))
+                sub_d = sub.to_dict() if hasattr(sub, "to_dict") else _as_dict(sub)
+                period_end = _iso_from_ts(sub_d.get("current_period_end"))
+                status = (sub_d.get("status") or "active").lower()
+                sm = _meta(sub_d)
+                if not plan:
+                    plan = _plan_from_meta(sm)
+                if not uid:
+                    uid = sm.get("supabase_user_id") or sm.get("user_id")
+            except Exception as e:
+                print("[stripe] retrieve sub after checkout", e)
+        print(f"[stripe] checkout.session.completed uid={uid!r} plan={plan!r} sub={sub_id!r}")
         if uid and plan in auth.VALID_PLANS and plan != "demo":
             try:
-                auth.set_plan(str(uid), plan)
-                print(f"[stripe] plan set OK plan={plan} user={uid}")
+                auth.apply_subscription_state(
+                    str(uid),
+                    plan=plan,
+                    status=status,
+                    period_end=period_end,
+                    customer_id=str(customer_id) if customer_id else None,
+                    subscription_id=str(sub_id) if sub_id else None,
+                )
+                print(f"[stripe] plan set OK plan={plan} user={uid} until={period_end}")
             except Exception as e:
-                print("[stripe] set_plan error", e)
+                print("[stripe] set after checkout error", e)
                 raise HTTPException(status_code=500, detail=str(e))
         else:
-            print(f"[stripe] skip set_plan (uid/plan incomplete)")
+            print("[stripe] skip checkout set_plan (uid/plan incomplete)")
+
+    # ----- subscription updated / deleted -----
+    elif etype in ("customer.subscription.updated", "customer.subscription.deleted"):
+        sub = data_obj
+        meta = _meta(sub)
+        uid = meta.get("supabase_user_id") or meta.get("user_id")
+        plan = _plan_from_meta(meta)
+        status = (sub.get("status") or "").lower()
+        period_end = _iso_from_ts(sub.get("current_period_end"))
+        customer_id = sub.get("customer")
+        sub_id = sub.get("id")
+        print(f"[stripe] {etype} uid={uid!r} status={status} plan={plan!r}")
+
+        # lookup uid by subscription id if metadata missing
+        if not uid and sub_id and auth.SUPABASE_URL and auth.SUPABASE_SERVICE:
+            try:
+                import requests as req
+                url = (
+                    f"{auth.SUPABASE_URL}/rest/v1/profiles"
+                    f"?stripe_subscription_id=eq.{sub_id}&select=id,plan"
+                )
+                r = req.get(url, headers=auth._sb_headers(True), timeout=15)
+                if r.status_code == 200 and r.json():
+                    uid = r.json()[0].get("id")
+            except Exception as e:
+                print("[stripe] lookup by sub id", e)
+
+        if not uid:
+            print("[stripe] subscription event without uid – skip")
+        elif etype == "customer.subscription.deleted" or status in (
+            "canceled", "cancelled", "unpaid", "incomplete_expired"
+        ):
+            try:
+                auth.apply_subscription_state(
+                    str(uid),
+                    demote_to_demo=True,
+                    status=status or "canceled",
+                    period_end=period_end,
+                    customer_id=str(customer_id) if customer_id else None,
+                    subscription_id=str(sub_id) if sub_id else None,
+                )
+                print(f"[stripe] demoted to demo user={uid}")
+            except Exception as e:
+                print("[stripe] demote error", e)
+        else:
+            # active / past_due / trialing
+            try:
+                auth.apply_subscription_state(
+                    str(uid),
+                    plan=plan,  # may be None → keep existing plan field
+                    status=status or "active",
+                    period_end=period_end,
+                    customer_id=str(customer_id) if customer_id else None,
+                    subscription_id=str(sub_id) if sub_id else None,
+                )
+                # past_due: nie nadajemy wyższego planu; status zapisany, enforce w /me
+                print(f"[stripe] sub updated user={uid} status={status} until={period_end}")
+            except Exception as e:
+                print("[stripe] sub update error", e)
+
+    # ----- invoice.paid → odnów okres, upewnij się że plan płatny -----
+    elif etype == "invoice.paid":
+        inv = data_obj
+        meta = _meta(inv)
+        sub_id = inv.get("subscription")
+        customer_id = inv.get("customer")
+        uid = meta.get("supabase_user_id") or meta.get("user_id")
+        plan = _plan_from_meta(meta)
+        period_end = None
+        status = "active"
+        if sub_id and stripe_mod and getattr(stripe_mod, "api_key", None):
+            try:
+                sub = stripe_mod.Subscription.retrieve(str(sub_id))
+                sub_d = sub.to_dict() if hasattr(sub, "to_dict") else _as_dict(sub)
+                period_end = _iso_from_ts(sub_d.get("current_period_end"))
+                status = (sub_d.get("status") or "active").lower()
+                sm = _meta(sub_d)
+                if not uid:
+                    uid = sm.get("supabase_user_id") or sm.get("user_id")
+                if not plan:
+                    plan = _plan_from_meta(sm)
+            except Exception as e:
+                print("[stripe] invoice.paid retrieve sub", e)
+        if not uid and sub_id and auth.SUPABASE_URL and auth.SUPABASE_SERVICE:
+            try:
+                import requests as req
+                url = (
+                    f"{auth.SUPABASE_URL}/rest/v1/profiles"
+                    f"?stripe_subscription_id=eq.{sub_id}&select=id,plan"
+                )
+                r = req.get(url, headers=auth._sb_headers(True), timeout=15)
+                if r.status_code == 200 and r.json():
+                    row = r.json()[0]
+                    uid = row.get("id")
+                    if not plan:
+                        p = (row.get("plan") or "").lower()
+                        plan = p if p in ("standard", "pro") else None
+            except Exception as e:
+                print("[stripe] invoice.paid lookup", e)
+        print(f"[stripe] invoice.paid uid={uid!r} plan={plan!r}")
+        if uid and plan in ("standard", "pro"):
+            try:
+                auth.apply_subscription_state(
+                    str(uid),
+                    plan=plan,
+                    status=status,
+                    period_end=period_end,
+                    customer_id=str(customer_id) if customer_id else None,
+                    subscription_id=str(sub_id) if sub_id else None,
+                )
+            except Exception as e:
+                print("[stripe] invoice.paid apply", e)
+
+    # ----- invoice.payment_failed → past_due; po okresie grace enforce → demo -----
+    elif etype == "invoice.payment_failed":
+        inv = data_obj
+        meta = _meta(inv)
+        sub_id = inv.get("subscription")
+        customer_id = inv.get("customer")
+        uid = meta.get("supabase_user_id") or meta.get("user_id")
+        period_end = None
+        if sub_id and stripe_mod and getattr(stripe_mod, "api_key", None):
+            try:
+                sub = stripe_mod.Subscription.retrieve(str(sub_id))
+                sub_d = sub.to_dict() if hasattr(sub, "to_dict") else _as_dict(sub)
+                period_end = _iso_from_ts(sub_d.get("current_period_end"))
+                sm = _meta(sub_d)
+                if not uid:
+                    uid = sm.get("supabase_user_id") or sm.get("user_id")
+            except Exception as e:
+                print("[stripe] payment_failed retrieve", e)
+        if not uid and sub_id and auth.SUPABASE_URL and auth.SUPABASE_SERVICE:
+            try:
+                import requests as req
+                url = (
+                    f"{auth.SUPABASE_URL}/rest/v1/profiles"
+                    f"?stripe_subscription_id=eq.{sub_id}&select=id"
+                )
+                r = req.get(url, headers=auth._sb_headers(True), timeout=15)
+                if r.status_code == 200 and r.json():
+                    uid = r.json()[0].get("id")
+            except Exception as e:
+                print("[stripe] payment_failed lookup", e)
+        print(f"[stripe] invoice.payment_failed uid={uid!r}")
+        if uid:
+            try:
+                auth.apply_subscription_state(
+                    str(uid),
+                    status="past_due",
+                    period_end=period_end,
+                    customer_id=str(customer_id) if customer_id else None,
+                    subscription_id=str(sub_id) if sub_id else None,
+                )
+                # Nie ustawiamy od razu demo – Stripe ponawia; po cancel/deleted → demo.
+                # enforce_subscription_access zdejmie plan gdy period_end minie + past_due.
+            except Exception as e:
+                print("[stripe] payment_failed apply", e)
+
     return {"received": True}
+
+
 
 
 
