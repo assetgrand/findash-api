@@ -22,10 +22,11 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "crypto-precompute-v2"
+API_BUILD = "ai-brief-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
+import ai_brief
 
 # Klucz: najpierw ENV (produkcja), potem stała z core
 if os.environ.get("TWELVE_DATA_API_KEY"):
@@ -1999,6 +2000,42 @@ def crypto_rankings(
     }
 
 
+
+@app.get("/ai/brief/{ticker}")
+def ai_news_brief(
+    ticker: str,
+    refresh: bool = Query(False, description="Bypass cache and regenerate"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """
+    Multi-agent AI news brief (Gemini): headlines → news → risk → editor.
+    Standard/Pro. Cached server-side (AI_BRIEF_CACHE_MINUTES).
+    """
+    _gate(prof, "ai_brief")
+    if not ai_brief.configured():
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY not configured on server",
+        )
+    try:
+        data = ai_brief.build_brief(ticker, use_cache=not refresh)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print("[ai_brief] error", e)
+        raise HTTPException(status_code=502, detail=f"AI brief failed: {e}")
+    data = dict(data)
+    data["plan"] = (prof.get("plan") or "demo").lower()
+    return data
+
+
+@app.get("/ai/status")
+def ai_status(prof: Dict[str, Any] = Depends(get_profile)):
+    """Czy Gemini skonfigurowane (bez ujawniania klucza)."""
+    _gate(prof, "ai_brief")
+    return ai_brief.status()
+
+
 @app.get("/")
 def root():
     return {
@@ -2014,6 +2051,8 @@ def root():
             "GET /analyze/{ticker}?horizon=1M|3M",
             "GET /rankings?horizon=1M|3M&limit=12&order=top|bottom",
             "GET /fundamentals/{ticker}",
+            "GET /ai/brief/{ticker}",
+            "GET /ai/status",
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}",
             "GET /signals",

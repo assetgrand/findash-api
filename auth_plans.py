@@ -41,7 +41,8 @@ PLAN_FEATURES: Dict[str, Set[str]] = {
         "report",
         "backtest_forecast",
         "backtest_strategy",
-        "crypto",  # gdy dodacie endpoint
+        "crypto",
+        "ai_brief",
     },
     "pro": {
         "analyze",
@@ -55,6 +56,7 @@ PLAN_FEATURES: Dict[str, Set[str]] = {
         "hybrid",
         "signals",
         "portfolio",
+        "ai_brief",
     },
 }
 
