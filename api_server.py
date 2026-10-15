@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-full-v1"
+API_BUILD = "ai-full-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov

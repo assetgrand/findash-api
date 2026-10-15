@@ -36,7 +36,7 @@ import requests
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip()
 CACHE_MINUTES = float(os.environ.get("AI_BRIEF_CACHE_MINUTES") or "180")
-MAX_HEADLINES = int(os.environ.get("AI_BRIEF_MAX_HEADLINES") or "10")
+MAX_HEADLINES = int(os.environ.get("AI_BRIEF_MAX_HEADLINES") or "16")
 
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
@@ -193,10 +193,11 @@ def _model_candidates() -> List[str]:
     # Sensowne zapasowe nazwy (API i tak odrzuci nieistniejące).
     defaults = [
         "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
         "gemini-2.5-flash",
-        "gemini-2.0-flash-lite",
         "gemini-flash-latest",
-        "gemini-1.5-flash",
     ]
     out: List[str] = []
     for m in [primary] + extras + defaults:
@@ -262,7 +263,8 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
 
     raise RuntimeError(
         f"Gemini unavailable after retries/fallbacks. Last error: {last_err}. "
-        "Try again in a minute or set GEMINI_MODEL / GEMINI_FALLBACK_MODELS."
+        "Usually temporary overload (503) or deprecated model name (404). "
+        "Wait 1–2 min, or set GEMINI_MODEL=gemini-3.5-flash-lite on Render."
     )
 
 
