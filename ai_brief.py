@@ -9,7 +9,7 @@ Flow:
 
 Env:
   GEMINI_API_KEY              – required
-  GEMINI_MODEL                – default gemini-2.0-flash
+  GEMINI_MODEL                – default gemini-3.8-flash
   AI_BRIEF_CACHE_MINUTES      – default 180
   AI_BRIEF_MAX_HEADLINES      – default 10
 """
@@ -34,7 +34,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip()
 CACHE_MINUTES = float(os.environ.get("AI_BRIEF_CACHE_MINUTES") or "180")
 MAX_HEADLINES = int(os.environ.get("AI_BRIEF_MAX_HEADLINES") or "10")
 
