@@ -22,11 +22,12 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-brief-v1"
+API_BUILD = "ai-full-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
 import ai_brief
+import ai_full
 
 # Klucz: najpierw ENV (produkcja), potem stała z core
 if os.environ.get("TWELVE_DATA_API_KEY"):
@@ -2001,6 +2002,80 @@ def crypto_rankings(
 
 
 
+
+@app.get("/ai/full/{ticker}")
+def ai_full_analysis(
+    ticker: str,
+    horizon: str = Query("1M", description="1M or 3M"),
+    refresh: bool = Query(False),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """
+    Full AI analysis: AssetCore quant (forecast + Hit%) + news + multi-agent synthesis.
+    AI may use Hit% feedback to calibrate confidence; it does NOT change model prices.
+    Standard/Pro (feature ai_brief).
+    """
+    _gate(prof, "ai_brief")
+    if not ai_full.configured():
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured on server")
+    t = ticker.upper().strip()
+    days = _horizon_days(horizon)
+    hz = "3M" if days > 30 else "1M"
+    try:
+        quant = _analyze_one(t, hz, fast=True, quality=False)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Quant analyze failed: {e}")
+    fundamentals = None
+    perspective = None
+    try:
+        fundamentals = core.get_comprehensive_fundamental_analysis(t)
+    except Exception as e:
+        print("[ai_full] fundamentals", e)
+    try:
+        perspective = core.get_3year_perspective(t, None)
+    except Exception as e:
+        print("[ai_full] perspective", e)
+    try:
+        data = ai_full.build_full(
+            t,
+            quant,
+            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+            perspective=perspective if isinstance(perspective, dict) else None,
+            horizon=hz,
+            use_cache=not refresh,
+        )
+    except Exception as e:
+        print("[ai_full] error", e)
+        raise HTTPException(status_code=502, detail=f"AI full failed: {e}")
+    data = dict(data)
+    data["plan"] = (prof.get("plan") or "demo").lower()
+    return data
+
+
+class AiFeedbackBody(BaseModel):
+    ticker: str
+    note: str = ""
+    narrative_ok: Optional[bool] = None
+    hit_rate: Optional[float] = None
+    horizon: str = "1M"
+
+
+@app.post("/ai/feedback")
+def ai_feedback(
+    body: AiFeedbackBody,
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Feedback only for AI calibration (Hit% / narrative). Does not change quant model."""
+    _gate(prof, "ai_brief")
+    return ai_full.add_feedback(
+        body.ticker,
+        hit_rate=body.hit_rate,
+        note=body.note,
+        narrative_ok=body.narrative_ok,
+        horizon=body.horizon,
+    )
+
+
 @app.get("/ai/brief/{ticker}")
 def ai_news_brief(
     ticker: str,
@@ -2052,6 +2127,8 @@ def root():
             "GET /rankings?horizon=1M|3M&limit=12&order=top|bottom",
             "GET /fundamentals/{ticker}",
             "GET /ai/brief/{ticker}",
+            "GET /ai/full/{ticker}",
+            "POST /ai/feedback",
             "GET /ai/status",
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}",
