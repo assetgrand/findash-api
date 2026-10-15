@@ -182,13 +182,33 @@ def fetch_headlines(ticker: str, limit: int = MAX_HEADLINES) -> List[Dict[str, s
 # Gemini
 # ---------------------------------------------------------------------------
 
+def _model_candidates() -> List[str]:
+    """Primary model + fallbacks when Google returns 503 / overload."""
+    primary = GEMINI_MODEL
+    extras = [
+        x.strip()
+        for x in (os.environ.get("GEMINI_FALLBACK_MODELS") or "").split(",")
+        if x.strip()
+    ]
+    # Sensowne zapasowe nazwy (API i tak odrzuci nieistniejące).
+    defaults = [
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-flash-latest",
+        "gemini-1.5-flash",
+    ]
+    out: List[str] = []
+    for m in [primary] + extras + defaults:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not configured")
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
+
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -196,16 +216,54 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
             "maxOutputTokens": 1024,
         },
     }
-    r = requests.post(url, json=body, timeout=45)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts)
-        return text.strip()
-    except Exception as e:
-        raise RuntimeError(f"Gemini parse error: {e} | body={str(data)[:300]}")
+
+    last_err = "unknown"
+    models = _model_candidates()
+    # 503 = przeciążenie — retry z backoff + inny model
+    for model in models:
+        for attempt in range(3):
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            try:
+                r = requests.post(url, json=body, timeout=60)
+            except requests.RequestException as e:
+                last_err = f"network: {e}"
+                time.sleep(1.5 * (attempt + 1))
+                continue
+
+            if r.status_code == 200:
+                data = r.json()
+                try:
+                    parts = data["candidates"][0]["content"]["parts"]
+                    text = "".join(p.get("text", "") for p in parts)
+                    return text.strip()
+                except Exception as e:
+                    last_err = f"parse ({model}): {e}"
+                    break
+
+            # 404 = zły model → następny model
+            if r.status_code == 404:
+                last_err = f"HTTP 404 model={model}"
+                print(f"[ai_brief] model unavailable: {model}")
+                break
+
+            # 429 / 503 = limit lub przeciążenie → poczekaj i spróbuj
+            if r.status_code in (429, 503):
+                last_err = f"HTTP {r.status_code} model={model}: {r.text[:200]}"
+                wait = 2.0 * (attempt + 1)
+                print(f"[ai_brief] {r.status_code} on {model}, retry in {wait}s")
+                time.sleep(wait)
+                continue
+
+            last_err = f"HTTP {r.status_code} model={model}: {r.text[:300]}"
+            break
+
+    raise RuntimeError(
+        f"Gemini unavailable after retries/fallbacks. Last error: {last_err}. "
+        "Try again in a minute or set GEMINI_MODEL / GEMINI_FALLBACK_MODELS."
+    )
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
