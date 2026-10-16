@@ -1,15 +1,15 @@
 """
-AI Full Analysis – AssetCore
+AI Full Analysis – AssetCore (ultimate desk synthesis)
 
-Łączy:
-  • liczby z Waszego silnika (prognoza, Hit%, fundamenty, 3Y)
-  • newsy (RSS)
-  • multi-agent Gemini (analyst → news → editor)
-  • feedback Hit% / jakości (tylko do AI – nie zmienia matematyki prognoz)
+Pakiet danych (nie „wiedza o wszystkim”, tylko to co system realnie ma):
+  • prognoza + Hit% + score (quant)
+  • pełniejsze fundamenty + makro kraju
+  • perspektywa 3Y
+  • newsy (RSS, więcej tytułów)
+  • feedback Hit% tylko do kalibracji pewności AI
 
-Env: te same co ai_brief (GEMINI_API_KEY, GEMINI_MODEL, …)
-     AI_FULL_CACHE_MINUTES (default 120)
-     AI_FEEDBACK_PATH (opcjonalnie ścieżka pliku JSON)
+Agenci: Fundamentals → Quant → World/News → Editor
+Ceny pochodzą WYŁĄCZNIE z modelu AssetCore.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v1"
+_BUILD = "ai-full-v3.1-safe"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "120")
@@ -37,9 +37,19 @@ _FB_PATH = Path(
 _MAX_FEEDBACK = 80
 
 _DISCLAIMER = (
-    "Full AI analysis combines AssetCore quantitative outputs with news context. "
+    "AssetCore desk synthesis: quantitative model outputs + fundamentals/macro + news. "
     "Price forecasts come from the AssetCore model, not from the LLM. "
-    "Not investment advice."
+    "Not omniscient; data can be incomplete or delayed. Not investment advice."
+)
+
+# Klucze metryk spółki (jeśli są w company_fundamentals)
+_FUND_METRIC_KEYS = (
+    "P/E", "Forward P/E", "PEG", "P/B", "P/S",
+    "ROE", "ROA", "ROIC",
+    "Profit Margin", "Operating Margin", "Gross Margin",
+    "Revenue Growth", "Earnings Growth",
+    "Debt/Equity", "Current Ratio",
+    "EPS", "Book Value", "Dividend Yield",
 )
 
 
@@ -48,7 +58,7 @@ def configured() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Feedback store (Hit% / quality → only for AI prompts)
+# Feedback
 # ---------------------------------------------------------------------------
 
 def _load_feedback() -> List[Dict[str, Any]]:
@@ -80,7 +90,6 @@ def add_feedback(
     narrative_ok: Optional[bool] = None,
     horizon: str = "1M",
 ) -> Dict[str, Any]:
-    """Zapis feedbacku dla AI (kalibracja pewności / tonu)."""
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "ticker": (ticker or "").upper().strip(),
@@ -102,7 +111,6 @@ def _feedback_for_prompt(ticker: str, limit: int = 12) -> str:
     rows = _load_feedback()
     if not rows:
         return "No prior AI feedback stored yet."
-    # najpierw ten ticker, potem globalne
     related = [r for r in rows if r.get("ticker") == t][-6:]
     global_ = [r for r in rows if r.get("ticker") != t][-limit:]
     pick = (related + global_)[-limit:]
@@ -114,7 +122,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 12) -> str:
             f"- {r.get('ticker')} {r.get('horizon')}: hit_rate={r.get('hit_rate')}, "
             f"narrative_ok={ok_s}, note={r.get('note') or '—'}"
         )
-    return "Recent feedback (for confidence calibration only):\n" + "\n".join(lines)
+    return "Recent feedback (confidence calibration only):\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +130,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 12) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3"
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -150,114 +158,287 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Desk pack (maximize real data into the LLM)
+# ---------------------------------------------------------------------------
+
+def _safe_num(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, (int, float, str, bool)):
+        return v
+    try:
+        return float(v)
+    except Exception:
+        return str(v)[:120]
+
+
+def _pack_fundamentals(fundamentals: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not fundamentals or not isinstance(fundamentals, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k in (
+        "sector",
+        "country_code",
+        "country_score",
+        "macro_rating",
+        "basic_company_score",
+        "comprehensive_company_score",
+        "sector_position_score",
+        "management_quality_score",
+        "growth_momentum_score",
+        "risk_assessment_score",
+        "innovation_score",
+        "analyst_revision_score",
+        "recommendation_momentum_score",
+        "combined_score",
+        "fundamental_rating",
+    ):
+        if fundamentals.get(k) is not None:
+            out[k] = _safe_num(fundamentals.get(k))
+
+    macro = fundamentals.get("macro_data")
+    if isinstance(macro, dict):
+        # skrót makro (inflacja, bezrobocie, stopy jeśli są)
+        out["macro_data"] = {
+            str(k): _safe_num(v) for k, v in list(macro.items())[:12]
+        }
+
+    cf = fundamentals.get("company_fundamentals")
+    if isinstance(cf, dict):
+        metrics = {}
+        for k in _FUND_METRIC_KEYS:
+            if cf.get(k) is not None:
+                metrics[k] = _safe_num(cf.get(k))
+        # wszystko inne numeryczne (limit)
+        for k, v in cf.items():
+            if k in metrics:
+                continue
+            if isinstance(v, (int, float)) and len(metrics) < 24:
+                metrics[str(k)] = v
+        if metrics:
+            out["company_metrics"] = metrics
+    return out
+
+
+def _pack_perspective(perspective: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not perspective or not isinstance(perspective, dict):
+        return {}
+    keys = (
+        "trend_3y",
+        "position_in_range",
+        "risk_of_drop_pct",
+        "upside_potential_pct",
+        "crash_risk_score",
+        "risk_tier",
+        "sharpe_ratio",
+        "volatility",
+        "best_analogy",
+        "best_similarity",
+        "hist_dd_p50",
+        "hist_dd_p75",
+        "hist_max_dd",
+        "duza_okazja",
+        "duze_zagrozenie",
+        "high_3y",
+        "low_3y",
+    )
+    return {k: _safe_num(perspective.get(k)) for k in keys if perspective.get(k) is not None}
+
+
+def _sector_peers(ticker: str, sector: Optional[str], limit: int = 6) -> List[str]:
+    """Peerzy z tego samego sektora (mapa w core), bez dodatkowego API."""
+    try:
+        import core_analysis as core
+        mapping = getattr(core, "sector_mapping", None) or {}
+        if not sector or sector in ("Unknown", "Index"):
+            sector = mapping.get(ticker.upper())
+        if not sector:
+            return []
+        peers = [t for t, s in mapping.items() if s == sector and t != ticker.upper()]
+        return peers[:limit]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
 
-def _agent_quant(ticker: str, quant: Dict[str, Any], feedback_blob: str) -> Dict[str, Any]:
-    prompt = f"""You are a quantitative research analyst for equity {ticker}.
+def _agent_fundamentals(ticker: str, desk: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = f"""You are a senior fundamental analyst at a buy-side desk covering {ticker}.
 
-AssetCore model outputs (AUTHORITATIVE for numbers — do not invent different prices):
-{json.dumps(quant, ensure_ascii=False, default=str)}
+Authoritative desk data (do not invent metrics that are missing/null):
+{json.dumps(desk, ensure_ascii=False, default=str)[:7000]}
+
+Return ONLY valid JSON:
+{{
+  "fundamentals_summary": "6-9 sentences: quality of business, profitability, growth, leverage, valuation vs sector if possible",
+  "strengths": ["..."],
+  "weaknesses": ["..."],
+  "macro_overlay": "2-4 sentences on country/macro vs company",
+  "fundamental_stance": "constructive|neutral|cautious",
+  "data_gaps": ["list metrics that are missing and limit confidence"]
+}}
+
+Rules:
+- Use only provided numbers. If a metric is null/missing, say so in data_gaps.
+- English. No buy/sell recommendation. No price targets of your own.
+"""
+    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
+    data = ai_brief._extract_json(raw)
+    if not data.get("fundamentals_summary"):
+        data["fundamentals_summary"] = str(data.get("raw") or raw)[:1500]
+    return data
+
+
+def _agent_quant(ticker: str, desk: Dict[str, Any], fund_view: Dict[str, Any], feedback_blob: str) -> Dict[str, Any]:
+    prompt = f"""You are a quantitative strategist for {ticker}.
+
+Desk quant + risk pack:
+{json.dumps(desk.get('quant', {}), ensure_ascii=False, default=str)}
+
+3Y perspective:
+{json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
+
+Fundamentals agent view:
+{json.dumps(fund_view, ensure_ascii=False)[:2500]}
 
 {feedback_blob}
 
 Return ONLY valid JSON:
 {{
-  "quant_summary": "4-6 sentences on what the numbers imply",
-  "hit_interpretation": "how reliable the model looks given hit_rate, mae, n_significant",
+  "quant_summary": "5-8 sentences on forecast, Hit%, score, technical context",
+  "hit_interpretation": "how trustworthy the model looks given hit_rate, mae, n_significant",
   "confidence_from_model": "low|medium|high",
-  "key_drivers": ["driver1", "driver2"],
-  "warnings": ["warning1"]
+  "key_drivers": ["..."],
+  "warnings": ["..."],
+  "horizon_notes": "what 1M vs 3Y risk implies together"
 }}
 
 Rules:
-- Treat predicted_change_pct / predicted_price as given; do not replace them.
-- If hit_rate is low or n_significant is small, confidence_from_model must be low or medium.
-- English only. No buy/sell recommendation.
+- predicted_change_pct and predicted_price are AUTHORITATIVE — do not replace them.
+- Low hit_rate or small n_significant → lower confidence_from_model.
+- English. No buy/sell.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.25)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
     data = ai_brief._extract_json(raw)
     if not data.get("quant_summary"):
-        data["quant_summary"] = str(data.get("raw") or raw)[:1200]
+        data["quant_summary"] = str(data.get("raw") or raw)[:1500]
     return data
 
 
-def _agent_world(ticker: str, headlines: List[Dict[str, str]], quant_view: Dict[str, Any]) -> Dict[str, Any]:
-    titles = "\n".join(f"- {h.get('title')}" for h in headlines[:12]) or "(no headlines)"
-    prompt = f"""You are a macro/news analyst for {ticker}.
+def _agent_world(
+    ticker: str,
+    headlines: List[Dict[str, str]],
+    fund_view: Dict[str, Any],
+    quant_view: Dict[str, Any],
+    desk: Dict[str, Any],
+) -> Dict[str, Any]:
+    titles = "\n".join(
+        f"- {h.get('title')}" + (f" ({h.get('source')})" if h.get("source") else "")
+        for h in headlines[:18]
+    ) or "(no headlines)"
+    peers = desk.get("sector_peers") or []
+    prompt = f"""You are a macro and news analyst for {ticker} (sector peers for context: {peers}).
 
-Quant desk view:
-{json.dumps(quant_view, ensure_ascii=False)[:2000]}
+Fundamentals stance: {json.dumps(fund_view.get('fundamental_stance'))}
+Quant view excerpt: {json.dumps(quant_view.get('quant_summary'))[:800]}
+Macro from desk: {json.dumps(desk.get('fundamentals', {}).get('macro_data', {}), ensure_ascii=False)[:1500]}
 
 Headlines:
 {titles}
 
 Return ONLY valid JSON:
 {{
-  "news_summary": "4-6 sentences",
+  "news_summary": "5-8 sentences",
   "sentiment": "bullish|bearish|neutral|mixed",
   "alignment_with_model": "supports|contradicts|mixed|unclear",
+  "alignment_with_fundamentals": "supports|contradicts|mixed|unclear",
   "world_risks": ["..."],
-  "themes": ["..."]
+  "themes": ["..."],
+  "catalysts": ["near-term events or themes to watch"]
 }}
 
-Rules: Do not invent earnings numbers. English only. No buy/sell.
+Rules: Do not invent earnings figures. English. No buy/sell.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.3)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.28)
     data = ai_brief._extract_json(raw)
     if not data.get("news_summary"):
-        data["news_summary"] = str(data.get("raw") or raw)[:1200]
+        data["news_summary"] = str(data.get("raw") or raw)[:1500]
     return data
 
 
 def _agent_editor(
     ticker: str,
-    quant: Dict[str, Any],
+    desk: Dict[str, Any],
+    fund_view: Dict[str, Any],
     quant_view: Dict[str, Any],
     world: Dict[str, Any],
     feedback_blob: str,
 ) -> Dict[str, Any]:
-    prompt = f"""You are the final editor for AssetCore Full Analysis on {ticker}.
+    prompt = f"""You are the Chief Investment Office editor for AssetCore covering {ticker}.
+Your job: produce the closest thing to an institutional one-pager using ONLY the desk pack.
+You do NOT replace the quant price forecast.
 
-QUANT numbers (do not change):
-{json.dumps(quant, ensure_ascii=False, default=str)}
+DESK QUANT (authoritative prices):
+{json.dumps(desk.get('quant', {}), ensure_ascii=False, default=str)}
 
-Quant agent:
-{json.dumps(quant_view, ensure_ascii=False)}
+FUNDAMENTALS pack:
+{json.dumps(desk.get('fundamentals', {}), ensure_ascii=False, default=str)[:4000]}
 
-News agent:
-{json.dumps(world, ensure_ascii=False)}
+3Y:
+{json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
+
+Agent — Fundamentals:
+{json.dumps(fund_view, ensure_ascii=False)[:3000]}
+
+Agent — Quant:
+{json.dumps(quant_view, ensure_ascii=False)[:2500]}
+
+Agent — News/Macro:
+{json.dumps(world, ensure_ascii=False)[:2500]}
 
 {feedback_blob}
 
+Sector peers (names only, for relative context — no peer prices unless in pack):
+{json.dumps(desk.get('sector_peers', []), ensure_ascii=False)}
+
 Return ONLY valid JSON:
 {{
-  "executive_summary": "6-10 sentence integrated brief",
-  "base_scenario": "what is most likely if model + news both roughly hold",
-  "risk_scenario": "what breaks the thesis",
+  "executive_summary": "10-14 sentences: integrated view of situation, fundamentals, forecast, news",
+  "situation_assessment": "where the company/stock stands now in 4-6 sentences",
+  "fundamentals_verdict": "4-6 sentences",
+  "base_scenario": "most likely path over the stated horizon if model holds",
+  "risk_scenario": "what breaks the thesis (drawdown / news / macro)",
+  "devil_advocate": "4-7 sentences: strongest case AGAINST the model-implied direction; force skepticism",
+  "key_objections": ["3-5 concrete objections"],
   "sentiment": "bullish|bearish|neutral|mixed",
   "confidence": "low|medium|high",
-  "model_vs_news": "short paragraph on agreement/disagreement",
-  "watchpoints": ["..."],
+  "model_vs_news": "agreement/disagreement paragraph",
+  "model_vs_fundamentals": "short paragraph",
+  "peer_context": "2-4 sentences on how this name sits vs sector peers list (qualitative only)",
+  "watchpoints": ["5-8 concrete watchpoints"],
   "uses_model_forecast": true
 }}
 
 Rules:
-- Price path must stay consistent with predicted_change_pct from QUANT (mention it, do not invent another %).
-- Confidence must respect hit_rate / feedback (low hit → lower confidence).
-- English. No explicit buy/sell.
+- Mention predicted_change_pct from DESK QUANT; do not invent a different forecast %.
+- Confidence must respect hit_rate and data_gaps (missing fundamentals → not high).
+- devil_advocate is mandatory even when sentiment is bullish — challenge the thesis.
+- English. No explicit buy/sell. Be specific, not generic filler.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.25)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
     data = ai_brief._extract_json(raw)
     if not data.get("executive_summary"):
-        data["executive_summary"] = str(data.get("raw") or raw)[:2000]
+        data["executive_summary"] = str(data.get("raw") or raw)[:2500]
+
     conf = str(data.get("confidence") or "medium").lower()
     if conf not in ("low", "medium", "high"):
         conf = "medium"
-    # twarda kalibracja z Hit%
+    quant = desk.get("quant") or {}
     try:
         hr = quant.get("hit_rate")
-        n = quant.get("n_significant") or quant.get("n_sig")
+        n = quant.get("n_significant")
         if hr is not None and float(hr) < 45:
             conf = "low"
         elif hr is not None and float(hr) < 55 and conf == "high":
@@ -266,12 +447,23 @@ Rules:
             conf = "medium"
     except Exception:
         pass
+    gaps = fund_view.get("data_gaps") or []
+    if isinstance(gaps, list) and len(gaps) >= 3 and conf == "high":
+        conf = "medium"
     data["confidence"] = conf
+
     sent = str(data.get("sentiment") or world.get("sentiment") or "neutral").lower()
     if sent not in ("bullish", "bearish", "neutral", "mixed"):
         sent = "neutral"
     data["sentiment"] = sent
     data["uses_model_forecast"] = True
+    if not data.get("devil_advocate"):
+        data["devil_advocate"] = (
+            "Counter-thesis not fully generated; treat confidence conservatively "
+            "and verify headlines and fundamentals independently."
+        )
+    if not isinstance(data.get("key_objections"), list):
+        data["key_objections"] = []
     return data
 
 
@@ -288,10 +480,6 @@ def build_full(
     horizon: str = "1M",
     use_cache: bool = True,
 ) -> Dict[str, Any]:
-    """
-    quant = wynik Waszego /analyze (dict).
-    fundamentals / perspective opcjonalne.
-    """
     t = (ticker or "").upper().strip()
     if not t:
         raise ValueError("Invalid ticker")
@@ -305,7 +493,14 @@ def build_full(
     if not configured():
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    # zbity pakiet liczb dla AI
+    fund_pack = _pack_fundamentals(fundamentals)
+    pers_pack = _pack_perspective(perspective)
+    sector = (
+        (fund_pack.get("sector") if fund_pack else None)
+        or quant.get("sector")
+    )
+    peers = _sector_peers(t, str(sector) if sector else None)
+
     q = {
         "ticker": t,
         "horizon": hz,
@@ -317,61 +512,73 @@ def build_full(
         "mae": quant.get("mae"),
         "n_significant": quant.get("n_significant"),
         "combined_score": quant.get("combined_score"),
-        "fundamental_rating": quant.get("fundamental_rating"),
+        "fundamental_rating": quant.get("fundamental_rating")
+        or fund_pack.get("fundamental_rating"),
         "rsi": quant.get("rsi"),
-        "sector": quant.get("sector"),
+        "sector": sector,
     }
-    if fundamentals:
-        q["fundamentals_excerpt"] = {
-            k: fundamentals.get(k)
-            for k in (
-                "score",
-                "rating",
-                "sector",
-                "macro_score",
-                "fundamental_rating",
-            )
-            if k in fundamentals or fundamentals.get(k) is not None
-        }
-    if perspective:
-        q["perspective_3y_excerpt"] = {
-            k: perspective.get(k)
-            for k in (
-                "trend_3y",
-                "risk_of_drop_pct",
-                "upside_potential_pct",
-                "crash_risk_score",
-                "risk_tier",
-                "position_in_range",
-            )
-            if perspective.get(k) is not None
-        }
+
+    desk = {
+        "quant": q,
+        "fundamentals": fund_pack,
+        "perspective_3y": pers_pack,
+        "sector_peers": peers,
+    }
 
     feedback_blob = _feedback_for_prompt(t)
-    headlines = ai_brief.fetch_headlines(t, limit=ai_brief.MAX_HEADLINES)
+    # Soft Hit% calibration for this run only (does not change quant math)
+    try:
+        hr = q.get("hit_rate")
+        mae = q.get("mae")
+        nsig = q.get("n_significant")
+        if hr is not None:
+            feedback_blob += (
+                f"\n\nLive model reliability for this ticker/horizon: "
+                f"hit_rate={hr}, mae={mae}, n_significant={nsig}. "
+                f"If hit_rate < 50, keep confidence low/medium and stress devil_advocate."
+            )
+    except Exception:
+        pass
+    headlines = ai_brief.fetch_headlines(t, limit=max(ai_brief.MAX_HEADLINES, 18))
 
-    quant_view = _agent_quant(t, q, feedback_blob)
-    world = _agent_world(t, headlines, quant_view)
-    final = _agent_editor(t, q, quant_view, world, feedback_blob)
+    fund_view = _agent_fundamentals(t, desk)
+    quant_view = _agent_quant(t, desk, fund_view, feedback_blob)
+    world = _agent_world(t, headlines, fund_view, quant_view, desk)
+    final = _agent_editor(t, desk, fund_view, quant_view, world, feedback_blob)
 
     out: Dict[str, Any] = {
         "ticker": t,
         "horizon": hz,
         "quant": q,
+        "fundamentals_pack": fund_pack,
+        "perspective_3y": pers_pack,
+        "sector_peers": peers,
         "executive_summary": final.get("executive_summary"),
+        "situation_assessment": final.get("situation_assessment"),
+        "fundamentals_verdict": final.get("fundamentals_verdict"),
+        "fundamentals_summary": fund_view.get("fundamentals_summary"),
         "base_scenario": final.get("base_scenario"),
         "risk_scenario": final.get("risk_scenario"),
         "sentiment": final.get("sentiment"),
         "confidence": final.get("confidence"),
         "model_vs_news": final.get("model_vs_news"),
+        "model_vs_fundamentals": final.get("model_vs_fundamentals"),
         "watchpoints": final.get("watchpoints") or [],
+        "devil_advocate": final.get("devil_advocate"),
+        "key_objections": final.get("key_objections") or [],
+        "peer_context": final.get("peer_context"),
         "quant_summary": quant_view.get("quant_summary"),
         "hit_interpretation": quant_view.get("hit_interpretation"),
         "news_summary": world.get("news_summary"),
         "alignment_with_model": world.get("alignment_with_model"),
+        "themes": world.get("themes") or [],
+        "world_risks": world.get("world_risks") or [],
+        "strengths": fund_view.get("strengths") or [],
+        "weaknesses": fund_view.get("weaknesses") or [],
+        "data_gaps": fund_view.get("data_gaps") or [],
         "headlines": [
-            {"title": h.get("title"), "link": h.get("link")}
-            for h in headlines[:10]
+            {"title": h.get("title"), "link": h.get("link"), "source": h.get("source")}
+            for h in headlines[:12]
         ],
         "engine": _BUILD,
         "model": ai_brief.GEMINI_MODEL,
