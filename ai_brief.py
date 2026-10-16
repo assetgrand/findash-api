@@ -214,7 +214,7 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 2048,
         },
     }
 
