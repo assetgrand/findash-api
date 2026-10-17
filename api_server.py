@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-full-v3"
+API_BUILD = "ai-full-v3.2-learn"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -2058,6 +2058,17 @@ class AiFeedbackBody(BaseModel):
     narrative_ok: Optional[bool] = None
     hit_rate: Optional[float] = None
     horizon: str = "1M"
+    quality: Optional[int] = Field(None, ge=1, le=5)
+    predicted_change_pct: Optional[float] = None
+
+
+class AiOutcomeBody(BaseModel):
+    ticker: str
+    horizon: str = "1M"
+    predicted_change_pct: Optional[float] = None
+    realized_change_pct: Optional[float] = None
+    hit_rate_at_forecast: Optional[float] = None
+    note: str = ""
 
 
 @app.post("/ai/feedback")
@@ -2073,7 +2084,35 @@ def ai_feedback(
         note=body.note,
         narrative_ok=body.narrative_ok,
         horizon=body.horizon,
+        quality=body.quality,
+        predicted_change_pct=body.predicted_change_pct,
     )
+
+
+@app.post("/ai/outcome")
+def ai_outcome(
+    body: AiOutcomeBody,
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Log predicted vs realized — AI confidence only."""
+    _gate(prof, "ai_brief")
+    return ai_full.log_outcome(
+        body.ticker,
+        horizon=body.horizon,
+        predicted_change_pct=body.predicted_change_pct,
+        realized_change_pct=body.realized_change_pct,
+        hit_rate_at_forecast=body.hit_rate_at_forecast,
+        note=body.note,
+    )
+
+
+@app.get("/ai/feedback/summary")
+def ai_feedback_summary(
+    ticker: Optional[str] = Query(None),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    _gate(prof, "ai_brief")
+    return ai_full.feedback_summary(ticker)
 
 
 @app.get("/ai/brief/{ticker}")
@@ -2129,6 +2168,8 @@ def root():
             "GET /ai/brief/{ticker}",
             "GET /ai/full/{ticker}",
             "POST /ai/feedback",
+            "POST /ai/outcome",
+            "GET /ai/feedback/summary",
             "GET /ai/status",
             "GET /perspective-3y/{ticker}",
             "GET /hybrid/{ticker}",

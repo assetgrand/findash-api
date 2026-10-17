@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v3.1-safe"
+_BUILD = "ai-full-v3.2-learn"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "120")
@@ -34,7 +34,7 @@ _FB_PATH = Path(
     os.environ.get("AI_FEEDBACK_PATH")
     or os.path.join(os.path.dirname(__file__), "ai_feedback.json")
 )
-_MAX_FEEDBACK = 80
+_MAX_FEEDBACK = 200
 
 _DISCLAIMER = (
     "AssetCore desk synthesis: quantitative model outputs + fundamentals/macro + news. "
@@ -89,13 +89,26 @@ def add_feedback(
     note: str = "",
     narrative_ok: Optional[bool] = None,
     horizon: str = "1M",
+    quality: Optional[int] = None,
+    predicted_change_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """User / system feedback for AI tone & confidence only — never changes quant prices."""
+    q = None
+    if quality is not None:
+        try:
+            q = max(1, min(5, int(quality)))
+        except Exception:
+            q = None
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
     row = {
+        "type": "feedback",
         "ts": datetime.now(timezone.utc).isoformat(),
         "ticker": (ticker or "").upper().strip(),
-        "horizon": horizon,
+        "horizon": hz,
         "hit_rate": hit_rate,
         "narrative_ok": narrative_ok,
+        "quality": q,
+        "predicted_change_pct": predicted_change_pct,
         "note": (note or "")[:500],
     }
     with _FB_LOCK:
@@ -106,23 +119,142 @@ def add_feedback(
     return {"ok": True, "stored": row, "n": len(rows)}
 
 
-def _feedback_for_prompt(ticker: str, limit: int = 12) -> str:
+def log_outcome(
+    ticker: str,
+    *,
+    horizon: str = "1M",
+    predicted_change_pct: Optional[float] = None,
+    realized_change_pct: Optional[float] = None,
+    hit_rate_at_forecast: Optional[float] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    """
+    Record predicted vs realized return after the horizon.
+    Calibrates AI confidence language only — does not retrain quant model.
+    """
+    pred = predicted_change_pct
+    real = realized_change_pct
+    direction_ok = None
+    abs_err = None
+    try:
+        if pred is not None and real is not None:
+            direction_ok = (float(pred) >= 0 and float(real) >= 0) or (
+                float(pred) < 0 and float(real) < 0
+            )
+            abs_err = abs(float(pred) - float(real))
+    except Exception:
+        pass
+    row = {
+        "type": "outcome",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "ticker": (ticker or "").upper().strip(),
+        "horizon": "3M" if str(horizon).upper().startswith("3") else "1M",
+        "predicted_change_pct": pred,
+        "realized_change_pct": real,
+        "direction_ok": direction_ok,
+        "abs_error_pct": abs_err,
+        "hit_rate": hit_rate_at_forecast,
+        "note": (note or "")[:500],
+    }
+    with _FB_LOCK:
+        rows = _load_feedback()
+        rows.append(row)
+        rows = rows[-_MAX_FEEDBACK:]
+        _save_feedback(rows)
+    return {"ok": True, "stored": row, "n": len(rows)}
+
+
+def feedback_summary(ticker: Optional[str] = None) -> Dict[str, Any]:
+    rows = _load_feedback()
+    t = (ticker or "").upper().strip() or None
+    if t:
+        rows = [r for r in rows if r.get("ticker") == t]
+    outcomes = [r for r in rows if r.get("type") == "outcome"]
+    feedbacks = [r for r in rows if r.get("type") != "outcome"]
+    dir_ok = [r for r in outcomes if r.get("direction_ok") is True]
+    dir_bad = [r for r in outcomes if r.get("direction_ok") is False]
+    narrative_yes = [r for r in feedbacks if r.get("narrative_ok") is True]
+    narrative_no = [r for r in feedbacks if r.get("narrative_ok") is False]
+    return {
+        "ok": True,
+        "n_total": len(rows),
+        "n_feedback": len(feedbacks),
+        "n_outcomes": len(outcomes),
+        "direction_ok_rate": (
+            round(100.0 * len(dir_ok) / max(len(dir_ok) + len(dir_bad), 1), 1)
+            if (dir_ok or dir_bad)
+            else None
+        ),
+        "narrative_ok_rate": (
+            round(
+                100.0 * len(narrative_yes) / max(len(narrative_yes) + len(narrative_no), 1),
+                1,
+            )
+            if (narrative_yes or narrative_no)
+            else None
+        ),
+        "recent": rows[-15:],
+    }
+
+
+def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
     t = (ticker or "").upper().strip()
     rows = _load_feedback()
     if not rows:
-        return "No prior AI feedback stored yet."
-    related = [r for r in rows if r.get("ticker") == t][-6:]
+        return "No prior AI feedback or outcomes stored yet."
+
+    related = [r for r in rows if r.get("ticker") == t][-8:]
     global_ = [r for r in rows if r.get("ticker") != t][-limit:]
     pick = (related + global_)[-limit:]
+
     lines = []
     for r in pick:
-        ok = r.get("narrative_ok")
-        ok_s = "yes" if ok is True else ("no" if ok is False else "n/a")
-        lines.append(
-            f"- {r.get('ticker')} {r.get('horizon')}: hit_rate={r.get('hit_rate')}, "
-            f"narrative_ok={ok_s}, note={r.get('note') or '—'}"
+        typ = r.get("type") or "feedback"
+        if typ == "outcome":
+            lines.append(
+                f"- OUTCOME {r.get('ticker')} {r.get('horizon')}: pred={r.get('predicted_change_pct')}% "
+                f"realized={r.get('realized_change_pct')}% direction_ok={r.get('direction_ok')} "
+                f"abs_err={r.get('abs_error_pct')} note={r.get('note') or '—'}"
+            )
+        else:
+            ok = r.get("narrative_ok")
+            ok_s = "yes" if ok is True else ("no" if ok is False else "n/a")
+            lines.append(
+                f"- FEEDBACK {r.get('ticker')} {r.get('horizon')}: hit_rate={r.get('hit_rate')}, "
+                f"quality={r.get('quality')}, narrative_ok={ok_s}, note={r.get('note') or '—'}"
+            )
+
+    outcomes = [r for r in rows if r.get("type") == "outcome" and r.get("direction_ok") is not None]
+    digest = ""
+    if outcomes:
+        ok_n = sum(1 for r in outcomes if r.get("direction_ok") is True)
+        rate = 100.0 * ok_n / len(outcomes)
+        digest = (
+            f"\nReliability digest (historical outcomes, n={len(outcomes)}): "
+            f"direction match rate ≈ {rate:.0f}%. "
+            f"If rate is low, keep confidence lower and strengthen devil_advocate."
         )
-    return "Recent feedback (confidence calibration only):\n" + "\n".join(lines)
+
+    gold = [
+        r
+        for r in rows
+        if r.get("type") != "outcome"
+        and r.get("narrative_ok") is True
+        and (r.get("quality") or 0) >= 4
+        and (r.get("note") or "").strip()
+    ][-5:]
+    few = ""
+    if gold:
+        few = "\nPreferred brief qualities (from rated examples):\n" + "\n".join(
+            f"- {g.get('note')}" for g in gold
+        )
+
+    return (
+        "Learning memory (confidence & style only — do not change price forecasts):\n"
+        + "\n".join(lines)
+        + digest
+        + few
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +262,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 12) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3.2"
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
