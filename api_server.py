@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-full-v3.2-learn"
+API_BUILD = "ai-board-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -369,6 +369,124 @@ def _precompute_all_once() -> None:
     print(f"[precompute] done, entries={n}")
 
 
+def _gemini_should_wait(err: BaseException) -> bool:
+    s = str(err).lower()
+    return any(
+        k in s
+        for k in (
+            "429",
+            "503",
+            "unavailable",
+            "overload",
+            "resource exhausted",
+            "rate",
+            "quota",
+            "timeout",
+            "timed out",
+        )
+    )
+
+
+_AI_BOARD_STATUS: Dict[str, Any] = {
+    "running": False,
+    "done": 0,
+    "total": 0,
+    "last_ticker": None,
+    "last_horizon": None,
+    "last_error": None,
+    "last_run_ts": None,
+}
+
+
+def _ai_board_one(ticker: str, horizon: str) -> None:
+    """One full AI brief. On Gemini limit/overload, wait and retry until it lands."""
+    t = ticker.upper().strip()
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    attempt = 0
+    while True:
+        try:
+            quant = _analyze_one(t, hz, fast=True, quality=False)
+            fundamentals = None
+            perspective = None
+            try:
+                fundamentals = core.get_comprehensive_fundamental_analysis(t)
+            except Exception as e:
+                print(f"[ai-board] fundamentals {t}: {e}")
+            try:
+                perspective = core.get_3year_perspective(t, None)
+            except Exception as e:
+                print(f"[ai-board] perspective {t}: {e}")
+            ai_full.build_full(
+                t,
+                quant,
+                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+                perspective=perspective if isinstance(perspective, dict) else None,
+                horizon=hz,
+                use_cache=True,
+            )
+            _AI_BOARD_STATUS["last_error"] = None
+            return
+        except Exception as e:
+            attempt += 1
+            _AI_BOARD_STATUS["last_error"] = f"{t}/{hz}: {e}"
+            if _gemini_should_wait(e) and attempt < 40:
+                wait = min(120.0, 15.0 + attempt * 8.0)
+                print(f"[ai-board] wait {wait:.0f}s {t}/{hz} ({e})")
+                time.sleep(wait)
+                continue
+            print(f"[ai-board] skip {t}/{hz} after {attempt}: {e}")
+            return
+
+
+def _ai_board_once() -> None:
+    if not ai_full.configured():
+        print("[ai-board] GEMINI_API_KEY missing — skip")
+        _AI_BOARD_STATUS["last_error"] = "GEMINI_API_KEY not set"
+        return
+    tickers = _ticker_list_for_precompute()
+    horizons = ("1M", "3M")
+    _AI_BOARD_STATUS["running"] = True
+    _AI_BOARD_STATUS["done"] = 0
+    _AI_BOARD_STATUS["total"] = len(tickers) * len(horizons)
+    _AI_BOARD_STATUS["last_error"] = None
+    pause = float(os.environ.get("AI_BOARD_PAUSE", "8"))
+    print(f"[ai-board] start {len(tickers)} tickers × 1M/3M")
+    try:
+        for hz in horizons:
+            for t in tickers:
+                _AI_BOARD_STATUS["last_ticker"] = t
+                _AI_BOARD_STATUS["last_horizon"] = hz
+                _ai_board_one(t, hz)
+                _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
+                time.sleep(pause)
+    finally:
+        _AI_BOARD_STATUS["running"] = False
+        _AI_BOARD_STATUS["last_run_ts"] = time.time()
+        print(f"[ai-board] done {_AI_BOARD_STATUS.get('done')}/{_AI_BOARD_STATUS.get('total')}")
+
+
+def _ai_board_worker() -> None:
+    """Po deployu: najpierw daj precompute policzyć prognozy, potem AI po kolei."""
+    time.sleep(8)
+    interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
+    while True:
+        if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
+            time.sleep(60)
+            continue
+        # Czekaj na pierwszą rundę prognoz (max ~45 min), potem i tak startuj.
+        for _ in range(270):
+            if _PRECOMPUTE_STATUS.get("last_full_run_ts"):
+                break
+            time.sleep(10)
+        try:
+            _ai_board_once()
+        except Exception as e:
+            print("[ai-board] worker:", e)
+            _AI_BOARD_STATUS["last_error"] = str(e)
+            _AI_BOARD_STATUS["running"] = False
+        time.sleep(max(interval, 3600))
+
+
 def _precompute_worker() -> None:
     time.sleep(2)  # API wstaje – od razu pierwsza runda (po cold start)
     while True:
@@ -530,6 +648,8 @@ def _startup():
     if _PRECOMPUTE_ENABLED:
         threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
         print(f"[precompute] worker ON interval={_PRECOMPUTE_INTERVAL}s")
+        threading.Thread(target=_ai_board_worker, name="ai-board", daemon=True).start()
+        print("[ai-board] worker ON (after first forecast round)")
         # Osobny szybki wątek: krypto zaraz po starcie dyno (nie czeka na kolejkę akcji)
         def _crypto_boot():
             time.sleep(1)
@@ -2167,6 +2287,7 @@ def root():
             "GET /fundamentals/{ticker}",
             "GET /ai/brief/{ticker}",
             "GET /ai/full/{ticker}",
+            "GET /ai/rankings?horizon=1M|3M",
             "POST /ai/feedback",
             "POST /ai/outcome",
             "GET /ai/feedback/summary",

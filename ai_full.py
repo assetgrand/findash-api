@@ -27,7 +27,7 @@ import ai_brief
 _BUILD = "ai-full-v3.2-learn"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "120")
+_CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
 
 _FB_LOCK = threading.Lock()
 _FB_PATH = Path(
