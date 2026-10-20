@@ -289,6 +289,45 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
                 _CACHE.pop(k, None)
 
 
+def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
+    """Slim rows from the in-memory AI cache (forecast stays the model number)."""
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    suffix = f"|{hz}|v3.2"
+    rows: List[Dict[str, Any]] = []
+    with _CACHE_LOCK:
+        items = list(_CACHE.items())
+    for key, row in items:
+        if not str(key).endswith(suffix):
+            continue
+        data = row.get("data") or {}
+        q = data.get("quant") or {}
+        if not isinstance(q, dict):
+            q = {}
+        rows.append(
+            {
+                "ticker": data.get("ticker") or q.get("ticker"),
+                "horizon": hz,
+                "current_price": q.get("current_price"),
+                "predicted_price": q.get("predicted_price"),
+                "predicted_change_pct": q.get("predicted_change_pct"),
+                "direction": q.get("direction"),
+                "hit_rate": q.get("hit_rate"),
+                "sector": q.get("sector"),
+                "fundamental_rating": q.get("fundamental_rating"),
+                "sentiment": data.get("sentiment"),
+                "confidence": data.get("confidence"),
+                "generated_at": data.get("generated_at"),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            r.get("predicted_change_pct") is None,
+            -(r.get("predicted_change_pct") or 0),
+        ),
+    )
+    return rows[: max(1, min(int(limit or 12), 50))]
+
+
 # ---------------------------------------------------------------------------
 # Desk pack (maximize real data into the LLM)
 # ---------------------------------------------------------------------------

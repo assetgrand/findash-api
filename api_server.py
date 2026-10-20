@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-board-v1"
+API_BUILD = "ai-board-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -466,16 +466,18 @@ def _ai_board_once() -> None:
 
 
 def _ai_board_worker() -> None:
-    """Po deployu: najpierw daj precompute policzyć prognozy, potem AI po kolei."""
-    time.sleep(8)
+    """Po deployu: krótki start, potem AI po kolei (nie blokuje prognoz)."""
+    time.sleep(15)
     interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
     while True:
         if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
             time.sleep(60)
             continue
-        # Czekaj na pierwszą rundę prognoz (max ~45 min), potem i tak startuj.
-        for _ in range(270):
-            if _PRECOMPUTE_STATUS.get("last_full_run_ts"):
+        # Preferuj gotowe prognozy, ale nie czekaj godzinę — max ~3 min.
+        for _ in range(18):
+            if _PRECOMPUTE_STATUS.get("last_full_run_ts") or int(
+                _PRECOMPUTE_STATUS.get("tickers_done") or 0
+            ) >= 3:
                 break
             time.sleep(10)
         try:
@@ -2263,11 +2265,53 @@ def ai_news_brief(
     return data
 
 
+@app.get("/ai/rankings")
+def ai_rankings(
+    horizon: str = Query("1M"),
+    limit: int = Query(12, ge=1, le=50),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Top AI briefs already computed after deploy. Fills in as the board finishes."""
+    _gate(prof, "ai_brief")
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    items = ai_full.ranking_rows(hz, limit=limit)
+    return {
+        "horizon": hz,
+        "items": items,
+        "count": len(items),
+        "status": {
+            "running": bool(_AI_BOARD_STATUS.get("running")),
+            "done": _AI_BOARD_STATUS.get("done") or 0,
+            "total": _AI_BOARD_STATUS.get("total") or 0,
+            "last_ticker": _AI_BOARD_STATUS.get("last_ticker"),
+            "last_horizon": _AI_BOARD_STATUS.get("last_horizon"),
+            "last_error": _AI_BOARD_STATUS.get("last_error"),
+            "last_run_ts": _AI_BOARD_STATUS.get("last_run_ts"),
+        },
+        "disclaimer": (
+            "Ranked by AssetCore forecast %. AI text is cached from the post-deploy board. "
+            "Not investment advice."
+        ),
+    }
+
+
 @app.get("/ai/status")
 def ai_status(prof: Dict[str, Any] = Depends(get_profile)):
     """Czy Gemini skonfigurowane (bez ujawniania klucza)."""
     _gate(prof, "ai_brief")
-    return ai_brief.status()
+    st = ai_brief.status()
+    if isinstance(st, dict):
+        st = dict(st)
+        st["board"] = {
+            "running": bool(_AI_BOARD_STATUS.get("running")),
+            "done": _AI_BOARD_STATUS.get("done") or 0,
+            "total": _AI_BOARD_STATUS.get("total") or 0,
+            "last_ticker": _AI_BOARD_STATUS.get("last_ticker"),
+            "last_horizon": _AI_BOARD_STATUS.get("last_horizon"),
+            "last_error": _AI_BOARD_STATUS.get("last_error"),
+            "last_run_ts": _AI_BOARD_STATUS.get("last_run_ts"),
+        }
+    return st
 
 
 @app.get("/")
