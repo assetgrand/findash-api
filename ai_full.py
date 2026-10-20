@@ -760,3 +760,92 @@ def build_full(
     }
     _cache_set(t, hz, out)
     return out
+
+
+def build_board_row(
+    ticker: str,
+    quant: Dict[str, Any],
+    *,
+    horizon: str = "1M",
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """
+    Fast path for the post-deploy Top 12 board:
+    one Gemini call only (not the 4-agent desk). Full analysis stays on /ai/full.
+    """
+    t = (ticker or "").upper().strip()
+    if not t:
+        raise ValueError("Invalid ticker")
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+
+    if use_cache:
+        hit = _cache_get(t, hz)
+        if hit:
+            return hit
+
+    if not configured():
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    q = {
+        "ticker": t,
+        "horizon": hz,
+        "current_price": quant.get("current_price"),
+        "predicted_price": quant.get("predicted_price"),
+        "predicted_change_pct": quant.get("predicted_change_pct"),
+        "direction": quant.get("direction"),
+        "hit_rate": quant.get("hit_rate"),
+        "mae": quant.get("mae"),
+        "n_significant": quant.get("n_significant"),
+        "combined_score": quant.get("combined_score"),
+        "fundamental_rating": quant.get("fundamental_rating"),
+        "rsi": quant.get("rsi"),
+        "sector": quant.get("sector"),
+    }
+
+    prompt = f"""You are a desk assistant. AssetCore model numbers below are FIXED — do not invent other prices or % forecasts.
+
+Model pack:
+{json.dumps(q, ensure_ascii=False, default=str)}
+
+Return ONLY valid JSON:
+{{
+  "executive_summary": "3-5 sentences: what the model says and caveats",
+  "sentiment": "bullish|neutral|bearish",
+  "confidence": "low|medium|high",
+  "watchpoints": ["2-4 short bullets"]
+}}
+Rules: if hit_rate < 50 use low/medium confidence; never change predicted_change_pct.
+"""
+    text = ai_brief._gemini_generate(prompt, temperature=0.25)
+    parsed = ai_brief._extract_json(text)
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    sent = str(parsed.get("sentiment") or "neutral").lower()
+    if sent not in ("bullish", "neutral", "bearish"):
+        sent = "neutral"
+    conf = str(parsed.get("confidence") or "medium").lower()
+    if conf not in ("low", "medium", "high"):
+        conf = "medium"
+    watches = parsed.get("watchpoints") or []
+    if not isinstance(watches, list):
+        watches = []
+
+    out: Dict[str, Any] = {
+        "ticker": t,
+        "horizon": hz,
+        "quant": q,
+        "executive_summary": parsed.get("executive_summary")
+        or f"{t}: model {q.get('predicted_change_pct')}% ({hz}), hit {q.get('hit_rate')}.",
+        "sentiment": sent,
+        "confidence": conf,
+        "watchpoints": [str(x)[:160] for x in watches[:4]],
+        "engine": "ai-board-fast-v1",
+        "model": ai_brief.GEMINI_MODEL,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
+        "disclaimer": _DISCLAIMER,
+        "board_fast": True,
+    }
+    _cache_set(t, hz, out)
+    return out
