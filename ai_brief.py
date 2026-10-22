@@ -34,7 +34,8 @@ import requests
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip()
+# Prefer models that actually answer quickly; override with GEMINI_MODEL on Render if needed
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 CACHE_MINUTES = float(os.environ.get("AI_BRIEF_CACHE_MINUTES") or "180")
 MAX_HEADLINES = int(os.environ.get("AI_BRIEF_MAX_HEADLINES") or "16")
 
@@ -183,27 +184,25 @@ def fetch_headlines(ticker: str, limit: int = MAX_HEADLINES) -> List[Dict[str, s
 # ---------------------------------------------------------------------------
 
 def _model_candidates() -> List[str]:
-    """Primary model + fallbacks when Google returns 503 / overload."""
+    """Primary + short fallback list so dead model names do not burn the whole request."""
     primary = GEMINI_MODEL
     extras = [
         x.strip()
         for x in (os.environ.get("GEMINI_FALLBACK_MODELS") or "").split(",")
         if x.strip()
     ]
-    # Sensowne zapasowe nazwy (API i tak odrzuci nieistniejące).
     defaults = [
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
         "gemini-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
     ]
     out: List[str] = []
     for m in [primary] + extras + defaults:
         if m and m not in out:
             out.append(m)
-    return out
+    return out[:6]
 
 
 def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
@@ -214,24 +213,24 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 3072,
         },
     }
 
     last_err = "unknown"
     models = _model_candidates()
-    # 503 = przeciążenie — retry z backoff + inny model
+    # Short timeout + few retries so the website gets a result instead of infinite loading
     for model in models:
-        for attempt in range(3):
+        for attempt in range(2):
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={GEMINI_API_KEY}"
             )
             try:
-                r = requests.post(url, json=body, timeout=60)
+                r = requests.post(url, json=body, timeout=35)
             except requests.RequestException as e:
                 last_err = f"network: {e}"
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
                 continue
 
             if r.status_code == 200:
@@ -239,21 +238,22 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
                 try:
                     parts = data["candidates"][0]["content"]["parts"]
                     text = "".join(p.get("text", "") for p in parts)
-                    return text.strip()
+                    if text and text.strip():
+                        return text.strip()
+                    last_err = f"empty response ({model})"
+                    break
                 except Exception as e:
                     last_err = f"parse ({model}): {e}"
                     break
 
-            # 404 = zły model → następny model
             if r.status_code == 404:
                 last_err = f"HTTP 404 model={model}"
                 print(f"[ai_brief] model unavailable: {model}")
                 break
 
-            # 429 / 503 = limit lub przeciążenie → poczekaj i spróbuj
             if r.status_code in (429, 503):
                 last_err = f"HTTP {r.status_code} model={model}: {r.text[:200]}"
-                wait = 2.0 * (attempt + 1)
+                wait = 1.5 * (attempt + 1)
                 print(f"[ai_brief] {r.status_code} on {model}, retry in {wait}s")
                 time.sleep(wait)
                 continue
@@ -263,8 +263,7 @@ def _gemini_generate(prompt: str, temperature: float = 0.3) -> str:
 
     raise RuntimeError(
         f"Gemini unavailable after retries/fallbacks. Last error: {last_err}. "
-        "Usually temporary overload (503) or deprecated model name (404). "
-        "Wait 1–2 min, or set GEMINI_MODEL=gemini-3.5-flash-lite on Render."
+        "Check GEMINI_API_KEY on Render and Generative Language API access."
     )
 
 

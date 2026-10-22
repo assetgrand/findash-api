@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-news-react-v1"
+API_BUILD = "ai-loads-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -2136,16 +2136,21 @@ def ai_full_analysis(
     ticker: str,
     horizon: str = Query("1M", description="1M or 3M"),
     refresh: bool = Query(False),
+    deep: int = Query(0, description="1 = slow 4-agent desk; default 0 = one solid synthesis that returns"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    Full AI analysis: AssetCore quant (forecast + Hit%) + news + multi-agent synthesis.
-    AI may use Hit% feedback to calibrate confidence; it does NOT change model prices.
-    Standard/Pro (feature ai_brief).
+    AI analysis for the UI.
+    Default (deep=0): quant + fundamentals + 3Y + news reaction + ONE Gemini call.
+    Must finish within proxy limits so the page actually shows a result.
+    deep=1: legacy 4-agent pipeline (slow, can time out on free Render).
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured on server")
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY not configured on server. Set it in Render Environment.",
+        )
     t = ticker.upper().strip()
     days = _horizon_days(horizon)
     hz = "3M" if days > 30 else "1M"
@@ -2164,19 +2169,31 @@ def ai_full_analysis(
     except Exception as e:
         print("[ai_full] perspective", e)
     try:
-        data = ai_full.build_full(
-            t,
-            quant,
-            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
-            perspective=perspective if isinstance(perspective, dict) else None,
-            horizon=hz,
-            use_cache=not refresh,
-        )
+        if int(deep or 0) == 1:
+            data = ai_full.build_full(
+                t,
+                quant,
+                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+                perspective=perspective if isinstance(perspective, dict) else None,
+                horizon=hz,
+                use_cache=not refresh,
+            )
+        else:
+            # Default path — this is what the website must use so analysis actually loads
+            data = ai_full.build_board_row(
+                t,
+                quant,
+                horizon=hz,
+                use_cache=not refresh,
+                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+                perspective=perspective if isinstance(perspective, dict) else None,
+            )
     except Exception as e:
         print("[ai_full] error", e)
-        raise HTTPException(status_code=502, detail=f"AI full failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
     data = dict(data)
     data["plan"] = (prof.get("plan") or "demo").lower()
+    data["mode"] = "deep" if int(deep or 0) == 1 else "standard"
     return data
 
 
