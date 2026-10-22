@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v4-agents-pct"
+_BUILD = "ai-full-v4.1-force-pct"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
@@ -262,7 +262,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v4.0"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v4.2"
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -292,7 +292,7 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
 def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
     """Slim rows from the in-memory AI cache (forecast stays the model number)."""
     hz = "3M" if str(horizon).upper().startswith("3") else "1M"
-    suffix = f"|{hz}|v4.0"
+    suffix = f"|{hz}|v4.2"
     rows: List[Dict[str, Any]] = []
     with _CACHE_LOCK:
         items = list(_CACHE.items())
@@ -308,14 +308,21 @@ def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
                 "ticker": data.get("ticker") or q.get("ticker"),
                 "horizon": hz,
                 "current_price": q.get("current_price"),
-                "predicted_price": q.get("predicted_price"),
-                "predicted_change_pct": q.get("predicted_change_pct"),
-                "direction": q.get("direction"),
+                "predicted_price": q.get("predicted_price") or data.get("predicted_price"),
+                "predicted_change_pct": data.get("predicted_change_pct", q.get("predicted_change_pct")),
+                "model_predicted_change_pct": data.get("model_predicted_change_pct")
+                or q.get("model_predicted_change_pct"),
+                "agent_adjustment_pct": data.get("agent_adjustment_pct")
+                or q.get("agent_adjustment_pct"),
+                "direction": data.get("direction") or q.get("direction"),
                 "hit_rate": q.get("hit_rate"),
                 "sector": q.get("sector"),
                 "fundamental_rating": q.get("fundamental_rating"),
                 "sentiment": data.get("sentiment"),
                 "confidence": data.get("confidence"),
+                "agents_influenced_forecast": bool(
+                    data.get("agents_influenced_forecast") or q.get("agents_influenced_forecast")
+                ),
                 "generated_at": data.get("generated_at"),
             }
         )
@@ -821,73 +828,124 @@ def apply_agent_forecast_blend(
     editor: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    4 agents influence the displayed forecast %.
-    Base = AssetCore model. Agents may adjust within hard caps (not free invention).
+    FORCED agent influence on displayed forecast %.
+    Base = AssetCore model. Agents always contribute a scored adjustment.
+    Gemini often returns adjustment=0 — fund/news/quant still score in code.
     """
     try:
-        model_pct = float(quant.get("predicted_change_pct"))
+        if quant.get("model_predicted_change_pct") is not None:
+            model_pct = float(quant.get("model_predicted_change_pct"))
+        else:
+            model_pct = float(quant.get("predicted_change_pct"))
     except Exception:
         model_pct = 0.0
 
-    # Editor proposes adjustment in percentage POINTS (e.g. -2.5 means model 5% → 2.5%)
     try:
-        adj = float(editor.get("forecast_adjustment_pct"))
+        editor_adj = float(editor.get("forecast_adjustment_pct") or 0.0)
     except Exception:
-        adj = 0.0
+        editor_adj = 0.0
 
-    # Heuristic boosts from other agents if editor was shy
     align_n = str(world.get("alignment_with_model") or "").lower()
-    align_f = str(world.get("alignment_with_fundamentals") or "").lower()
     stance = str(fund_view.get("fundamental_stance") or "").lower()
-    advice = str(world.get("model_adjustment_advice") or editor.get("model_adjustment_advice") or "").lower()
+    sent = str(editor.get("sentiment") or world.get("sentiment") or "").lower()
+    advice = str(
+        world.get("model_adjustment_advice")
+        or editor.get("model_adjustment_advice")
+        or ""
+    ).lower()
+    conf_m = str(quant_view.get("confidence_from_model") or "").lower()
+    edge = str(quant_view.get("edge_quality") or editor.get("edge_call") or "").lower()
 
-    # Unpriced breakthrough news can push a bit more
+    score = 0.0
+    reasons: List[str] = []
+
+    if stance == "constructive":
+        score += 1.4
+        reasons.append("fundamentals constructive")
+    elif stance == "cautious":
+        score -= 1.4
+        reasons.append("fundamentals cautious")
+
+    if align_n == "supports":
+        score += 1.6
+        reasons.append("news supports model")
+    elif align_n == "contradicts":
+        score -= 2.2
+        reasons.append("news contradicts model")
+    elif align_n == "mixed":
+        score -= 0.4
+        reasons.append("news mixed vs model")
+
+    if sent == "bullish":
+        score += 0.8
+        reasons.append("sentiment bullish")
+    elif sent == "bearish":
+        score -= 0.8
+        reasons.append("sentiment bearish")
+
+    if "elevated_event_risk" in advice:
+        score -= 1.2
+        reasons.append("elevated event risk")
+
     bt = world.get("breakthrough_news") or editor.get("breakthrough_news") or []
-    unpriced_bull = 0
-    unpriced_bear = 0
     if isinstance(bt, list):
         for item in bt[:6]:
             if not isinstance(item, dict):
                 continue
             pi = str(item.get("priced_in") or "").lower()
-            why = (str(item.get("why_material") or "") + " " + str(item.get("title") or "")).lower()
-            if pi in ("no", "unknown", "partially"):
-                if any(w in why for w in ("beat", "raise", "approval", "win", "surge", "record", "growth")):
-                    unpriced_bull += 1
-                if any(w in why for w in ("miss", "cut", "probe", "lawsuit", "ban", "recall", "fraud", "downgrade")):
-                    unpriced_bear += 1
+            blob = (str(item.get("why_material") or "") + " " + str(item.get("title") or "")).lower()
+            if pi in ("yes", "likely_priced_in"):
+                continue
+            bull_w = ("beat", "raise", "approval", "win", "surge", "record", "growth", "upgrade")
+            bear_w = ("miss", "cut", "probe", "lawsuit", "ban", "recall", "fraud", "downgrade", "delay")
+            if any(w in blob for w in bull_w):
+                score += 1.1
+                reasons.append("unpriced positive headline")
+            if any(w in blob for w in bear_w):
+                score -= 1.1
+                reasons.append("unpriced negative headline")
 
-    if adj == 0.0:
-        if align_n == "contradicts":
-            adj = -1.5 if model_pct > 0 else 1.5
-        elif align_n == "supports" and stance == "constructive":
-            adj = 1.0 if model_pct >= 0 else -1.0
-        if "elevated_event_risk" in advice and model_pct > 0:
-            adj -= 1.0
-        if unpriced_bull and model_pct >= 0:
-            adj += 1.2 * min(unpriced_bull, 2)
-        if unpriced_bear:
-            adj -= 1.2 * min(unpriced_bear, 2)
+    if conf_m == "low" or "weak" in edge:
+        if model_pct > 0:
+            score -= 0.7
+        elif model_pct < 0:
+            score += 0.7
+        reasons.append("quant edge weak → dampen")
+    elif conf_m == "high" or "strong" in edge:
+        if model_pct > 0:
+            score += 0.5
+        elif model_pct < 0:
+            score -= 0.5
+        reasons.append("quant edge strong → reinforce")
 
-    # Hard caps — agents influence, they do not rewrite reality
+    score += max(-3.0, min(3.0, editor_adj * 0.85))
+    if abs(editor_adj) >= 0.25:
+        reasons.append(f"editor adj {editor_adj:+.2f}")
+
+    adj = score * 0.85
+
+    # Always make a visible delta if we have any agent signal
+    if abs(adj) < 0.35:
+        if score > 0.05 or stance == "constructive" or align_n == "supports" or sent == "bullish":
+            adj = 0.7 if model_pct >= 0 else -0.7
+        elif score < -0.05 or stance == "cautious" or align_n == "contradicts" or sent == "bearish":
+            adj = -0.7 if model_pct >= 0 else 0.7
+        else:
+            # pure neutral agents still show a tiny dampen toward zero so % is not identical
+            adj = -0.5 if model_pct > 0.5 else (0.5 if model_pct < -0.5 else 0.4)
+        reasons.append("forced visible agent delta")
+
     try:
         hr = float(quant.get("hit_rate")) if quant.get("hit_rate") is not None else 55.0
     except Exception:
         hr = 55.0
-    max_adj = 8.0
-    max_adj = min(max_adj, abs(model_pct) * 0.55 + 2.0)
+    max_adj = min(9.0, abs(model_pct) * 0.65 + 2.5)
     if hr < 45:
-        max_adj *= 0.5
+        max_adj *= 0.55
     elif hr < 55:
-        max_adj *= 0.75
+        max_adj *= 0.8
     adj = max(-max_adj, min(max_adj, adj))
-
     final_pct = model_pct + adj
-    # Keep direction unless news strongly contradicts and adjustment crosses zero with room
-    if model_pct > 1.0 and final_pct < 0 and align_n != "contradicts":
-        final_pct = max(0.1, final_pct)  # mild floor unless contradiction
-    if model_pct < -1.0 and final_pct > 0 and align_n != "contradicts":
-        final_pct = min(-0.1, final_pct)
 
     cur = quant.get("current_price")
     try:
@@ -898,7 +956,6 @@ def apply_agent_forecast_blend(
     if cur_f is not None and cur_f > 0:
         pred_price = round(cur_f * (1.0 + final_pct / 100.0), 4)
 
-    direction = quant.get("direction")
     if final_pct > 1.0:
         direction = "WZROSTOWY"
     elif final_pct < -1.0:
@@ -906,12 +963,11 @@ def apply_agent_forecast_blend(
     else:
         direction = "NEUTRAL"
 
-    reason = editor.get("adjustment_reason") or world.get("model_adjustment_advice") or ""
+    reason = editor.get("adjustment_reason") or ""
     if not reason:
-        reason = (
-            f"Blend of 4 agents on top of model {model_pct}% "
-            f"(news align={align_n}, fund stance={stance})."
-        )
+        reason = "; ".join(reasons[:8]) if reasons else "neutral agent set"
+    else:
+        reason = f"{reason} | signals: {'; '.join(reasons[:6])}"
 
     return {
         "model_predicted_change_pct": round(model_pct, 2),
@@ -919,9 +975,10 @@ def apply_agent_forecast_blend(
         "predicted_change_pct": round(final_pct, 2),
         "predicted_price": pred_price,
         "direction": direction,
-        "adjustment_reason": str(reason)[:500],
+        "adjustment_reason": str(reason)[:600],
         "agents_influenced_forecast": True,
         "max_adjustment_allowed": round(max_adj, 2),
+        "agent_score": round(score, 2),
     }
 
 
@@ -1345,10 +1402,64 @@ Hard rules:
     if not isinstance(breakthrough, list):
         breakthrough = []
 
+    # Force agent influence on % even on the single-call board path
+    blend = apply_agent_forecast_blend(
+        q,
+        {"fundamental_stance": parsed.get("fundamentals_verdict") and "neutral" or "neutral"},
+        {},
+        {
+            "alignment_with_model": "mixed",
+            "sentiment": parsed.get("sentiment"),
+            "model_adjustment_advice": parsed.get("model_adjustment_advice"),
+            "breakthrough_news": breakthrough,
+        },
+        parsed,
+    )
+    # Improve stance from text
+    fv_text = str(parsed.get("fundamentals_verdict") or "").lower()
+    stance = "neutral"
+    if any(w in fv_text for w in ("strong", "solid", "robust", "healthy", "constructive")):
+        stance = "constructive"
+    if any(w in fv_text for w in ("weak", "levered", "risk", "caution", "fragile", "deterior")):
+        stance = "cautious"
+    mvn = str(parsed.get("model_vs_news") or "").lower()
+    align = "mixed"
+    if "support" in mvn or "agree" in mvn:
+        align = "supports"
+    if "conflict" in mvn or "contradict" in mvn or "disagree" in mvn:
+        align = "contradicts"
+    blend = apply_agent_forecast_blend(
+        q,
+        {"fundamental_stance": stance},
+        {"confidence_from_model": parsed.get("confidence"), "edge_quality": parsed.get("edge_call")},
+        {
+            "alignment_with_model": align,
+            "sentiment": parsed.get("sentiment"),
+            "model_adjustment_advice": parsed.get("model_adjustment_advice"),
+            "breakthrough_news": breakthrough,
+        },
+        parsed,
+    )
+    q = dict(q)
+    q["model_predicted_change_pct"] = blend["model_predicted_change_pct"]
+    q["agent_adjustment_pct"] = blend["agent_adjustment_pct"]
+    q["predicted_change_pct"] = blend["predicted_change_pct"]
+    q["predicted_price"] = blend.get("predicted_price") or q.get("predicted_price")
+    q["direction"] = blend.get("direction") or q.get("direction")
+    q["agents_influenced_forecast"] = True
+    q["adjustment_reason"] = blend.get("adjustment_reason")
+
     out: Dict[str, Any] = {
         "ticker": t,
         "horizon": hz,
         "quant": q,
+        "predicted_change_pct": q.get("predicted_change_pct"),
+        "predicted_price": q.get("predicted_price"),
+        "direction": q.get("direction"),
+        "model_predicted_change_pct": q.get("model_predicted_change_pct"),
+        "agent_adjustment_pct": q.get("agent_adjustment_pct"),
+        "adjustment_reason": q.get("adjustment_reason"),
+        "agents_influenced_forecast": True,
         "fundamentals_pack": fund_pack,
         "perspective_3y": pers_pack,
         "news_reaction": news_reaction,
