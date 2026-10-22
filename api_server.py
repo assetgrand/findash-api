@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-board-v1"
+API_BUILD = "ai-news-react-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -399,42 +399,56 @@ _AI_BOARD_STATUS: Dict[str, Any] = {
 
 
 def _ai_board_one(ticker: str, horizon: str) -> None:
-    """One full AI brief. On Gemini limit/overload, wait and retry until it lands."""
+    """Board row: quant + fundamentals + 3Y + headlines + one strong Gemini synthesis."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
     t = ticker.upper().strip()
     hz = "3M" if str(horizon).upper().startswith("3") else "1M"
-    attempt = 0
-    while True:
+    # Richer note needs more time than the old 3-line summary
+    budget = float(os.environ.get("AI_BOARD_TICKER_TIMEOUT", "90"))
+
+    def _run() -> None:
+        quant = _analyze_one(t, hz, fast=True, quality=False)
+        fundamentals = None
+        perspective = None
         try:
-            quant = _analyze_one(t, hz, fast=True, quality=False)
-            fundamentals = None
-            perspective = None
-            try:
-                fundamentals = core.get_comprehensive_fundamental_analysis(t)
-            except Exception as e:
-                print(f"[ai-board] fundamentals {t}: {e}")
-            try:
-                perspective = core.get_3year_perspective(t, None)
-            except Exception as e:
-                print(f"[ai-board] perspective {t}: {e}")
-            ai_full.build_full(
-                t,
-                quant,
-                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
-                perspective=perspective if isinstance(perspective, dict) else None,
-                horizon=hz,
-                use_cache=True,
-            )
+            fundamentals = core.get_comprehensive_fundamental_analysis(t)
+        except Exception as e:
+            print(f"[ai-board] fundamentals {t}: {e}")
+        try:
+            perspective = core.get_3year_perspective(t, None)
+        except Exception as e:
+            print(f"[ai-board] perspective {t}: {e}")
+        ai_full.build_board_row(
+            t,
+            quant,
+            horizon=hz,
+            use_cache=True,
+            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+            perspective=perspective if isinstance(perspective, dict) else None,
+        )
+
+    attempt = 0
+    while attempt < 3:
+        attempt += 1
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_run)
+                fut.result(timeout=budget)
             _AI_BOARD_STATUS["last_error"] = None
             return
+        except FuturesTimeout:
+            _AI_BOARD_STATUS["last_error"] = f"{t}/{hz}: timeout {budget:.0f}s"
+            print(f"[ai-board] timeout {t}/{hz}")
+            return
         except Exception as e:
-            attempt += 1
             _AI_BOARD_STATUS["last_error"] = f"{t}/{hz}: {e}"
-            if _gemini_should_wait(e) and attempt < 40:
-                wait = min(120.0, 15.0 + attempt * 8.0)
+            if _gemini_should_wait(e) and attempt < 3:
+                wait = min(20.0, 5.0 * attempt)
                 print(f"[ai-board] wait {wait:.0f}s {t}/{hz} ({e})")
                 time.sleep(wait)
                 continue
-            print(f"[ai-board] skip {t}/{hz} after {attempt}: {e}")
+            print(f"[ai-board] skip {t}/{hz}: {e}")
             return
 
 
@@ -444,21 +458,20 @@ def _ai_board_once() -> None:
         _AI_BOARD_STATUS["last_error"] = "GEMINI_API_KEY not set"
         return
     tickers = _ticker_list_for_precompute()
-    horizons = ("1M", "3M")
+    # Only 1M on board (table is 1M by default). Manual full AI still uses /ai/full.
+    pause = float(os.environ.get("AI_BOARD_PAUSE", "1"))
     _AI_BOARD_STATUS["running"] = True
     _AI_BOARD_STATUS["done"] = 0
-    _AI_BOARD_STATUS["total"] = len(tickers) * len(horizons)
+    _AI_BOARD_STATUS["total"] = len(tickers)
     _AI_BOARD_STATUS["last_error"] = None
-    pause = float(os.environ.get("AI_BOARD_PAUSE", "8"))
-    print(f"[ai-board] start {len(tickers)} tickers × 1M/3M")
+    print(f"[ai-board] fast 1M board: {len(tickers)} tickers")
     try:
-        for hz in horizons:
-            for t in tickers:
-                _AI_BOARD_STATUS["last_ticker"] = t
-                _AI_BOARD_STATUS["last_horizon"] = hz
-                _ai_board_one(t, hz)
-                _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
-                time.sleep(pause)
+        for t in tickers:
+            _AI_BOARD_STATUS["last_ticker"] = t
+            _AI_BOARD_STATUS["last_horizon"] = "1M"
+            _ai_board_one(t, "1M")
+            _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
+            time.sleep(pause)
     finally:
         _AI_BOARD_STATUS["running"] = False
         _AI_BOARD_STATUS["last_run_ts"] = time.time()
@@ -466,18 +479,13 @@ def _ai_board_once() -> None:
 
 
 def _ai_board_worker() -> None:
-    """Po deployu: najpierw daj precompute policzyć prognozy, potem AI po kolei."""
-    time.sleep(8)
+    """Po deployu: szybki board 1M (1× Gemini na spółkę), start po kilku sekundach."""
+    time.sleep(3)
     interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
     while True:
         if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
             time.sleep(60)
             continue
-        # Czekaj na pierwszą rundę prognoz (max ~45 min), potem i tak startuj.
-        for _ in range(270):
-            if _PRECOMPUTE_STATUS.get("last_full_run_ts"):
-                break
-            time.sleep(10)
         try:
             _ai_board_once()
         except Exception as e:
@@ -525,7 +533,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v8|{ticker}|{horizon_label}|{mode}|{day_key}|mp30"
+    cache_key = f"v8|{ticker}|{horizon_label}|{mode}|{day_key}|mp12"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -588,9 +596,9 @@ def _analyze_one(
     except Exception as e:
         print(f"predict error {ticker}: {e}")
 
-    # Hit% jak desktop: default max_points=30 (wcześniej 8 → niestabilne 25% na małych próbkach)
+    # Hit%: 12 punktów (std) / 18 (quality) — stabilny sample, bez skrajności 3 ani 30+
     hit_rate = mae = n_sig = None
-    max_pts = 40 if quality else 30
+    max_pts = 18 if quality else 12
     try:
         q = core.backtest_forecast_quality(
             df,
@@ -2263,11 +2271,53 @@ def ai_news_brief(
     return data
 
 
+@app.get("/ai/rankings")
+def ai_rankings(
+    horizon: str = Query("1M"),
+    limit: int = Query(12, ge=1, le=50),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Top AI briefs already computed after deploy. Fills in as the board finishes."""
+    _gate(prof, "ai_brief")
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    items = ai_full.ranking_rows(hz, limit=limit)
+    return {
+        "horizon": hz,
+        "items": items,
+        "count": len(items),
+        "status": {
+            "running": bool(_AI_BOARD_STATUS.get("running")),
+            "done": _AI_BOARD_STATUS.get("done") or 0,
+            "total": _AI_BOARD_STATUS.get("total") or 0,
+            "last_ticker": _AI_BOARD_STATUS.get("last_ticker"),
+            "last_horizon": _AI_BOARD_STATUS.get("last_horizon"),
+            "last_error": _AI_BOARD_STATUS.get("last_error"),
+            "last_run_ts": _AI_BOARD_STATUS.get("last_run_ts"),
+        },
+        "disclaimer": (
+            "Ranked by AssetCore forecast %. AI text is cached from the post-deploy board. "
+            "Not investment advice."
+        ),
+    }
+
+
 @app.get("/ai/status")
 def ai_status(prof: Dict[str, Any] = Depends(get_profile)):
     """Czy Gemini skonfigurowane (bez ujawniania klucza)."""
     _gate(prof, "ai_brief")
-    return ai_brief.status()
+    st = ai_brief.status()
+    if isinstance(st, dict):
+        st = dict(st)
+        st["board"] = {
+            "running": bool(_AI_BOARD_STATUS.get("running")),
+            "done": _AI_BOARD_STATUS.get("done") or 0,
+            "total": _AI_BOARD_STATUS.get("total") or 0,
+            "last_ticker": _AI_BOARD_STATUS.get("last_ticker"),
+            "last_horizon": _AI_BOARD_STATUS.get("last_horizon"),
+            "last_error": _AI_BOARD_STATUS.get("last_error"),
+            "last_run_ts": _AI_BOARD_STATUS.get("last_run_ts"),
+        }
+    return st
 
 
 @app.get("/")

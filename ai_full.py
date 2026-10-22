@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v3.2-learn"
+_BUILD = "ai-full-v3.5-news"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
@@ -262,7 +262,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3.2"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3.5"
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -287,6 +287,45 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
             oldest = sorted(_CACHE.items(), key=lambda kv: kv[1]["ts"])[:30]
             for k, _ in oldest:
                 _CACHE.pop(k, None)
+
+
+def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
+    """Slim rows from the in-memory AI cache (forecast stays the model number)."""
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    suffix = f"|{hz}|v3.5"
+    rows: List[Dict[str, Any]] = []
+    with _CACHE_LOCK:
+        items = list(_CACHE.items())
+    for key, row in items:
+        if not str(key).endswith(suffix):
+            continue
+        data = row.get("data") or {}
+        q = data.get("quant") or {}
+        if not isinstance(q, dict):
+            q = {}
+        rows.append(
+            {
+                "ticker": data.get("ticker") or q.get("ticker"),
+                "horizon": hz,
+                "current_price": q.get("current_price"),
+                "predicted_price": q.get("predicted_price"),
+                "predicted_change_pct": q.get("predicted_change_pct"),
+                "direction": q.get("direction"),
+                "hit_rate": q.get("hit_rate"),
+                "sector": q.get("sector"),
+                "fundamental_rating": q.get("fundamental_rating"),
+                "sentiment": data.get("sentiment"),
+                "confidence": data.get("confidence"),
+                "generated_at": data.get("generated_at"),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            r.get("predicted_change_pct") is None,
+            -(r.get("predicted_change_pct") or 0),
+        ),
+    )
+    return rows[: max(1, min(int(limit or 12), 50))]
 
 
 # ---------------------------------------------------------------------------
@@ -392,70 +431,313 @@ def _sector_peers(ticker: str, sector: Optional[str], limit: int = 6) -> List[st
         return []
 
 
+def _parse_news_date(published: Any):
+    """Best-effort parse of RSS pubDate / Atom updated → date."""
+    from datetime import datetime, timezone, timedelta
+    import email.utils
+
+    if published is None:
+        return None
+    s = str(published).strip()
+    if not s:
+        return None
+    # RFC 2822 (RSS)
+    try:
+        dt = email.utils.parsedate_to_datetime(s)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.date()
+    except Exception:
+        pass
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            raw = s.replace("Z", "+0000") if fmt.endswith("%z") and s.endswith("Z") else s
+            if fmt.endswith("Z") and s.endswith("Z"):
+                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.strptime(raw[: len(s)], fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.date()
+        except Exception:
+            continue
+    return None
+
+
+def _price_on_or_before(closes, target_date):
+    """Last close on or before target_date from a DatetimeIndex series."""
+    try:
+        import pandas as pd
+
+        if closes is None or len(closes) == 0:
+            return None, None
+        idx = pd.to_datetime(closes.index)
+        # normalize to dates
+        mask = idx.date <= target_date
+        if not mask.any():
+            return None, None
+        sub = closes[mask]
+        if len(sub) == 0:
+            return None, None
+        return float(sub.iloc[-1]), sub.index[-1]
+    except Exception:
+        return None, None
+
+
+def _price_n_sessions_after(closes, after_date, n: int = 3):
+    """Close n trading sessions after after_date (strictly later sessions)."""
+    try:
+        import pandas as pd
+
+        if closes is None or len(closes) == 0:
+            return None, None
+        idx = pd.to_datetime(closes.index)
+        later = closes[idx.date > after_date]
+        if len(later) == 0:
+            return None, None
+        pos = min(n - 1, len(later) - 1)
+        return float(later.iloc[pos]), later.index[pos]
+    except Exception:
+        return None, None
+
+
+def analyze_news_market_reaction(
+    ticker: str,
+    headlines: List[Dict[str, Any]],
+    *,
+    max_items: int = 8,
+) -> Dict[str, Any]:
+    """
+    For each headline with a date: measure if the market already moved after the news.
+    Does NOT change the quant forecast — only desk context for the AI.
+    """
+    t = (ticker or "").upper().strip()
+    out_items: List[Dict[str, Any]] = []
+    try:
+        import core_analysis as core
+        import pandas as pd
+
+        df = core.get_historical_prices(t, days=400)
+        if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+            return {
+                "ticker": t,
+                "items": [],
+                "note": "No price history to check post-news reaction.",
+            }
+        closes = df["Close"].astype(float).dropna()
+        last_close = float(closes.iloc[-1])
+        last_date = pd.to_datetime(closes.index[-1]).date()
+    except Exception as e:
+        return {"ticker": t, "items": [], "note": f"Price load failed: {e}"}
+
+    for h in (headlines or [])[: max_items + 4]:
+        title = (h.get("title") or "").strip()
+        if not title:
+            continue
+        pub = h.get("published") or h.get("pubDate") or ""
+        nd = _parse_news_date(pub)
+        row: Dict[str, Any] = {
+            "title": title[:280],
+            "published_raw": str(pub)[:80] if pub else None,
+            "news_date": nd.isoformat() if nd else None,
+            "source": (h.get("source") or "")[:60],
+            "link": (h.get("link") or "")[:400],
+        }
+        if nd is None:
+            row["priced_in_status"] = "unknown_date"
+            row["note"] = "No reliable publish date — cannot check if market already moved."
+            out_items.append(row)
+            if len(out_items) >= max_items:
+                break
+            continue
+
+        px0, _ = _price_on_or_before(closes, nd)
+        px1, _ = _price_n_sessions_after(closes, nd, n=1)
+        px3, _ = _price_n_sessions_after(closes, nd, n=3)
+        px5, _ = _price_n_sessions_after(closes, nd, n=5)
+
+        def _ret(a, b):
+            if a is None or b is None or a == 0:
+                return None
+            return round((b / a - 1.0) * 100.0, 2)
+
+        r1 = _ret(px0, px1)
+        r3 = _ret(px0, px3)
+        r5 = _ret(px0, px5)
+        r_now = _ret(px0, last_close)
+
+        # Heuristic: large move already happened after news → likely partially/fully priced
+        abs_move = max(
+            abs(r1 or 0),
+            abs(r3 or 0),
+            abs(r5 or 0),
+        )
+        days_ago = (last_date - nd).days if nd else None
+        if days_ago is not None and days_ago < 0:
+            status = "future_or_bad_date"
+        elif abs_move >= 4.0 or (r_now is not None and abs(r_now) >= 5.0 and (days_ago or 0) <= 14):
+            status = "likely_priced_in"
+        elif abs_move >= 1.5:
+            status = "partially_priced"
+        elif days_ago is not None and days_ago <= 2 and abs_move < 1.5:
+            status = "fresh_limited_reaction"
+        elif days_ago is not None and days_ago > 21:
+            status = "stale_news"
+        else:
+            status = "reaction_unclear"
+
+        row.update(
+            {
+                "price_before": round(px0, 4) if px0 is not None else None,
+                "ret_1s_pct": r1,
+                "ret_3s_pct": r3,
+                "ret_5s_pct": r5,
+                "ret_since_news_to_now_pct": r_now,
+                "sessions_since_news_est": days_ago,
+                "priced_in_status": status,
+            }
+        )
+        out_items.append(row)
+        if len(out_items) >= max_items:
+            break
+
+    # Flag possible breakthrough-sized market moves (for AI attention)
+    material = [
+        x
+        for x in out_items
+        if x.get("priced_in_status") in ("likely_priced_in", "partially_priced", "fresh_limited_reaction")
+        and (
+            abs(x.get("ret_3s_pct") or 0) >= 3
+            or abs(x.get("ret_since_news_to_now_pct") or 0) >= 4
+            or x.get("priced_in_status") == "fresh_limited_reaction"
+        )
+    ]
+
+    return {
+        "ticker": t,
+        "as_of_price": round(last_close, 4),
+        "as_of_date": last_date.isoformat(),
+        "items": out_items,
+        "material_candidates": material[:5],
+        "note": (
+            "priced_in_status is a price-reaction heuristic after the news date, "
+            "not a claim that the headline caused the move. AI must still judge if news is breakthrough."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
 
-def _agent_fundamentals(ticker: str, desk: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = f"""You are a senior fundamental analyst at a buy-side desk covering {ticker}.
+def _calibrate_confidence(
+    conf: str,
+    quant: Dict[str, Any],
+    fund_view: Optional[Dict[str, Any]] = None,
+    world: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Hard rules so AI confidence tracks model reliability + data quality."""
+    c = str(conf or "medium").lower()
+    if c not in ("low", "medium", "high"):
+        c = "medium"
+    try:
+        hr = quant.get("hit_rate")
+        n = quant.get("n_significant")
+        mae = quant.get("mae")
+        if hr is not None:
+            hr_f = float(hr)
+            if hr_f < 42:
+                c = "low"
+            elif hr_f < 52 and c == "high":
+                c = "medium"
+            elif hr_f >= 65 and n is not None and int(n) >= 6 and c == "low":
+                c = "medium"
+        if n is not None and int(n) < 4 and c == "high":
+            c = "medium"
+        if mae is not None and float(mae) > 12 and c == "high":
+            c = "medium"
+    except Exception:
+        pass
+    gaps = (fund_view or {}).get("data_gaps") or []
+    if isinstance(gaps, list) and len(gaps) >= 3 and c == "high":
+        c = "medium"
+    align = str((world or {}).get("alignment_with_model") or "").lower()
+    if align == "contradicts" and c == "high":
+        c = "medium"
+    return c
 
-Authoritative desk data (do not invent metrics that are missing/null):
-{json.dumps(desk, ensure_ascii=False, default=str)[:7000]}
+
+def _agent_fundamentals(ticker: str, desk: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = f"""You are a senior fundamental analyst at a top long-only desk covering {ticker}.
+Write like an internal memo, not marketing copy.
+
+Authoritative desk data (never invent missing metrics):
+{json.dumps(desk, ensure_ascii=False, default=str)[:7500]}
 
 Return ONLY valid JSON:
 {{
-  "fundamentals_summary": "6-9 sentences: quality of business, profitability, growth, leverage, valuation vs sector if possible",
-  "strengths": ["..."],
-  "weaknesses": ["..."],
-  "macro_overlay": "2-4 sentences on country/macro vs company",
+  "fundamentals_summary": "8-12 sentences: business quality, margins, growth durability, balance sheet, valuation vs peers if data allows, and what the rating/score actually implies",
+  "strengths": ["3-5 specific strengths tied to numbers in the pack"],
+  "weaknesses": ["3-5 specific weaknesses or open risks"],
+  "macro_overlay": "3-5 sentences: country/macro vs this company's earnings sensitivity",
   "fundamental_stance": "constructive|neutral|cautious",
-  "data_gaps": ["list metrics that are missing and limit confidence"]
+  "valuation_read": "cheap|fair|rich|unknown — based only on provided multiples",
+  "data_gaps": ["metrics missing that should lower confidence"]
 }}
 
 Rules:
-- Use only provided numbers. If a metric is null/missing, say so in data_gaps.
-- English. No buy/sell recommendation. No price targets of your own.
+- Cite concrete figures from the pack (P/E, margins, scores, rating) when present.
+- If fundamentals are thin, say so and lean cautious — do not bluff.
+- English. No buy/sell. No personal price targets.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.18)
     data = ai_brief._extract_json(raw)
     if not data.get("fundamentals_summary"):
-        data["fundamentals_summary"] = str(data.get("raw") or raw)[:1500]
+        data["fundamentals_summary"] = str(data.get("raw") or raw)[:1800]
     return data
 
 
 def _agent_quant(ticker: str, desk: Dict[str, Any], fund_view: Dict[str, Any], feedback_blob: str) -> Dict[str, Any]:
-    prompt = f"""You are a quantitative strategist for {ticker}.
+    prompt = f"""You are a quantitative strategist for {ticker}. Your job is brutal honesty about model reliability.
 
-Desk quant + risk pack:
+Desk quant:
 {json.dumps(desk.get('quant', {}), ensure_ascii=False, default=str)}
 
-3Y perspective:
+3Y risk pack:
 {json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
 
-Fundamentals agent view:
-{json.dumps(fund_view, ensure_ascii=False)[:2500]}
+Fundamentals agent:
+{json.dumps(fund_view, ensure_ascii=False)[:2800]}
 
 {feedback_blob}
 
 Return ONLY valid JSON:
 {{
-  "quant_summary": "5-8 sentences on forecast, Hit%, score, technical context",
-  "hit_interpretation": "how trustworthy the model looks given hit_rate, mae, n_significant",
+  "quant_summary": "7-10 sentences: direction, predicted_change_pct, RSI/score context, and whether the setup is clean or noisy",
+  "hit_interpretation": "explicit: what hit_rate, mae, n_significant mean for trusting THIS forecast (e.g. hit 48% = coin-flip edge; hit 70%+ with n>=6 = usable edge)",
   "confidence_from_model": "low|medium|high",
-  "key_drivers": ["..."],
-  "warnings": ["..."],
-  "horizon_notes": "what 1M vs 3Y risk implies together"
+  "edge_quality": "weak|moderate|strong",
+  "key_drivers": ["3-5 drivers grounded in the quant pack"],
+  "warnings": ["2-5 model-risk warnings"],
+  "horizon_notes": "how 1M/3M forecast interacts with 3Y drop/crash risk if present"
 }}
 
 Rules:
-- predicted_change_pct and predicted_price are AUTHORITATIVE — do not replace them.
-- Low hit_rate or small n_significant → lower confidence_from_model.
+- predicted_change_pct and predicted_price are FIXED — never replace them with your own %.
+- Map reliability roughly: hit<45 or n<4 → low; hit 45-58 → medium at best; hit>=62 and n>=6 → medium/high only if MAE is not extreme.
+- If model direction conflicts with fundamental_stance, flag it in warnings.
 - English. No buy/sell.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.18)
     data = ai_brief._extract_json(raw)
     if not data.get("quant_summary"):
-        data["quant_summary"] = str(data.get("raw") or raw)[:1500]
+        data["quant_summary"] = str(data.get("raw") or raw)[:1800]
     return data
 
 
@@ -467,36 +749,67 @@ def _agent_world(
     desk: Dict[str, Any],
 ) -> Dict[str, Any]:
     titles = "\n".join(
-        f"- {h.get('title')}" + (f" ({h.get('source')})" if h.get("source") else "")
+        f"- {h.get('title')}"
+        + (f" | date={h.get('published')}" if h.get("published") else "")
+        + (f" ({h.get('source')})" if h.get("source") else "")
         for h in headlines[:18]
     ) or "(no headlines)"
     peers = desk.get("sector_peers") or []
-    prompt = f"""You are a macro and news analyst for {ticker} (sector peers for context: {peers}).
+    q = desk.get("quant") or {}
+    reaction = desk.get("news_reaction") or {}
+    prompt = f"""You are a macro and news risk analyst for {ticker}.
+Peers (context only): {peers}
+Model direction: {q.get('direction')} | model %: {q.get('predicted_change_pct')} | hit: {q.get('hit_rate')}
 
 Fundamentals stance: {json.dumps(fund_view.get('fundamental_stance'))}
-Quant view excerpt: {json.dumps(quant_view.get('quant_summary'))[:800]}
+Quant excerpt: {json.dumps(quant_view.get('quant_summary'))[:900]}
 Macro from desk: {json.dumps(desk.get('fundamentals', {}).get('macro_data', {}), ensure_ascii=False)[:1500]}
 
-Headlines:
+Headlines (with dates when available):
 {titles}
+
+MARKET REACTION AFTER NEWS DATES (measured from price history — not causation proof):
+{json.dumps(reaction, ensure_ascii=False, default=str)[:4500]}
+
+Your job:
+1) Flag any BREAKTHROUGH / material news (earnings shock, guidance, regulation, M&A, major product, fraud, macro shock).
+2) For each material item, use news_date + priced_in_status + ret_*_pct to say whether the market ALREADY moved after that date.
+3) Say whether residual (not-yet-priced) risk/opportunity remains for the model horizon.
 
 Return ONLY valid JSON:
 {{
-  "news_summary": "5-8 sentences",
+  "news_summary": "6-9 sentences",
   "sentiment": "bullish|bearish|neutral|mixed",
   "alignment_with_model": "supports|contradicts|mixed|unclear",
   "alignment_with_fundamentals": "supports|contradicts|mixed|unclear",
-  "world_risks": ["..."],
-  "themes": ["..."],
-  "catalysts": ["near-term events or themes to watch"]
+  "breakthrough_news": [
+    {{
+      "title": "...",
+      "news_date": "YYYY-MM-DD or null",
+      "why_material": "1-2 sentences",
+      "priced_in": "yes|partially|no|unknown",
+      "evidence": "cite ret_1s/ret_3s/ret_since or unknown_date"
+    }}
+  ],
+  "model_adjustment_advice": "keep_model_path|treat_as_stale_shock|elevated_event_risk — explain in 2-4 sentences WITHOUT inventing a new forecast %",
+  "world_risks": ["3-5 concrete external risks"],
+  "themes": ["2-5 themes"],
+  "catalysts": ["2-5 near-term catalysts"],
+  "noise_vs_signal": "1-3 sentences"
 }}
 
-Rules: Do not invent earnings figures. English. No buy/sell.
+Rules:
+- Do not invent earnings numbers not in headlines.
+- If priced_in_status is likely_priced_in, do NOT claim the news is still a fresh unpriced catalyst.
+- If fresh_limited_reaction on a clearly major headline, flag elevated event risk.
+- English. No buy/sell. Never replace predicted_change_pct.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.28)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.2)
     data = ai_brief._extract_json(raw)
     if not data.get("news_summary"):
-        data["news_summary"] = str(data.get("raw") or raw)[:1500]
+        data["news_summary"] = str(data.get("raw") or raw)[:1800]
+    if not isinstance(data.get("breakthrough_news"), list):
+        data["breakthrough_news"] = []
     return data
 
 
@@ -508,81 +821,70 @@ def _agent_editor(
     world: Dict[str, Any],
     feedback_blob: str,
 ) -> Dict[str, Any]:
-    prompt = f"""You are the Chief Investment Office editor for AssetCore covering {ticker}.
-Your job: produce the closest thing to an institutional one-pager using ONLY the desk pack.
-You do NOT replace the quant price forecast.
+    quant = desk.get("quant") or {}
+    prompt = f"""You are CIO desk editor for AssetCore covering {ticker}.
+Produce an institutional one-pager that feels sharper than a generic LLM summary.
+You MUST integrate ALL four lenses: quant model, fundamentals, 3Y risk, news/macro.
+You must NOT invent a different price forecast than the desk quant.
 
-DESK QUANT (authoritative prices):
-{json.dumps(desk.get('quant', {}), ensure_ascii=False, default=str)}
+DESK QUANT (authoritative):
+{json.dumps(quant, ensure_ascii=False, default=str)}
 
 FUNDAMENTALS pack:
-{json.dumps(desk.get('fundamentals', {}), ensure_ascii=False, default=str)[:4000]}
+{json.dumps(desk.get('fundamentals', {}), ensure_ascii=False, default=str)[:4200]}
 
 3Y:
 {json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
 
 Agent — Fundamentals:
-{json.dumps(fund_view, ensure_ascii=False)[:3000]}
+{json.dumps(fund_view, ensure_ascii=False)[:3200]}
 
 Agent — Quant:
-{json.dumps(quant_view, ensure_ascii=False)[:2500]}
+{json.dumps(quant_view, ensure_ascii=False)[:2800]}
 
 Agent — News/Macro:
-{json.dumps(world, ensure_ascii=False)[:2500]}
+{json.dumps(world, ensure_ascii=False)[:2800]}
 
 {feedback_blob}
 
-Sector peers (names only, for relative context — no peer prices unless in pack):
-{json.dumps(desk.get('sector_peers', []), ensure_ascii=False)}
+Peers: {json.dumps(desk.get('sector_peers', []), ensure_ascii=False)}
 
 Return ONLY valid JSON:
 {{
-  "executive_summary": "10-14 sentences: integrated view of situation, fundamentals, forecast, news",
-  "situation_assessment": "where the company/stock stands now in 4-6 sentences",
-  "fundamentals_verdict": "4-6 sentences",
-  "base_scenario": "most likely path over the stated horizon if model holds",
-  "risk_scenario": "what breaks the thesis (drawdown / news / macro)",
-  "devil_advocate": "4-7 sentences: strongest case AGAINST the model-implied direction; force skepticism",
-  "key_objections": ["3-5 concrete objections"],
+  "executive_summary": "12-16 sentences: coherent thesis tying model forecast, hit reliability, fundamentals, and news. State predicted_change_pct and hit_rate explicitly once.",
+  "situation_assessment": "4-7 sentences on where the stock sits now (technical + fundamental + narrative)",
+  "fundamentals_verdict": "4-7 sentences",
+  "base_scenario": "most likely path over the horizon IF the model edge is real",
+  "risk_scenario": "path if model is wrong or a catalyst hits (include drawdown language from 3Y pack when present)",
+  "devil_advocate": "5-8 sentences: strongest case AGAINST the model-implied direction — mandatory, specific, not generic",
+  "key_objections": ["4-6 concrete objections"],
   "sentiment": "bullish|bearish|neutral|mixed",
   "confidence": "low|medium|high",
-  "model_vs_news": "agreement/disagreement paragraph",
-  "model_vs_fundamentals": "short paragraph",
-  "peer_context": "2-4 sentences on how this name sits vs sector peers list (qualitative only)",
-  "watchpoints": ["5-8 concrete watchpoints"],
+  "model_vs_news": "paragraph: supports / conflicts / mixed",
+  "model_vs_fundamentals": "paragraph",
+  "peer_context": "2-4 qualitative sentences",
+  "watchpoints": ["6-9 concrete, checkable watchpoints"],
+  "edge_call": "one sentence: is the desk edge usable, marginal, or noise given hit_rate and sample size",
   "uses_model_forecast": true
 }}
 
-Rules:
-- Mention predicted_change_pct from DESK QUANT; do not invent a different forecast %.
-- Confidence must respect hit_rate and data_gaps (missing fundamentals → not high).
-- devil_advocate is mandatory even when sentiment is bullish — challenge the thesis.
-- English. No explicit buy/sell. Be specific, not generic filler.
+Hard rules:
+1) Use desk predicted_change_pct; never invent another %.
+2) Confidence: hit<45 or thin sample → low; do not call high unless hit is solid AND fundamentals/news are not contradicting.
+3) If news contradicts model, say so clearly and keep confidence capped.
+4) No buy/sell labels. English. Specific numbers over vague adjectives.
 """
-    raw = ai_brief._gemini_generate(prompt, temperature=0.22)
+    raw = ai_brief._gemini_generate(prompt, temperature=0.18)
     data = ai_brief._extract_json(raw)
     if not data.get("executive_summary"):
-        data["executive_summary"] = str(data.get("raw") or raw)[:2500]
+        data["executive_summary"] = str(data.get("raw") or raw)[:2800]
 
-    conf = str(data.get("confidence") or "medium").lower()
-    if conf not in ("low", "medium", "high"):
-        conf = "medium"
-    quant = desk.get("quant") or {}
-    try:
-        hr = quant.get("hit_rate")
-        n = quant.get("n_significant")
-        if hr is not None and float(hr) < 45:
-            conf = "low"
-        elif hr is not None and float(hr) < 55 and conf == "high":
-            conf = "medium"
-        if n is not None and int(n) < 4 and conf == "high":
-            conf = "medium"
-    except Exception:
-        pass
-    gaps = fund_view.get("data_gaps") or []
-    if isinstance(gaps, list) and len(gaps) >= 3 and conf == "high":
-        conf = "medium"
-    data["confidence"] = conf
+    data["confidence"] = _calibrate_confidence(
+        str(data.get("confidence") or "medium"),
+        quant if isinstance(quant, dict) else {},
+        fund_view,
+        world,
+    )
 
     sent = str(data.get("sentiment") or world.get("sentiment") or "neutral").lower()
     if sent not in ("bullish", "bearish", "neutral", "mixed"):
@@ -591,11 +893,19 @@ Rules:
     data["uses_model_forecast"] = True
     if not data.get("devil_advocate"):
         data["devil_advocate"] = (
-            "Counter-thesis not fully generated; treat confidence conservatively "
-            "and verify headlines and fundamentals independently."
+            "Counter-thesis incomplete; treat confidence conservatively and verify "
+            "headlines, hit sample size, and fundamentals independently."
         )
     if not isinstance(data.get("key_objections"), list):
         data["key_objections"] = []
+    if not data.get("edge_call"):
+        try:
+            hr = quant.get("hit_rate")
+            data["edge_call"] = (
+                f"Model hit_rate={hr}: treat edge as informational until sample size and alignment improve."
+            )
+        except Exception:
+            data["edge_call"] = "Edge quality unclear — verify hit_rate and n_significant."
     return data
 
 
@@ -672,6 +982,8 @@ def build_full(
     except Exception:
         pass
     headlines = ai_brief.fetch_headlines(t, limit=max(ai_brief.MAX_HEADLINES, 18))
+    news_reaction = analyze_news_market_reaction(t, headlines, max_items=8)
+    desk["news_reaction"] = news_reaction
 
     fund_view = _agent_fundamentals(t, desk)
     quant_view = _agent_quant(t, desk, fund_view, feedback_blob)
@@ -685,6 +997,9 @@ def build_full(
         "fundamentals_pack": fund_pack,
         "perspective_3y": pers_pack,
         "sector_peers": peers,
+        "news_reaction": news_reaction,
+        "breakthrough_news": world.get("breakthrough_news") or [],
+        "model_adjustment_advice": world.get("model_adjustment_advice"),
         "executive_summary": final.get("executive_summary"),
         "situation_assessment": final.get("situation_assessment"),
         "fundamentals_verdict": final.get("fundamentals_verdict"),
@@ -699,6 +1014,7 @@ def build_full(
         "devil_advocate": final.get("devil_advocate"),
         "key_objections": final.get("key_objections") or [],
         "peer_context": final.get("peer_context"),
+        "edge_call": final.get("edge_call"),
         "quant_summary": quant_view.get("quant_summary"),
         "hit_interpretation": quant_view.get("hit_interpretation"),
         "news_summary": world.get("news_summary"),
@@ -709,7 +1025,12 @@ def build_full(
         "weaknesses": fund_view.get("weaknesses") or [],
         "data_gaps": fund_view.get("data_gaps") or [],
         "headlines": [
-            {"title": h.get("title"), "link": h.get("link"), "source": h.get("source")}
+            {
+                "title": h.get("title"),
+                "link": h.get("link"),
+                "source": h.get("source"),
+                "published": h.get("published"),
+            }
             for h in headlines[:12]
         ],
         "engine": _BUILD,
@@ -718,6 +1039,194 @@ def build_full(
         "cached": False,
         "disclaimer": _DISCLAIMER,
         "feedback_injected": True,
+    }
+    _cache_set(t, hz, out)
+    return out
+
+
+def build_board_row(
+    ticker: str,
+    quant: Dict[str, Any],
+    *,
+    horizon: str = "1M",
+    use_cache: bool = True,
+    fundamentals: Optional[Dict[str, Any]] = None,
+    perspective: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Board / quick desk note: quant + fundamentals + 3Y + headlines in ONE strong synthesis.
+    Still not the 4-agent full desk (that is /ai/full), but much richer than a 3-line summary.
+    """
+    t = (ticker or "").upper().strip()
+    if not t:
+        raise ValueError("Invalid ticker")
+    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+
+    if use_cache:
+        hit = _cache_get(t, hz)
+        if hit:
+            return hit
+
+    if not configured():
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    fund_pack = _pack_fundamentals(fundamentals)
+    pers_pack = _pack_perspective(perspective)
+    sector = (fund_pack.get("sector") if fund_pack else None) or quant.get("sector")
+
+    q = {
+        "ticker": t,
+        "horizon": hz,
+        "current_price": quant.get("current_price"),
+        "predicted_price": quant.get("predicted_price"),
+        "predicted_change_pct": quant.get("predicted_change_pct"),
+        "direction": quant.get("direction"),
+        "hit_rate": quant.get("hit_rate"),
+        "mae": quant.get("mae"),
+        "n_significant": quant.get("n_significant"),
+        "combined_score": quant.get("combined_score"),
+        "fundamental_rating": quant.get("fundamental_rating")
+        or fund_pack.get("fundamental_rating"),
+        "rsi": quant.get("rsi"),
+        "sector": sector,
+    }
+
+    headlines: List[Dict[str, str]] = []
+    try:
+        headlines = ai_brief.fetch_headlines(t, limit=12)
+    except Exception as e:
+        print(f"[ai_board] headlines {t}: {e}")
+
+    news_reaction = analyze_news_market_reaction(t, headlines, max_items=8)
+
+    titles = "\n".join(
+        f"- {h.get('title')}"
+        + (f" | date={h.get('published')}" if h.get("published") else "")
+        + (f" ({h.get('source')})" if h.get("source") else "")
+        for h in headlines[:12]
+    ) or "(no recent headlines)"
+
+    feedback_blob = _feedback_for_prompt(t)
+    prompt = f"""You are a senior multi-asset desk analyst at AssetCore writing an institutional board note on {t}.
+Integrate: quant model, fundamentals, 3Y risk, AND news with whether the market already priced it.
+Model prices and predicted_change_pct are FIXED — never invent a different forecast %.
+
+QUANT (authoritative):
+{json.dumps(q, ensure_ascii=False, default=str)}
+
+FUNDAMENTALS pack:
+{json.dumps(fund_pack, ensure_ascii=False, default=str)[:3500]}
+
+3Y RISK pack:
+{json.dumps(pers_pack, ensure_ascii=False, default=str)}
+
+HEADLINES:
+{titles}
+
+NEWS DATE → PRICE REACTION (from history; not proof of causation):
+{json.dumps(news_reaction, ensure_ascii=False, default=str)[:4500]}
+
+{feedback_blob}
+
+Return ONLY valid JSON:
+{{
+  "executive_summary": "10-14 dense sentences including forecast %, hit_rate, and whether any breakthrough news looks unpriced vs already moved",
+  "situation_assessment": "4-6 sentences",
+  "fundamentals_verdict": "3-5 sentences",
+  "base_scenario": "most likely path over {hz} if model holds",
+  "risk_scenario": "what breaks the thesis",
+  "devil_advocate": "5-7 sentences against model direction",
+  "breakthrough_news": [
+    {{
+      "title": "...",
+      "news_date": "YYYY-MM-DD or null",
+      "why_material": "...",
+      "priced_in": "yes|partially|no|unknown",
+      "evidence": "cite ret_1s/ret_3s/ret_since or unknown_date"
+    }}
+  ],
+  "model_adjustment_advice": "keep_model_path|treat_as_stale_shock|elevated_event_risk — 2-4 sentences, no new forecast %",
+  "key_objections": ["4-6 concrete objections"],
+  "sentiment": "bullish|bearish|neutral|mixed",
+  "confidence": "low|medium|high",
+  "model_vs_news": "short paragraph",
+  "model_vs_fundamentals": "short paragraph",
+  "edge_call": "one sentence on desk edge quality",
+  "watchpoints": ["5-8 concrete watchpoints"],
+  "uses_model_forecast": true
+}}
+
+Hard rules:
+1) If a headline is material AND priced_in_status is likely_priced_in, say residual impact is limited.
+2) If material AND fresh_limited_reaction, flag elevated event risk (do not invent a new %).
+3) hit_rate < 45 or n_significant < 4 → confidence low.
+4) English. No buy/sell.
+"""
+    text = ai_brief._gemini_generate(prompt, temperature=0.15)
+    parsed = ai_brief._extract_json(text)
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    conf = _calibrate_confidence(
+        str(parsed.get("confidence") or "medium"),
+        q,
+        {"data_gaps": [] if fund_pack else ["fundamentals missing"]},
+        {"alignment_with_model": "mixed" if "conflict" in str(parsed.get("model_vs_news") or "").lower() else None},
+    )
+    sent = str(parsed.get("sentiment") or "neutral").lower()
+    if sent not in ("bullish", "bearish", "neutral", "mixed"):
+        sent = "neutral"
+
+    watches = parsed.get("watchpoints") or []
+    if not isinstance(watches, list):
+        watches = []
+    objections = parsed.get("key_objections") or []
+    if not isinstance(objections, list):
+        objections = []
+    breakthrough = parsed.get("breakthrough_news") or []
+    if not isinstance(breakthrough, list):
+        breakthrough = []
+
+    out: Dict[str, Any] = {
+        "ticker": t,
+        "horizon": hz,
+        "quant": q,
+        "fundamentals_pack": fund_pack,
+        "perspective_3y": pers_pack,
+        "news_reaction": news_reaction,
+        "breakthrough_news": breakthrough[:6],
+        "model_adjustment_advice": parsed.get("model_adjustment_advice"),
+        "executive_summary": parsed.get("executive_summary")
+        or f"{t}: model {q.get('predicted_change_pct')}% ({hz}), hit {q.get('hit_rate')}.",
+        "situation_assessment": parsed.get("situation_assessment"),
+        "fundamentals_verdict": parsed.get("fundamentals_verdict"),
+        "base_scenario": parsed.get("base_scenario"),
+        "risk_scenario": parsed.get("risk_scenario"),
+        "devil_advocate": parsed.get("devil_advocate")
+        or "Counter-thesis incomplete — verify news and hit sample independently.",
+        "key_objections": [str(x)[:200] for x in objections[:6]],
+        "sentiment": sent,
+        "confidence": conf,
+        "model_vs_news": parsed.get("model_vs_news"),
+        "model_vs_fundamentals": parsed.get("model_vs_fundamentals"),
+        "edge_call": parsed.get("edge_call"),
+        "watchpoints": [str(x)[:180] for x in watches[:8]],
+        "headlines": [
+            {
+                "title": h.get("title"),
+                "link": h.get("link"),
+                "source": h.get("source"),
+                "published": h.get("published"),
+            }
+            for h in headlines[:10]
+        ],
+        "engine": "ai-board-news-react-v1",
+        "model": ai_brief.GEMINI_MODEL,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
+        "disclaimer": _DISCLAIMER,
+        "board_fast": True,
+        "uses_model_forecast": True,
     }
     _cache_set(t, hz, out)
     return out
