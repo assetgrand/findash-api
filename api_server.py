@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-loads-v1"
+API_BUILD = "ai-4agents-pct-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -2136,14 +2136,12 @@ def ai_full_analysis(
     ticker: str,
     horizon: str = Query("1M", description="1M or 3M"),
     refresh: bool = Query(False),
-    deep: int = Query(0, description="1 = slow 4-agent desk; default 0 = one solid synthesis that returns"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    AI analysis for the UI.
-    Default (deep=0): quant + fundamentals + 3Y + news reaction + ONE Gemini call.
-    Must finish within proxy limits so the page actually shows a result.
-    deep=1: legacy 4-agent pipeline (slow, can time out on free Render).
+    Full 4-agent AI desk (always):
+      Fundamentals → Quant → World/News → Editor
+    Agents may adjust the displayed forecast % within hard caps on top of AssetCore model base.
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
@@ -2169,51 +2167,28 @@ def ai_full_analysis(
     except Exception as e:
         print("[ai_full] perspective", e)
     try:
-        if int(deep or 0) == 1:
-            data = ai_full.build_full(
-                t,
-                quant,
-                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
-                perspective=perspective if isinstance(perspective, dict) else None,
-                horizon=hz,
-                use_cache=not refresh,
-            )
-        else:
-            # Default path — this is what the website must use so analysis actually loads
-            data = ai_full.build_board_row(
-                t,
-                quant,
-                horizon=hz,
-                use_cache=not refresh,
-                fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
-                perspective=perspective if isinstance(perspective, dict) else None,
-            )
+        data = ai_full.build_full(
+            t,
+            quant,
+            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+            perspective=perspective if isinstance(perspective, dict) else None,
+            horizon=hz,
+            use_cache=not refresh,
+        )
     except Exception as e:
         print("[ai_full] error", e)
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
     data = dict(data)
     data["plan"] = (prof.get("plan") or "demo").lower()
-    data["mode"] = "deep" if int(deep or 0) == 1 else "standard"
+    data["mode"] = "four_agents"
+    data["agents_used"] = data.get("agents_used") or [
+        "fundamentals",
+        "quant",
+        "world_news",
+        "editor",
+    ]
     return data
 
-
-class AiFeedbackBody(BaseModel):
-    ticker: str
-    note: str = ""
-    narrative_ok: Optional[bool] = None
-    hit_rate: Optional[float] = None
-    horizon: str = "1M"
-    quality: Optional[int] = Field(None, ge=1, le=5)
-    predicted_change_pct: Optional[float] = None
-
-
-class AiOutcomeBody(BaseModel):
-    ticker: str
-    horizon: str = "1M"
-    predicted_change_pct: Optional[float] = None
-    realized_change_pct: Optional[float] = None
-    hit_rate_at_forecast: Optional[float] = None
-    note: str = ""
 
 
 @app.post("/ai/feedback")

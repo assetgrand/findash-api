@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v3.5-news"
+_BUILD = "ai-full-v4-agents-pct"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
@@ -262,7 +262,7 @@ def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v3.5"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v4.0"
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -292,7 +292,7 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
 def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
     """Slim rows from the in-memory AI cache (forecast stays the model number)."""
     hz = "3M" if str(horizon).upper().startswith("3") else "1M"
-    suffix = f"|{hz}|v3.5"
+    suffix = f"|{hz}|v4.0"
     rows: List[Dict[str, Any]] = []
     with _CACHE_LOCK:
         items = list(_CACHE.items())
@@ -813,6 +813,118 @@ Rules:
     return data
 
 
+def apply_agent_forecast_blend(
+    quant: Dict[str, Any],
+    fund_view: Dict[str, Any],
+    quant_view: Dict[str, Any],
+    world: Dict[str, Any],
+    editor: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    4 agents influence the displayed forecast %.
+    Base = AssetCore model. Agents may adjust within hard caps (not free invention).
+    """
+    try:
+        model_pct = float(quant.get("predicted_change_pct"))
+    except Exception:
+        model_pct = 0.0
+
+    # Editor proposes adjustment in percentage POINTS (e.g. -2.5 means model 5% → 2.5%)
+    try:
+        adj = float(editor.get("forecast_adjustment_pct"))
+    except Exception:
+        adj = 0.0
+
+    # Heuristic boosts from other agents if editor was shy
+    align_n = str(world.get("alignment_with_model") or "").lower()
+    align_f = str(world.get("alignment_with_fundamentals") or "").lower()
+    stance = str(fund_view.get("fundamental_stance") or "").lower()
+    advice = str(world.get("model_adjustment_advice") or editor.get("model_adjustment_advice") or "").lower()
+
+    # Unpriced breakthrough news can push a bit more
+    bt = world.get("breakthrough_news") or editor.get("breakthrough_news") or []
+    unpriced_bull = 0
+    unpriced_bear = 0
+    if isinstance(bt, list):
+        for item in bt[:6]:
+            if not isinstance(item, dict):
+                continue
+            pi = str(item.get("priced_in") or "").lower()
+            why = (str(item.get("why_material") or "") + " " + str(item.get("title") or "")).lower()
+            if pi in ("no", "unknown", "partially"):
+                if any(w in why for w in ("beat", "raise", "approval", "win", "surge", "record", "growth")):
+                    unpriced_bull += 1
+                if any(w in why for w in ("miss", "cut", "probe", "lawsuit", "ban", "recall", "fraud", "downgrade")):
+                    unpriced_bear += 1
+
+    if adj == 0.0:
+        if align_n == "contradicts":
+            adj = -1.5 if model_pct > 0 else 1.5
+        elif align_n == "supports" and stance == "constructive":
+            adj = 1.0 if model_pct >= 0 else -1.0
+        if "elevated_event_risk" in advice and model_pct > 0:
+            adj -= 1.0
+        if unpriced_bull and model_pct >= 0:
+            adj += 1.2 * min(unpriced_bull, 2)
+        if unpriced_bear:
+            adj -= 1.2 * min(unpriced_bear, 2)
+
+    # Hard caps — agents influence, they do not rewrite reality
+    try:
+        hr = float(quant.get("hit_rate")) if quant.get("hit_rate") is not None else 55.0
+    except Exception:
+        hr = 55.0
+    max_adj = 8.0
+    max_adj = min(max_adj, abs(model_pct) * 0.55 + 2.0)
+    if hr < 45:
+        max_adj *= 0.5
+    elif hr < 55:
+        max_adj *= 0.75
+    adj = max(-max_adj, min(max_adj, adj))
+
+    final_pct = model_pct + adj
+    # Keep direction unless news strongly contradicts and adjustment crosses zero with room
+    if model_pct > 1.0 and final_pct < 0 and align_n != "contradicts":
+        final_pct = max(0.1, final_pct)  # mild floor unless contradiction
+    if model_pct < -1.0 and final_pct > 0 and align_n != "contradicts":
+        final_pct = min(-0.1, final_pct)
+
+    cur = quant.get("current_price")
+    try:
+        cur_f = float(cur) if cur is not None else None
+    except Exception:
+        cur_f = None
+    pred_price = None
+    if cur_f is not None and cur_f > 0:
+        pred_price = round(cur_f * (1.0 + final_pct / 100.0), 4)
+
+    direction = quant.get("direction")
+    if final_pct > 1.0:
+        direction = "WZROSTOWY"
+    elif final_pct < -1.0:
+        direction = "SPADKOWY"
+    else:
+        direction = "NEUTRAL"
+
+    reason = editor.get("adjustment_reason") or world.get("model_adjustment_advice") or ""
+    if not reason:
+        reason = (
+            f"Blend of 4 agents on top of model {model_pct}% "
+            f"(news align={align_n}, fund stance={stance})."
+        )
+
+    return {
+        "model_predicted_change_pct": round(model_pct, 2),
+        "agent_adjustment_pct": round(adj, 2),
+        "predicted_change_pct": round(final_pct, 2),
+        "predicted_price": pred_price,
+        "direction": direction,
+        "adjustment_reason": str(reason)[:500],
+        "agents_influenced_forecast": True,
+        "max_adjustment_allowed": round(max_adj, 2),
+    }
+
+
 def _agent_editor(
     ticker: str,
     desk: Dict[str, Any],
@@ -822,12 +934,17 @@ def _agent_editor(
     feedback_blob: str,
 ) -> Dict[str, Any]:
     quant = desk.get("quant") or {}
+    model_pct = quant.get("predicted_change_pct")
     prompt = f"""You are CIO desk editor for AssetCore covering {ticker}.
-Produce an institutional one-pager that feels sharper than a generic LLM summary.
-You MUST integrate ALL four lenses: quant model, fundamentals, 3Y risk, news/macro.
-You must NOT invent a different price forecast than the desk quant.
+Integrate ALL four agents: fundamentals, quant, news/macro, and your synthesis.
+The AssetCore model base forecast is {model_pct}%.
 
-DESK QUANT (authoritative):
+You MAY adjust the forecast in percentage POINTS via forecast_adjustment_pct
+(e.g. model +5.0 and adjustment -1.5 → final +3.5).
+Hard limit: adjustment between -8 and +8, and usually smaller when hit_rate is weak.
+Do NOT ignore the model — start from it, then apply justified agent pressure.
+
+DESK QUANT (model base):
 {json.dumps(quant, ensure_ascii=False, default=str)}
 
 FUNDAMENTALS pack:
@@ -835,6 +952,9 @@ FUNDAMENTALS pack:
 
 3Y:
 {json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
+
+NEWS REACTION (priced-in checks):
+{json.dumps(desk.get('news_reaction', {}), ensure_ascii=False, default=str)[:3500]}
 
 Agent — Fundamentals:
 {json.dumps(fund_view, ensure_ascii=False)[:3200]}
@@ -851,28 +971,31 @@ Peers: {json.dumps(desk.get('sector_peers', []), ensure_ascii=False)}
 
 Return ONLY valid JSON:
 {{
-  "executive_summary": "12-16 sentences: coherent thesis tying model forecast, hit reliability, fundamentals, and news. State predicted_change_pct and hit_rate explicitly once.",
-  "situation_assessment": "4-7 sentences on where the stock sits now (technical + fundamental + narrative)",
+  "executive_summary": "12-16 sentences: model base %, agent-adjusted view, hit_rate, news priced-in status",
+  "situation_assessment": "4-7 sentences",
   "fundamentals_verdict": "4-7 sentences",
-  "base_scenario": "most likely path over the horizon IF the model edge is real",
-  "risk_scenario": "path if model is wrong or a catalyst hits (include drawdown language from 3Y pack when present)",
-  "devil_advocate": "5-8 sentences: strongest case AGAINST the model-implied direction — mandatory, specific, not generic",
+  "base_scenario": "most likely path over the horizon after agent blend",
+  "risk_scenario": "what breaks the thesis",
+  "devil_advocate": "5-8 sentences against the blended direction",
   "key_objections": ["4-6 concrete objections"],
   "sentiment": "bullish|bearish|neutral|mixed",
   "confidence": "low|medium|high",
-  "model_vs_news": "paragraph: supports / conflicts / mixed",
+  "model_vs_news": "paragraph",
   "model_vs_fundamentals": "paragraph",
-  "peer_context": "2-4 qualitative sentences",
-  "watchpoints": ["6-9 concrete, checkable watchpoints"],
-  "edge_call": "one sentence: is the desk edge usable, marginal, or noise given hit_rate and sample size",
+  "peer_context": "2-4 sentences",
+  "watchpoints": ["6-9 concrete watchpoints"],
+  "edge_call": "one sentence on edge quality",
+  "forecast_adjustment_pct": 0.0,
+  "adjustment_reason": "2-4 sentences: why agents pull the % up or down vs model base {model_pct}",
   "uses_model_forecast": true
 }}
 
-Hard rules:
-1) Use desk predicted_change_pct; never invent another %.
-2) Confidence: hit<45 or thin sample → low; do not call high unless hit is solid AND fundamentals/news are not contradicting.
-3) If news contradicts model, say so clearly and keep confidence capped.
-4) No buy/sell labels. English. Specific numbers over vague adjectives.
+Rules:
+1) forecast_adjustment_pct is percentage POINTS added to model base (not a full replacement %).
+2) If breakthrough news is already priced_in=yes, do not re-shock the forecast for that headline.
+3) If fresh unpriced negative news, negative adjustment is expected; unpriced positive → positive adjustment.
+4) Weak hit_rate → smaller |adjustment|.
+5) English. No buy/sell label.
 """
     raw = ai_brief._gemini_generate(prompt, temperature=0.18)
     data = ai_brief._extract_json(raw)
@@ -906,6 +1029,10 @@ Hard rules:
             )
         except Exception:
             data["edge_call"] = "Edge quality unclear — verify hit_rate and n_significant."
+    try:
+        data["forecast_adjustment_pct"] = float(data.get("forecast_adjustment_pct") or 0.0)
+    except Exception:
+        data["forecast_adjustment_pct"] = 0.0
     return data
 
 
@@ -985,15 +1112,45 @@ def build_full(
     news_reaction = analyze_news_market_reaction(t, headlines, max_items=8)
     desk["news_reaction"] = news_reaction
 
-    fund_view = _agent_fundamentals(t, desk)
-    quant_view = _agent_quant(t, desk, fund_view, feedback_blob)
+    # 4 agents: fundamentals || quant first, then world, then editor (all always run)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_fund = pool.submit(_agent_fundamentals, t, desk)
+        # quant agent can start with empty fund_view; editor still sees both
+        f_quant = pool.submit(_agent_quant, t, desk, {}, feedback_blob)
+        fund_view = f_fund.result()
+        quant_view = f_quant.result()
+    # Re-run quant briefly is costly — enrich quant_view with fund stance note
+    if isinstance(quant_view, dict) and isinstance(fund_view, dict):
+        quant_view = dict(quant_view)
+        quant_view["fundamentals_stance_ref"] = fund_view.get("fundamental_stance")
+
     world = _agent_world(t, headlines, fund_view, quant_view, desk)
     final = _agent_editor(t, desk, fund_view, quant_view, world, feedback_blob)
+
+    blend = apply_agent_forecast_blend(q, fund_view, quant_view, world, final)
+    q_out = dict(q)
+    q_out["model_predicted_change_pct"] = blend.get("model_predicted_change_pct")
+    q_out["agent_adjustment_pct"] = blend.get("agent_adjustment_pct")
+    q_out["predicted_change_pct"] = blend.get("predicted_change_pct")
+    q_out["predicted_price"] = blend.get("predicted_price") or q_out.get("predicted_price")
+    q_out["direction"] = blend.get("direction") or q_out.get("direction")
+    q_out["agents_influenced_forecast"] = True
+    q_out["adjustment_reason"] = blend.get("adjustment_reason")
 
     out: Dict[str, Any] = {
         "ticker": t,
         "horizon": hz,
-        "quant": q,
+        "quant": q_out,
+        # Top-level mirrors for UI that reads predicted_change_pct on root
+        "predicted_change_pct": q_out.get("predicted_change_pct"),
+        "predicted_price": q_out.get("predicted_price"),
+        "direction": q_out.get("direction"),
+        "model_predicted_change_pct": blend.get("model_predicted_change_pct"),
+        "agent_adjustment_pct": blend.get("agent_adjustment_pct"),
+        "adjustment_reason": blend.get("adjustment_reason"),
+        "agents_used": ["fundamentals", "quant", "world_news", "editor"],
         "fundamentals_pack": fund_pack,
         "perspective_3y": pers_pack,
         "sector_peers": peers,
@@ -1039,6 +1196,7 @@ def build_full(
         "cached": False,
         "disclaimer": _DISCLAIMER,
         "feedback_injected": True,
+        "agents_influenced_forecast": True,
     }
     _cache_set(t, hz, out)
     return out
