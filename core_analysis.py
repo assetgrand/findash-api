@@ -2620,24 +2620,32 @@ def _build_training_set(df, horizon_days, max_samples=None):
 
 
 def _heuristic_momentum_return(feats, regime, days_forward):
+    """Heuristic edge: horizon-matched momentum + mean-reversion + volume confirm."""
     scale = days_forward / 21.0
-    # 3M: dłuższy momentum ważniejszy (ret5 często szum na 63d)
+    # 3M: dłuższy momentum; 1M: świeższy, ale ret20 nadal kotwica
     if days_forward > 30:
         mom = (
-            0.08 * feats['ret5']
-            + 0.17 * feats['ret10']
-            + 0.30 * feats['ret20']
-            + 0.45 * feats.get('ret60', 0.0)
+            0.05 * feats['ret5']
+            + 0.12 * feats['ret10']
+            + 0.28 * feats['ret20']
+            + 0.55 * feats.get('ret60', 0.0)
         )
     else:
         mom = (
-            0.25 * feats['ret5']
-            + 0.35 * feats['ret10']
-            + 0.25 * feats['ret20']
+            0.22 * feats['ret5']
+            + 0.33 * feats['ret10']
+            + 0.30 * feats['ret20']
             + 0.15 * feats.get('ret60', 0.0)
         )
     if feats.get('mom_agree', 0) > 0:
-        mom *= 1.12
+        mom *= 1.14
+    # Volume confirmation: high volume + mom_agree strengthens; high vol alone weakens noise
+    vr = float(feats.get('vol_ratio') or 1.0)
+    if vr >= 1.35 and feats.get('mom_agree', 0) > 0:
+        mom *= 1.10
+    elif vr >= 1.60 and feats.get('mom_agree', 0) <= 0:
+        mom *= 0.82
+
     mr = 0.0
     if feats['rsi'] > 70:
         mr -= (feats['rsi'] - 70) * 0.18
@@ -2651,21 +2659,30 @@ def _heuristic_momentum_return(feats, regime, days_forward):
         mr -= 0.8
     elif feats.get('stoch_k', 50) < 20:
         mr += 0.8
+    # Distance from SMA200: 3M mean-reversion / trend context
+    d200 = float(feats.get('dist_sma200') or 0.0)
+    if days_forward > 30:
+        if d200 > 25:
+            mr -= 1.2
+        elif d200 < -20:
+            mr += 1.2
     slope = feats.get('sma_slope', 0.0)
     if regime == 'TREND_UP':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
+        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
         if feats['macd_hist'] > 0:
-            pred += 0.5 * scale
+            pred += 0.55 * scale
     elif regime == 'TREND_DOWN':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
+        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
         if feats['macd_hist'] < 0:
-            pred -= 0.5 * scale
+            pred -= 0.55 * scale
     elif regime == 'HIGH_VOL':
-        pred = mom * 0.20 * scale + mr * 0.50 * scale
+        pred = mom * 0.18 * scale + mr * 0.52 * scale
     else:
-        pred = mom * 0.12 * scale + mr * 0.55 * scale
+        pred = mom * 0.14 * scale + mr * 0.52 * scale
     if feats['adx'] > 30 and regime in ('TREND_UP', 'TREND_DOWN'):
         pred *= 1.12
+    elif feats['adx'] < 18:
+        pred *= 0.88  # weak trend → trust less momentum
     return float(np.clip(pred, -22, 22))
 
 
@@ -2864,13 +2881,22 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, STRONGjszy prior przy sporze."""
+    """Ensemble v4: horizon-aware model mix + agreement-aware blend."""
     built = _build_training_set(df, days_forward)
     if built[0] is None:
         X, y, sw = None, None, None
     else:
         X, y, sw = built
     weights = _calibrate_model_weights(X, y, days_forward, regime)
+    # Horizon priors: 1M more short-signal (heuristic/gb), 3M more ridge/stable
+    if days_forward <= 30:
+        hz_prior = {'ridge': 0.30, 'gb': 0.34, 'heuristic': 0.36}
+    else:
+        hz_prior = {'ridge': 0.40, 'gb': 0.32, 'heuristic': 0.28}
+    for k in weights:
+        weights[k] = 0.65 * weights.get(k, 0.33) + 0.35 * hz_prior.get(k, 0.33)
+    s = sum(weights.values()) or 1.0
+    weights = {k: weights[k] / s for k in weights}
     preds = {}
     preds['heuristic'] = _heuristic_momentum_return(feats, regime, days_forward)
     x_now = np.array([[feats[k] for k in FEATURE_KEYS]], dtype=float)
@@ -3086,11 +3112,11 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
 
 
 def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
-    """Prognoza 1M/3M v2 + wyjątki tylko dla wybranych par ticker/horyzont."""
+    """Prognoza 1M/3M ensemble v4 — horizon-aware mix, volume confirm, drift anchors (Hit definition unchanged)."""
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3m | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v4 | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3117,19 +3143,29 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v3b: rozdział 1M vs 3M (jak desktop main)
+    # v4: 1M more technical; 3M more fundamental + drift (fundamentals matter more over quarters)
     if horizon == '1M':
-        tech_w = min(0.74, base_tech + 0.12)
+        tech_w = min(0.76, base_tech + 0.14)
     else:
-        tech_w = max(0.28, base_tech - 0.16)
+        tech_w = max(0.26, base_tech - 0.18)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.80 if horizon == '1M' else 0.75
+        tech_w *= 0.78 if horizon == '1M' else 0.72
     if regime == 'RANGE':
-        tech_w *= 0.90 if horizon == '1M' else 0.85
+        tech_w *= 0.88 if horizon == '1M' else 0.82
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.85, tech_w + (0.06 if horizon == '1M' else 0.04))
+        tech_w = min(0.86, tech_w + (0.07 if horizon == '1M' else 0.05))
+    # Strong fundamental extreme on 3M: allow fund more voice
+    if horizon == '3M' and abs(fund_score - 50) >= 15:
+        tech_w = max(0.22, tech_w - 0.06)
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
+    # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
+    try:
+        if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
+            if abs(tech_ret) >= 1.0 and tech_ret * blended_ret > 0:
+                blended_ret *= 1.05
+    except Exception:
+        pass
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
         blended_ret *= 1.04 if horizon == '1M' else 1.02
 
@@ -3233,13 +3269,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
-    # v3m: 3M mocniej kotwiczy w dłuższym dryfie (lepszy kierunek, bez zmiany Hit%)
+    # v4: 3M kotwica w dłuższym dryfie; 1M lekki short drift (mniej szumu)
     if horizon == '1M':
-        drift_w = 0.12
+        drift_w = 0.14
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.26
-        mix_prior = 0.50 * hist_med + 0.50 * hist_med_long
+        drift_w = 0.30
+        mix_prior = 0.45 * hist_med + 0.55 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
     # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
@@ -3272,6 +3308,15 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
           f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
           f"| w={model_weights}")
+
+    # Residual bias: if recent local accuracy is OK but magnitude systematically off, shrink toward hist median
+    # (does not redefine Hit — only improves direction/magnitude quality)
+    try:
+        if loc is not None and 0.45 <= loc <= 0.70 and abs(hist_med) >= 0.8:
+            # pull 12% toward historical median direction when models are mediocre
+            blended_ret = 0.88 * blended_ret + 0.12 * hist_med
+    except Exception:
+        pass
 
     # Kalibracja wielkości (znak bez zmian → Hit% stabilny, MAE w dół)
     pre_cal = blended_ret
