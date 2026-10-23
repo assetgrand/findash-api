@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v4.1-force-pct"
+_BUILD = "ai-full-v6-desk"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
@@ -37,8 +37,8 @@ _FB_PATH = Path(
 _MAX_FEEDBACK = 200
 
 _DISCLAIMER = (
-    "AssetCore desk synthesis: quantitative model outputs + fundamentals/macro + news. "
-    "Price forecasts come from the AssetCore model, not from the LLM. "
+    "AssetCore desk synthesis v6: quant model + fundamentals/macro + news reaction. "
+    "Base price path from AssetCore model; agents may apply a bounded adjustment. "
     "Not omniscient; data can be incomplete or delayed. Not investment advice."
 )
 
@@ -99,7 +99,13 @@ def add_feedback(
             q = max(1, min(5, int(quality)))
         except Exception:
             q = None
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = str(horizon or "3M").upper().strip()
+    if hz.startswith("6"):
+        hz = "6M"
+    elif hz.startswith("3"):
+        hz = "3M"
+    else:
+        hz = "3M"  # AI desk default
     row = {
         "type": "feedback",
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -262,7 +268,12 @@ def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
 # ---------------------------------------------------------------------------
 
 def _ck(ticker: str, horizon: str) -> str:
-    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v4.2"
+    return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v6.0"
+
+
+def peek_cache(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
+    """Read AI cache without building — used by API to serve post-deploy results only."""
+    return _cache_get(ticker, horizon)
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -291,8 +302,14 @@ def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
 
 def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
     """Slim rows from the in-memory AI cache (forecast stays the model number)."""
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
-    suffix = f"|{hz}|v4.2"
+    hz = str(horizon or "3M").upper().strip()
+    if hz.startswith("6"):
+        hz = "6M"
+    elif hz.startswith("3"):
+        hz = "3M"
+    else:
+        hz = "3M"  # AI desk default
+    suffix = f"|{hz}|v5.0"
     rows: List[Dict[str, Any]] = []
     with _CACHE_LOCK:
         items = list(_CACHE.items())
@@ -649,58 +666,99 @@ def _calibrate_confidence(
     fund_view: Optional[Dict[str, Any]] = None,
     world: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Hard rules so AI confidence tracks model reliability + data quality."""
+    """Hard rules: confidence tracks hit sample, MAE, data gaps, news conflict."""
     c = str(conf or "medium").lower()
     if c not in ("low", "medium", "high"):
         c = "medium"
+    rank = {"low": 0, "medium": 1, "high": 2}
+
+    def _set_max(level: str):
+        nonlocal c
+        if rank[level] < rank.get(c, 1):
+            c = level
+
     try:
         hr = quant.get("hit_rate")
         n = quant.get("n_significant")
         mae = quant.get("mae")
         if hr is not None:
             hr_f = float(hr)
-            if hr_f < 42:
-                c = "low"
-            elif hr_f < 52 and c == "high":
+            if hr_f < 40:
+                _set_max("low")
+            elif hr_f < 50:
+                _set_max("medium")
+                if c == "high":
+                    c = "medium"
+            elif hr_f >= 68 and n is not None and int(n) >= 7:
+                # allow high only if already medium+ and sample is solid
+                if c == "low":
+                    c = "medium"
+            if n is not None and int(n) < 4:
+                _set_max("low" if hr_f < 55 else "medium")
+            if n is not None and int(n) < 6 and c == "high":
                 c = "medium"
-            elif hr_f >= 65 and n is not None and int(n) >= 6 and c == "low":
-                c = "medium"
-        if n is not None and int(n) < 4 and c == "high":
-            c = "medium"
-        if mae is not None and float(mae) > 12 and c == "high":
-            c = "medium"
+        if mae is not None and float(mae) > 11:
+            _set_max("medium")
+            if float(mae) > 16:
+                _set_max("low")
     except Exception:
         pass
     gaps = (fund_view or {}).get("data_gaps") or []
-    if isinstance(gaps, list) and len(gaps) >= 3 and c == "high":
+    if isinstance(gaps, list) and len(gaps) >= 2 and c == "high":
         c = "medium"
+    if isinstance(gaps, list) and len(gaps) >= 4:
+        _set_max("low")
     align = str((world or {}).get("alignment_with_model") or "").lower()
-    if align == "contradicts" and c == "high":
-        c = "medium"
+    if align == "contradicts":
+        _set_max("medium")
+        if c == "high":
+            c = "medium"
+    advice = str((world or {}).get("model_adjustment_advice") or "").lower()
+    if "elevated_event_risk" in advice or "stale" in advice:
+        if c == "high":
+            c = "medium"
+    # Breakthrough still unpriced → cap confidence
+    try:
+        bt = (world or {}).get("breakthrough_news") or []
+        if isinstance(bt, list):
+            for item in bt[:5]:
+                if not isinstance(item, dict):
+                    continue
+                pi = str(item.get("priced_in") or "").lower()
+                if pi in ("no", "unknown", "partially"):
+                    if c == "high":
+                        c = "medium"
+                    break
+    except Exception:
+        pass
     return c
 
 
 def _agent_fundamentals(ticker: str, desk: Dict[str, Any]) -> Dict[str, Any]:
+    hz = (desk.get("quant") or {}).get("horizon") or "3M"
     prompt = f"""You are a senior fundamental analyst at a top long-only desk covering {ticker}.
-Write like an internal memo, not marketing copy.
+Investment horizon for this memo: {hz}.
+Write like an internal research note — precise, skeptical, number-driven.
 
 Authoritative desk data (never invent missing metrics):
-{json.dumps(desk, ensure_ascii=False, default=str)[:7500]}
+{json.dumps(desk, ensure_ascii=False, default=str)[:8000]}
 
 Return ONLY valid JSON:
 {{
-  "fundamentals_summary": "8-12 sentences: business quality, margins, growth durability, balance sheet, valuation vs peers if data allows, and what the rating/score actually implies",
+  "fundamentals_summary": "8-12 sentences: quality of earnings, margins trajectory, growth durability, balance sheet, valuation vs history/peers if data allows; what rating/score implies for a {hz} hold",
   "strengths": ["3-5 specific strengths tied to numbers in the pack"],
   "weaknesses": ["3-5 specific weaknesses or open risks"],
-  "macro_overlay": "3-5 sentences: country/macro vs this company's earnings sensitivity",
+  "macro_overlay": "3-5 sentences: country/macro transmission into this company's earnings over {hz}",
   "fundamental_stance": "constructive|neutral|cautious",
   "valuation_read": "cheap|fair|rich|unknown — based only on provided multiples",
+  "horizon_fit": "1-3 sentences: are fundamentals more relevant on {hz} than on a pure short-term technical tape?",
   "data_gaps": ["metrics missing that should lower confidence"]
 }}
 
 Rules:
 - Cite concrete figures from the pack (P/E, margins, scores, rating) when present.
 - If fundamentals are thin, say so and lean cautious — do not bluff.
+- Separate cyclical noise from structural franchise quality.
 - English. No buy/sell. No personal price targets.
 """
     raw = ai_brief._gemini_generate(prompt, temperature=0.18)
@@ -711,7 +769,9 @@ Rules:
 
 
 def _agent_quant(ticker: str, desk: Dict[str, Any], fund_view: Dict[str, Any], feedback_blob: str) -> Dict[str, Any]:
-    prompt = f"""You are a quantitative strategist for {ticker}. Your job is brutal honesty about model reliability.
+    hz = (desk.get("quant") or {}).get("horizon") or "3M"
+    prompt = f"""You are a quantitative strategist for {ticker} on a {hz} horizon.
+Your job is brutal honesty about model reliability — not cheerleading the forecast.
 
 Desk quant:
 {json.dumps(desk.get('quant', {}), ensure_ascii=False, default=str)}
@@ -720,25 +780,27 @@ Desk quant:
 {json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
 
 Fundamentals agent:
-{json.dumps(fund_view, ensure_ascii=False)[:2800]}
+{json.dumps(fund_view, ensure_ascii=False)[:3000]}
 
 {feedback_blob}
 
 Return ONLY valid JSON:
 {{
-  "quant_summary": "7-10 sentences: direction, predicted_change_pct, RSI/score context, and whether the setup is clean or noisy",
-  "hit_interpretation": "explicit: what hit_rate, mae, n_significant mean for trusting THIS forecast (e.g. hit 48% = coin-flip edge; hit 70%+ with n>=6 = usable edge)",
+  "quant_summary": "7-10 sentences: direction, predicted_change_pct, RSI/score, whether the {hz} setup is clean or noisy",
+  "hit_interpretation": "explicit: hit_rate, mae, n_significant for THIS ticker/horizon (e.g. hit~50% with n<5 = weak sample; hit>=65 with n>=7 = usable directional edge)",
   "confidence_from_model": "low|medium|high",
   "edge_quality": "weak|moderate|strong",
   "key_drivers": ["3-5 drivers grounded in the quant pack"],
   "warnings": ["2-5 model-risk warnings"],
-  "horizon_notes": "how 1M/3M forecast interacts with 3Y drop/crash risk if present"
+  "horizon_notes": "how this {hz} forecast interacts with 3Y drop/crash risk and position-in-range if present",
+  "regime_read": "trending|mean-reverting|high-vol|unclear — one short justification"
 }}
 
 Rules:
-- predicted_change_pct and predicted_price are FIXED — never replace them with your own %.
-- Map reliability roughly: hit<45 or n<4 → low; hit 45-58 → medium at best; hit>=62 and n>=6 → medium/high only if MAE is not extreme.
+- predicted_change_pct and predicted_price are FIXED model outputs — never replace them with your own %.
+- Reliability map: hit<45 or n<4 → low; hit 45-58 → medium at best; hit>=62 and n>=6 → medium/high only if MAE is not extreme.
 - If model direction conflicts with fundamental_stance, flag it in warnings.
+- Prefer under-confidence to over-confidence.
 - English. No buy/sell.
 """
     raw = ai_brief._gemini_generate(prompt, temperature=0.18)
@@ -992,14 +1054,19 @@ def _agent_editor(
 ) -> Dict[str, Any]:
     quant = desk.get("quant") or {}
     model_pct = quant.get("predicted_change_pct")
-    prompt = f"""You are CIO desk editor for AssetCore covering {ticker}.
-Integrate ALL four agents: fundamentals, quant, news/macro, and your synthesis.
-The AssetCore model base forecast is {model_pct}%.
+    hz = quant.get("horizon") or "3M"
+    hr = quant.get("hit_rate")
+    nsig = quant.get("n_significant")
+    prompt = f"""You are CIO desk editor for AssetCore covering {ticker} on a {hz} horizon.
+Write an institutional research synthesis — crisp, non-hype, decision-useful.
+
+Integrate agents: fundamentals, quant, news/macro.
+AssetCore MODEL base forecast: {model_pct}% | hit_rate={hr} | n_significant={nsig}.
 
 You MAY adjust the forecast in percentage POINTS via forecast_adjustment_pct
-(e.g. model +5.0 and adjustment -1.5 → final +3.5).
-Hard limit: adjustment between -8 and +8, and usually smaller when hit_rate is weak.
-Do NOT ignore the model — start from it, then apply justified agent pressure.
+(e.g. model +5.0 and adjustment -1.5 → displayed +3.5).
+Hard limit: -8 to +8. Prefer |adj| <= 3 when hit_rate < 55 or n_significant < 6.
+Start from the model; apply agent pressure only with evidence.
 
 DESK QUANT (model base):
 {json.dumps(quant, ensure_ascii=False, default=str)}
@@ -1007,7 +1074,7 @@ DESK QUANT (model base):
 FUNDAMENTALS pack:
 {json.dumps(desk.get('fundamentals', {}), ensure_ascii=False, default=str)[:4200]}
 
-3Y:
+3Y risk:
 {json.dumps(desk.get('perspective_3y', {}), ensure_ascii=False, default=str)}
 
 NEWS REACTION (priced-in checks):
@@ -1028,31 +1095,34 @@ Peers: {json.dumps(desk.get('sector_peers', []), ensure_ascii=False)}
 
 Return ONLY valid JSON:
 {{
-  "executive_summary": "12-16 sentences: model base %, agent-adjusted view, hit_rate, news priced-in status",
-  "situation_assessment": "4-7 sentences",
-  "fundamentals_verdict": "4-7 sentences",
-  "base_scenario": "most likely path over the horizon after agent blend",
-  "risk_scenario": "what breaks the thesis",
-  "devil_advocate": "5-8 sentences against the blended direction",
+  "executive_summary": "10-14 sentences: {hz} thesis, model base %, agent tilt, hit reliability, whether news is priced in",
+  "situation_assessment": "4-6 sentences on positioning and regime",
+  "fundamentals_verdict": "4-6 sentences",
+  "base_scenario": "most likely {hz} path after agent blend",
+  "bull_case": "2-4 sentences: what has to go right",
+  "risk_scenario": "what breaks the thesis on {hz}",
+  "devil_advocate": "5-8 sentences arguing the OPPOSITE of the blended direction with specific mechanisms",
   "key_objections": ["4-6 concrete objections"],
   "sentiment": "bullish|bearish|neutral|mixed",
   "confidence": "low|medium|high",
   "model_vs_news": "paragraph",
   "model_vs_fundamentals": "paragraph",
   "peer_context": "2-4 sentences",
-  "watchpoints": ["6-9 concrete watchpoints"],
-  "edge_call": "one sentence on edge quality",
+  "watchpoints": ["6-9 falsifiable watchpoints for the next weeks"],
+  "what_would_change_mind": ["2-4 concrete data points that would flip the stance"],
+  "edge_call": "one sentence: is the edge usable, informational, or noise?",
   "forecast_adjustment_pct": 0.0,
-  "adjustment_reason": "2-4 sentences: why agents pull the % up or down vs model base {model_pct}",
+  "adjustment_reason": "2-4 sentences: evidence for pulling % vs model base {model_pct}",
   "uses_model_forecast": true
 }}
 
 Rules:
-1) forecast_adjustment_pct is percentage POINTS added to model base (not a full replacement %).
-2) If breakthrough news is already priced_in=yes, do not re-shock the forecast for that headline.
-3) If fresh unpriced negative news, negative adjustment is expected; unpriced positive → positive adjustment.
-4) Weak hit_rate → smaller |adjustment|.
-5) English. No buy/sell label.
+1) forecast_adjustment_pct = percentage POINTS added to model (not a full replacement %).
+2) priced_in=yes breakthrough → do not re-shock the path for that headline.
+3) Fresh unpriced negative → negative adj; unpriced positive → positive adj.
+4) Weak hit_rate / small n → smaller |adjustment| and confidence not high.
+5) Devil advocate must not repeat the bull case in softer words.
+6) English. No buy/sell label. No invented earnings numbers.
 """
     raw = ai_brief._gemini_generate(prompt, temperature=0.18)
     data = ai_brief._extract_json(raw)
@@ -1078,6 +1148,25 @@ Rules:
         )
     if not isinstance(data.get("key_objections"), list):
         data["key_objections"] = []
+    if not data.get("bull_case"):
+        data["bull_case"] = data.get("base_scenario") or "Upside path not separately specified."
+    if not isinstance(data.get("what_would_change_mind"), list):
+        data["what_would_change_mind"] = data.get("watchpoints")[:3] if isinstance(data.get("watchpoints"), list) else []
+    # Soft clamp LLM adjustment when sample is weak (code-side, not hit manipulation)
+    try:
+        hr_f = float(quant.get("hit_rate")) if quant.get("hit_rate") is not None else None
+        n_f = int(quant.get("n_significant")) if quant.get("n_significant") is not None else None
+        adj = float(data.get("forecast_adjustment_pct") or 0.0)
+        cap = 8.0
+        if hr_f is not None and hr_f < 48:
+            cap = 2.5
+        elif hr_f is not None and hr_f < 55:
+            cap = 4.0
+        if n_f is not None and n_f < 5:
+            cap = min(cap, 2.5)
+        data["forecast_adjustment_pct"] = float(max(-cap, min(cap, adj)))
+    except Exception:
+        pass
     if not data.get("edge_call"):
         try:
             hr = quant.get("hit_rate")
@@ -1109,7 +1198,13 @@ def build_full(
     t = (ticker or "").upper().strip()
     if not t:
         raise ValueError("Invalid ticker")
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = str(horizon or "3M").upper().strip()
+    if hz.startswith("6"):
+        hz = "6M"
+    elif hz.startswith("3"):
+        hz = "3M"
+    else:
+        hz = "3M"  # AI desk default
 
     if use_cache:
         hit = _cache_get(t, hz)
@@ -1169,16 +1264,9 @@ def build_full(
     news_reaction = analyze_news_market_reaction(t, headlines, max_items=8)
     desk["news_reaction"] = news_reaction
 
-    # 4 agents: fundamentals || quant first, then world, then editor (all always run)
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_fund = pool.submit(_agent_fundamentals, t, desk)
-        # quant agent can start with empty fund_view; editor still sees both
-        f_quant = pool.submit(_agent_quant, t, desk, {}, feedback_blob)
-        fund_view = f_fund.result()
-        quant_view = f_quant.result()
-    # Re-run quant briefly is costly — enrich quant_view with fund stance note
+    # v6 pipeline: fund → quant (with fund) → world → editor (quality over parallel race)
+    fund_view = _agent_fundamentals(t, desk)
+    quant_view = _agent_quant(t, desk, fund_view if isinstance(fund_view, dict) else {}, feedback_blob)
     if isinstance(quant_view, dict) and isinstance(fund_view, dict):
         quant_view = dict(quant_view)
         quant_view["fundamentals_stance_ref"] = fund_view.get("fundamental_stance")
@@ -1275,7 +1363,13 @@ def build_board_row(
     t = (ticker or "").upper().strip()
     if not t:
         raise ValueError("Invalid ticker")
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = str(horizon or "3M").upper().strip()
+    if hz.startswith("6"):
+        hz = "6M"
+    elif hz.startswith("3"):
+        hz = "3M"
+    else:
+        hz = "3M"  # AI desk default
 
     if use_cache:
         hit = _cache_get(t, hz)
