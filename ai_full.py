@@ -24,10 +24,15 @@ from typing import Any, Dict, List, Optional
 
 import ai_brief
 
-_BUILD = "ai-full-v6-desk"
+_BUILD = "ai-full-v6.1-board-fix"
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MIN = float(os.environ.get("AI_FULL_CACHE_MINUTES") or "1080")
+_CACHE_DISK = Path(
+    os.environ.get("AI_FULL_CACHE_PATH")
+    or os.path.join(os.path.dirname(__file__), "ai_full_cache.json")
+)
+_DISK_LOADED = False
 
 _FB_LOCK = threading.Lock()
 _FB_PATH = Path(
@@ -267,6 +272,50 @@ def _feedback_for_prompt(ticker: str, limit: int = 14) -> str:
 # Cache
 # ---------------------------------------------------------------------------
 
+def _disk_load() -> None:
+    """Load AI cache from disk once (survives process restart on same instance)."""
+    global _DISK_LOADED
+    if _DISK_LOADED:
+        return
+    _DISK_LOADED = True
+    try:
+        if not _CACHE_DISK.exists():
+            return
+        raw = json.loads(_CACHE_DISK.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        with _CACHE_LOCK:
+            for k, v in raw.items():
+                if not isinstance(v, dict):
+                    continue
+                ts = float(v.get("ts") or 0)
+                if now - ts > _CACHE_MIN * 60:
+                    continue
+                data = v.get("data")
+                if isinstance(data, dict):
+                    _CACHE[str(k)] = {"ts": ts, "data": data}
+        print(f"[ai_full] disk cache loaded: {len(_CACHE)} entries from {_CACHE_DISK}")
+    except Exception as e:
+        print(f"[ai_full] disk load: {e}")
+
+
+def _disk_save() -> None:
+    try:
+        with _CACHE_LOCK:
+            payload = {
+                k: {"ts": v.get("ts"), "data": v.get("data")}
+                for k, v in _CACHE.items()
+                if isinstance(v, dict) and isinstance(v.get("data"), dict)
+            }
+        _CACHE_DISK.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[ai_full] disk save: {e}")
+
+
 def _ck(ticker: str, horizon: str) -> str:
     return f"{ticker.upper().strip()}|{horizon.upper().strip()}|v6.0"
 
@@ -277,13 +326,20 @@ def peek_cache(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
 
 
 def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
+    _disk_load()
     key = _ck(ticker, horizon)
     with _CACHE_LOCK:
         row = _CACHE.get(key)
         if not row:
+            # fallback: any version for same ticker|horizon
+            prefix = f"{ticker.upper().strip()}|{horizon.upper().strip()}|"
+            for k, r in _CACHE.items():
+                if str(k).startswith(prefix):
+                    row = r
+                    break
+        if not row:
             return None
         if time.time() - row["ts"] > _CACHE_MIN * 60:
-            _CACHE.pop(key, None)
             return None
         out = dict(row["data"])
         out["cached"] = True
@@ -291,17 +347,20 @@ def _cache_get(ticker: str, horizon: str) -> Optional[Dict[str, Any]]:
 
 
 def _cache_set(ticker: str, horizon: str, data: Dict[str, Any]) -> None:
+    _disk_load()
     key = _ck(ticker, horizon)
     with _CACHE_LOCK:
         _CACHE[key] = {"ts": time.time(), "data": dict(data)}
-        if len(_CACHE) > 100:
-            oldest = sorted(_CACHE.items(), key=lambda kv: kv[1]["ts"])[:30]
+        if len(_CACHE) > 200:
+            oldest = sorted(_CACHE.items(), key=lambda kv: kv[1]["ts"])[:50]
             for k, _ in oldest:
                 _CACHE.pop(k, None)
+    _disk_save()
 
 
 def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
-    """Slim rows from the in-memory AI cache (forecast stays the model number)."""
+    """Slim rows from AI cache (memory + disk). Match any cache version for this horizon."""
+    _disk_load()
     hz = str(horizon or "3M").upper().strip()
     if hz.startswith("6"):
         hz = "6M"
@@ -309,13 +368,21 @@ def ranking_rows(horizon: str = "1M", limit: int = 12) -> List[Dict[str, Any]]:
         hz = "3M"
     else:
         hz = "3M"  # AI desk default
-    suffix = f"|{hz}|v5.0"
+    # Keys look like: AAPL|3M|v6.0  — accept any version suffix
+    needle = f"|{hz}|"
     rows: List[Dict[str, Any]] = []
     with _CACHE_LOCK:
         items = list(_CACHE.items())
     for key, row in items:
-        if not str(key).endswith(suffix):
+        ks = str(key)
+        if needle not in ks:
             continue
+        # skip expired
+        try:
+            if time.time() - float(row.get("ts") or 0) > _CACHE_MIN * 60:
+                continue
+        except Exception:
+            pass
         data = row.get("data") or {}
         q = data.get("quant") or {}
         if not isinstance(q, dict):
