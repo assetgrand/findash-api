@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-agents-pct-v3"
+API_BUILD = "ai-3m6m-cache-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -222,10 +222,30 @@ class RankingsResponse(BaseModel):
 
 
 def _horizon_days(horizon: str) -> int:
+    """Trading-day horizons: 1M≈21, 3M≈63, 6M≈126."""
     h = (horizon or "1M").upper().strip()
+    if h in ("6M", "6", "180", "126"):
+        return 126
     if h in ("3M", "3", "90", "63"):
         return 63
     return 21
+
+
+def _horizon_label(horizon: str) -> str:
+    days = _horizon_days(horizon)
+    if days >= 100:
+        return "6M"
+    if days > 30:
+        return "3M"
+    return "1M"
+
+
+def _ai_horizon_label(horizon: str) -> str:
+    """AI Brief tab only: 3M or 6M (default 3M)."""
+    h = (horizon or "3M").upper().strip()
+    if h in ("6M", "6", "180", "126") or h.startswith("6"):
+        return "6M"
+    return "3M"
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -336,10 +356,10 @@ def _precompute_all_once() -> None:
         _precompute_crypto_once()
     except Exception as e:
         print("[precompute] crypto first:", e)
-    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M")
+    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M/6M")
     for t in tickers:
         _PRECOMPUTE_STATUS["last_ticker"] = t
-        for hz in ("1M", "3M"):
+        for hz in ("1M", "3M", "6M"):
             try:
                 data = _analyze_one(t, hz, fast=True, quality=False)
                 if data and data.get("current_price") is not None:
@@ -367,6 +387,12 @@ def _precompute_all_once() -> None:
     with _PRECOMPUTE_LOCK:
         n = len(_PRECOMPUTE)
     print(f"[precompute] done, entries={n}")
+    # Right after quant precompute: fill AI 3M/6M cache (no user Twelve calls)
+    try:
+        if ai_full.configured():
+            _ai_board_once()
+    except Exception as e:
+        print("[precompute] ai-board follow-up:", e)
 
 
 def _gemini_should_wait(err: BaseException) -> bool:
@@ -403,12 +429,17 @@ def _ai_board_one(ticker: str, horizon: str) -> None:
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
     t = ticker.upper().strip()
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = _ai_horizon_label(horizon)
     # Richer note needs more time than the old 3-line summary
     budget = float(os.environ.get("AI_BOARD_TICKER_TIMEOUT", "90"))
 
     def _run() -> None:
-        quant = _analyze_one(t, hz, fast=True, quality=False)
+        # Twelve only via precompute worker — never on user/AI path
+        quant = _pc_get(t, hz)
+        if not quant:
+            quant = _pc_get(t, "3M") if hz == "6M" else None
+        if not quant:
+            raise RuntimeError(f"no precompute quant for {t}/{hz}")
         fundamentals = None
         perspective = None
         try:
@@ -453,25 +484,53 @@ def _ai_board_one(ticker: str, horizon: str) -> None:
 
 
 def _ai_board_once() -> None:
+    """After deploy: AI for every ticker × 3M and 6M, saved in ai_full cache."""
     if not ai_full.configured():
         print("[ai-board] GEMINI_API_KEY missing — skip")
         _AI_BOARD_STATUS["last_error"] = "GEMINI_API_KEY not set"
         return
     tickers = _ticker_list_for_precompute()
-    # Only 1M on board (table is 1M by default). Manual full AI still uses /ai/full.
-    pause = float(os.environ.get("AI_BOARD_PAUSE", "1"))
+    horizons = ("3M", "6M")
+    pause = float(os.environ.get("AI_BOARD_PAUSE", "2"))
     _AI_BOARD_STATUS["running"] = True
     _AI_BOARD_STATUS["done"] = 0
-    _AI_BOARD_STATUS["total"] = len(tickers)
+    _AI_BOARD_STATUS["total"] = len(tickers) * len(horizons)
     _AI_BOARD_STATUS["last_error"] = None
-    print(f"[ai-board] fast 1M board: {len(tickers)} tickers")
+    print(f"[ai-board] full AI cache {len(tickers)} tickers × {horizons}")
     try:
         for t in tickers:
-            _AI_BOARD_STATUS["last_ticker"] = t
-            _AI_BOARD_STATUS["last_horizon"] = "1M"
-            _ai_board_one(t, "1M")
-            _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
-            time.sleep(pause)
+            for hz in horizons:
+                _AI_BOARD_STATUS["last_ticker"] = t
+                _AI_BOARD_STATUS["last_horizon"] = hz
+                try:
+                    quant = _pc_get(t, hz)
+                    if not quant:
+                        print(f"[ai-board] skip {t}/{hz}: no quant precompute yet")
+                        continue
+                    fundamentals = None
+                    perspective = None
+                    try:
+                        fundamentals = core.get_comprehensive_fundamental_analysis(t)
+                    except Exception as e:
+                        print(f"[ai-board] fundamentals {t}: {e}")
+                    try:
+                        perspective = core.get_3year_perspective(t, None)
+                    except Exception as e:
+                        print(f"[ai-board] perspective {t}: {e}")
+                    # 4-agent desk — writes into AI cache (client later only reads)
+                    ai_full.build_full(
+                        t,
+                        quant,
+                        fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+                        perspective=perspective if isinstance(perspective, dict) else None,
+                        horizon=hz,
+                        use_cache=True,
+                    )
+                except Exception as e:
+                    _AI_BOARD_STATUS["last_error"] = f"{t}/{hz}: {e}"
+                    print(f"[ai-board] {t}/{hz}: {e}")
+                _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
+                time.sleep(pause)
     finally:
         _AI_BOARD_STATUS["running"] = False
         _AI_BOARD_STATUS["last_run_ts"] = time.time()
@@ -529,11 +588,11 @@ def _analyze_one(
         raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
 
     days = _horizon_days(horizon)
-    horizon_label = "3M" if days > 30 else "1M"
+    horizon_label = _horizon_label(horizon)
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v8|{ticker}|{horizon_label}|{mode}|{day_key}|mp12"
+    cache_key = f"v9|{ticker}|{horizon_label}|{mode}|{day_key}|retry2"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -577,13 +636,54 @@ def _analyze_one(
         fund_rating = fa.get("fundamental_rating")
         combined = _safe_float(fa.get("combined_score"))
 
+    # Forecast + Hit with up to 2 alternate analysis modes if hit < 50%
     pred_price, direction, chg = None, "NEUTRAL", None
+    hit_rate = mae = n_sig = None
+    analysis_mode = "default"
+    modes_tried = ["default"]
+    max_pts = 18 if quality else 12
     try:
-        pred_price, direction, chg = core.predict_with_technical_influence(
-            df, fa or {}, days, sector, ticker=ticker, quiet=True
-        )
-        pred_price = _safe_float(pred_price)
-        chg = _safe_float(chg)
+        if hasattr(core, "analyze_forecast_with_retries"):
+            res = core.analyze_forecast_with_retries(
+                df,
+                fa or {},
+                days,
+                sector,
+                ticker=ticker,
+                max_retries=2,
+                hit_threshold=50.0,
+                max_points=max_pts,
+            )
+            pred_price = _safe_float(res.get("pred_price"))
+            chg = _safe_float(res.get("change_pct"))
+            direction = res.get("direction") or "NEUTRAL"
+            hit_rate = _safe_float(res.get("hit_rate"))
+            mae = _safe_float(res.get("mae"))
+            n_sig = res.get("n_significant")
+            analysis_mode = res.get("analysis_mode") or "default"
+            modes_tried = res.get("modes_tried") or [analysis_mode]
+            print(
+                f"[analyze] {ticker} {horizon_label}: mode={analysis_mode} "
+                f"hit={hit_rate} tried={modes_tried}"
+            )
+        else:
+            pred_price, direction, chg = core.predict_with_technical_influence(
+                df, fa or {}, days, sector, ticker=ticker, quiet=True
+            )
+            pred_price = _safe_float(pred_price)
+            chg = _safe_float(chg)
+            q = core.backtest_forecast_quality(
+                df,
+                days_forward=days,
+                sector=sector,
+                fund_score=combined or 50,
+                ticker=ticker,
+                max_points=max_pts,
+            )
+            if q:
+                hit_rate = _safe_float(q.get("hit_rate"))
+                mae = _safe_float(q.get("mae"))
+                n_sig = q.get("n_significant")
     except TypeError:
         try:
             pred_price, direction, chg = core.predict_with_technical_influence(
@@ -594,26 +694,7 @@ def _analyze_one(
         except Exception as e:
             print(f"predict error {ticker}: {e}")
     except Exception as e:
-        print(f"predict error {ticker}: {e}")
-
-    # Hit%: 12 punktów (std) / 18 (quality) — stabilny sample, bez skrajności 3 ani 30+
-    hit_rate = mae = n_sig = None
-    max_pts = 18 if quality else 12
-    try:
-        q = core.backtest_forecast_quality(
-            df,
-            days_forward=days,
-            sector=sector,
-            fund_score=combined or 50,
-            ticker=ticker,
-            max_points=max_pts,
-        )
-        if q:
-            hit_rate = _safe_float(q.get("hit_rate"))
-            mae = _safe_float(q.get("mae"))
-            n_sig = q.get("n_significant")
-    except Exception as e:
-        print(f"backtest quality {ticker}: {e}")
+        print(f"predict/retry error {ticker}: {e}")
 
     data = {
         "ticker": ticker,
@@ -631,6 +712,8 @@ def _analyze_one(
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
+        "analysis_mode": analysis_mode,
+        "modes_tried": modes_tried,
         "fast_mode": False,
         "cached": False,
     }
@@ -727,7 +810,7 @@ def analyze(
 
     t = ticker.upper().strip()
     days = _horizon_days(horizon)
-    hz = "3M" if days > 30 else "1M"
+    hz = _horizon_label(horizon)
 
     if refresh:
         for k in list(_ANALYZE_CACHE.keys()):
@@ -2134,14 +2217,14 @@ def crypto_rankings(
 @app.get("/ai/full/{ticker}")
 def ai_full_analysis(
     ticker: str,
-    horizon: str = Query("1M", description="1M or 3M"),
-    refresh: bool = Query(False),
+    horizon: str = Query("3M", description="3M or 6M only"),
+    refresh: bool = Query(False, description="ignored — AI serves post-deploy cache only"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    Full 4-agent AI desk (always):
-      Fundamentals → Quant → World/News → Editor
-    Agents may adjust the displayed forecast % within hard caps on top of AssetCore model base.
+    AI Brief: horizons 3M / 6M only.
+    Quant prices come ONLY from server precompute (Twelve at deploy/worker — not per client).
+    AI text is served from server cache filled after deploy; client cannot force Twelve.
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
@@ -2150,12 +2233,35 @@ def ai_full_analysis(
             detail="GEMINI_API_KEY not configured on server. Set it in Render Environment.",
         )
     t = ticker.upper().strip()
-    days = _horizon_days(horizon)
-    hz = "3M" if days > 30 else "1M"
+    hz = _ai_horizon_label(horizon)
+
+    # Quant: precompute only (no Twelve on this path)
+    quant = _pc_get(t, hz)
+    if not quant:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Forecast for {t}/{hz} not ready yet. "
+                "Server fills 3M/6M AI after deploy precompute — try again shortly."
+            ),
+        )
+    quant = dict(quant)
+    quant["cached"] = True
+
+    # Prefer fully cached AI row (post-deploy). Client cannot force rebuild.
     try:
-        quant = _analyze_one(t, hz, fast=True, quality=False)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Quant analyze failed: {e}")
+        cached_ai = ai_full.peek_cache(t, hz)
+        if cached_ai:
+            data = dict(cached_ai)
+            data["cached"] = True
+            data["plan"] = (prof.get("plan") or "demo").lower()
+            data["mode"] = "four_agents_cached"
+            data["quant_source"] = "precompute"
+            data["client_refresh_ignored"] = True
+            return data
+    except Exception:
+        pass
+
     fundamentals = None
     perspective = None
     try:
@@ -2173,7 +2279,7 @@ def ai_full_analysis(
             fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
             perspective=perspective if isinstance(perspective, dict) else None,
             horizon=hz,
-            use_cache=not refresh,
+            use_cache=True,  # always cache; client cannot bust Twelve
         )
     except Exception as e:
         print("[ai_full] error", e)
@@ -2181,6 +2287,8 @@ def ai_full_analysis(
     data = dict(data)
     data["plan"] = (prof.get("plan") or "demo").lower()
     data["mode"] = "four_agents"
+    data["quant_source"] = "precompute"
+    data["client_refresh_ignored"] = True
     data["agents_used"] = data.get("agents_used") or [
         "fundamentals",
         "quant",
@@ -2265,13 +2373,13 @@ def ai_news_brief(
 
 @app.get("/ai/rankings")
 def ai_rankings(
-    horizon: str = Query("1M"),
+    horizon: str = Query("3M"),
     limit: int = Query(12, ge=1, le=50),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Top AI briefs already computed after deploy. Fills in as the board finishes."""
+    """Top AI briefs already computed after deploy (3M/6M). Fills in as the board finishes."""
     _gate(prof, "ai_brief")
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = _ai_horizon_label(horizon)
     items = ai_full.ranking_rows(hz, limit=limit)
     return {
         "horizon": hz,
