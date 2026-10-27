@@ -3111,18 +3111,12 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
     return float(pred)
 
 
-def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False, analysis_mode="default"):
-    """Prognoza 1M/3M ensemble v4 + optional alt modes (mean-reversion / trend) for low-hit retries.
-    analysis_mode: default | alt_mr | alt_trend
-    Hit definition unchanged — only the forecast path varies.
-    """
+def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
+    """Prognoza 1M/3M ensemble v4 — horizon-aware mix, volume confirm, drift anchors (Hit definition unchanged)."""
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    mode = (analysis_mode or "default").strip().lower()
-    if mode not in ("default", "alt_mr", "alt_trend"):
-        mode = "default"
-    _log(f"🔍 ENSEMBLE v4 mode={mode} | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v4 | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3172,42 +3166,6 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
                 blended_ret *= 1.05
     except Exception:
         pass
-
-    # --- Alternate analysis paths (used when default hit < 50%) ---
-    # alt_mr: more mean-reversion / historical anchor (helps noisy trend-followers)
-    # alt_trend: more pure momentum + ADX (helps when default over-mean-reverts)
-    if mode == "alt_mr":
-        try:
-            hm = _historical_drift(df_clean, days_forward)
-            rsi = float(feats.get('rsi') or 50)
-            mr_nudge = 0.0
-            if rsi >= 65:
-                mr_nudge = -abs(hm) * 0.35 - 0.6
-            elif rsi <= 35:
-                mr_nudge = abs(hm) * 0.35 + 0.6
-            # pull toward MR + longer drift
-            blended_ret = 0.45 * blended_ret + 0.35 * hm + 0.20 * mr_nudge
-            tech_w = max(0.20, tech_w * 0.75)
-            _log(f"   ALT_MR path rsi={rsi:.1f} hm={hm:+.2f} → {blended_ret:+.2f}%")
-        except Exception as e:
-            _log(f"   ALT_MR fail: {e}")
-    elif mode == "alt_trend":
-        try:
-            mom = (
-                0.20 * float(feats.get('ret5') or 0)
-                + 0.30 * float(feats.get('ret10') or 0)
-                + 0.30 * float(feats.get('ret20') or 0)
-                + 0.20 * float(feats.get('ret60') or 0)
-            )
-            scale = days_forward / 21.0
-            trend_core = mom * 0.55 * scale
-            if float(feats.get('adx') or 0) >= 25 and float(feats.get('mom_agree') or 0) > 0:
-                trend_core *= 1.15
-            # less fund, more trend
-            blended_ret = 0.35 * blended_ret + 0.55 * trend_core + 0.10 * tech_ret
-            _log(f"   ALT_TREND path mom={mom:+.2f} → {blended_ret:+.2f}%")
-        except Exception as e:
-            _log(f"   ALT_TREND fail: {e}")
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
         blended_ret *= 1.04 if horizon == '1M' else 1.02
 
@@ -3398,109 +3356,8 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
 
 
-
-
-def analyze_forecast_with_retries(df, fundamental_analysis, days_forward, sector, ticker=None,
-                                  max_retries=2, hit_threshold=50.0, max_points=12):
-    """
-    Run default 1M/3M forecast; if walk-forward hit < threshold, try up to
-    max_retries alternate analysis modes (alt_mr, alt_trend).
-
-    Returns dict: pred_price, direction, change_pct, hit_rate, mae, n_significant,
-    analysis_mode, modes_tried.
-    Does NOT change Hit definition — only the prediction path.
-    """
-    modes = ["default"]
-    # max 2 alternate attempts after default
-    alts = ["alt_mr", "alt_trend"]
-    for a in alts[: max(0, int(max_retries))]:
-        modes.append(a)
-
-    fa = fundamental_analysis or {}
-    fund_score = fa.get("combined_score", 50)
-    if fund_score is None:
-        fund_score = 50
-
-    best = None
-    tried = []
-
-    for mode in modes:
-        try:
-            pred_price, direction, chg = predict_with_technical_influence(
-                df, fa, days_forward, sector, ticker=ticker, quiet=True, analysis_mode=mode,
-            )
-        except Exception as e:
-            print(f"[retry] predict fail {ticker} mode={mode}: {e}")
-            continue
-        q = None
-        try:
-            q = backtest_forecast_quality(
-                df,
-                days_forward=days_forward,
-                sector=sector,
-                fund_score=fund_score,
-                ticker=ticker,
-                max_points=max_points,
-                analysis_mode=mode,
-            )
-        except Exception as e:
-            print(f"[retry] quality fail {ticker} mode={mode}: {e}")
-        hit = None
-        mae = None
-        n_sig = None
-        if q:
-            try:
-                hit = float(q.get("hit_rate")) if q.get("hit_rate") is not None else None
-            except Exception:
-                hit = None
-            try:
-                mae = float(q.get("mae")) if q.get("mae") is not None else None
-            except Exception:
-                mae = None
-            n_sig = q.get("n_significant")
-
-        row = {
-            "pred_price": pred_price,
-            "direction": direction,
-            "change_pct": chg,
-            "hit_rate": hit,
-            "mae": mae,
-            "n_significant": n_sig,
-            "analysis_mode": mode,
-        }
-        tried.append(mode)
-
-        def _score(r):
-            h = r.get("hit_rate")
-            if h is None:
-                return -1.0
-            return float(h)
-
-        if best is None or _score(row) > _score(best):
-            best = row
-
-        # stop early if good enough
-        if hit is not None and hit >= float(hit_threshold):
-            break
-
-    if best is None:
-        return {
-            "pred_price": None,
-            "direction": "NEUTRAL",
-            "change_pct": None,
-            "hit_rate": None,
-            "mae": None,
-            "n_significant": None,
-            "analysis_mode": "default",
-            "modes_tried": tried,
-        }
-    best = dict(best)
-    best["modes_tried"] = tried
-    return best
-
 def backtest_forecast_quality(df, days_forward=21, sector='Default',
-                              fund_score=50, step=None, max_points=48, ticker=None,
-                              analysis_mode="default"):
+                              fund_score=50, step=None, max_points=48, ticker=None):
     """
     Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mNOj inflacji).
 
@@ -3566,8 +3423,7 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
             continue
         try:
             _, _, pred_ret = predict_with_technical_influence(
-                hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True,
-                analysis_mode=analysis_mode,
+                hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True
             )
             if pred_ret is None:
                 continue
