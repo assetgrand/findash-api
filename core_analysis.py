@@ -116,19 +116,25 @@ def _cache_key(func_name, *args, **kwargs):
     key_str = func_name + "_" + "_".join(str(a) for a in args) + "_" + "_".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
     return hashlib.md5(key_str.encode()).hexdigest()
 
-def _cache_get(key, hours=None):
-    """hours=None → 1h default; hist_v2 może brać dłużej (more stable Hit)."""
+def _cache_get(key, hours=None, allow_stale=False):
+    """hours=None → 1h default; hist longer. allow_stale / cooldown → return old data."""
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             ttl = hours if hours is not None else 1
-            # hist_* – 6h, żeby po limicie Twelve NO liczyć hitu na urywanej historii
             if hours is None and str(key).startswith("hist"):
-                ttl = 6
-            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=ttl):
+                ttl = 24  # keep history longer — protects against 429 / no data
+            age_h = (datetime.now() - datetime.fromisoformat(data['_timestamp'])).total_seconds() / 3600.0
+            if age_h < ttl:
                 return data['data']
+            # During Twelve cooldown accept stale cache up to 7 days (better than NO DATA)
+            if allow_stale or _twelve_in_cooldown():
+                max_stale = 168.0 if str(key).startswith("hist") else 48.0
+                if age_h < max_stale:
+                    print(f"📦 stale cache {key[:12]}… age={age_h:.1f}h")
+                    return data['data']
         except Exception:
             pass
     return None
@@ -153,22 +159,58 @@ def _normalize_symbol(ticker: str) -> str:
             return f"{t[:-3]}/USD"
     return t
 
+# Global throttle when Twelve returns 429 / out of credits
+_TWELVE_COOLDOWN_UNTIL = 0.0
+_TWELVE_COOLDOWN_LOCK = threading.Lock()
+
+
+def _twelve_in_cooldown() -> bool:
+    return time.time() < _TWELVE_COOLDOWN_UNTIL
+
+
+def _twelve_trip_cooldown(seconds: float = 900.0) -> None:
+    """Stop hitting Twelve for a while after 429 / credit errors."""
+    global _TWELVE_COOLDOWN_UNTIL
+    with _TWELVE_COOLDOWN_LOCK:
+        _TWELVE_COOLDOWN_UNTIL = max(_TWELVE_COOLDOWN_UNTIL, time.time() + float(seconds))
+    print(f"⏳ Twelve Data cooldown {seconds:.0f}s — using cache only until then")
+
+
 def _api_call(url, max_retries=3):
-    """Wykonuje zapytaNO do Twelve Data API."""
+    """Twelve Data call with 429 / credit-limit protection."""
+    if _twelve_in_cooldown():
+        print("⏳ Twelve cooldown active — skip network call")
+        return None
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
+            # Hard rate limit
+            if resp.status_code == 429:
+                print(f"❌ Twelve 429 rate limit (attempt {attempt+1})")
+                _twelve_trip_cooldown(1200.0)  # 20 min
+                return None
+            if resp.status_code == 403:
+                print(f"❌ Twelve 403 Forbidden — key/plan issue")
+                _twelve_trip_cooldown(1800.0)
+                return None
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
-                if data.get("status") == "error" or data.get("code"):
-                    msg = data.get("message") or data.get("status") or str(data)[:200]
+                code = data.get("code")
+                msg = str(data.get("message") or data.get("status") or "")
+                if data.get("status") == "error" or code:
+                    low = msg.lower()
                     print(f"❌ Błąd Twelve Data: {msg}")
+                    if code == 429 or "run out of api credits" in low or "rate limit" in low or "credits" in low:
+                        _twelve_trip_cooldown(3600.0)  # 1h when daily credits gone
                     return None
             return data
         except requests.exceptions.RequestException as e:
             print(f"❌ Błąd sieci (próba {attempt+1}): {e}")
-            time.sleep(2)
+            if "429" in str(e):
+                _twelve_trip_cooldown(1200.0)
+                return None
+            time.sleep(2 + attempt * 2)
         except Exception as e:
             print(f"❌ Błąd (próba {attempt+1}): {e}")
             time.sleep(2)
@@ -281,7 +323,7 @@ def get_historical_prices(ticker, days=None):
     outputsize = max(400, min(int(calendar_days * 0.72) + 80, 5000))
 
     cache_key = _cache_key("hist_v3", sym, outputsize)
-    cached = _cache_get(cache_key)
+    cached = _cache_get(cache_key, allow_stale=True)
     if cached is not None:
         try:
             df = pd.DataFrame(cached)

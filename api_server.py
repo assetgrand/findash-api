@@ -284,10 +284,17 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "3600"))  # pełna runda co 1h
-_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # co 2h — mniej kredytów Twelve
+_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "3.0"))  # pauza między tickerami
+# Serve even old forecasts (user sees last known price/prediction — never empty loading)
+_PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(7 * 24 * 3600)))  # 7 dni
+_PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "3600"))  # po 1h odśwież w tle
 _PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
 _PRECOMPUTE_LOCK = threading.Lock()
+_PRECOMPUTE_DISK = os.path.join(os.path.dirname(__file__), "precompute_cache.json")
+_PRECOMPUTE_DISK_LOADED = False
+_BG_REFRESHING: set = set()
+_BG_LOCK = threading.Lock()
 _PRECOMPUTE_STATUS: Dict[str, Any] = {
     "running": False,
     "last_full_run_ts": None,
@@ -303,25 +310,122 @@ def _pc_key(ticker: str, horizon_label: str) -> str:
     return f"{str(ticker).upper()}|{horizon_label}"
 
 
+def _pc_disk_load() -> None:
+    global _PRECOMPUTE_DISK_LOADED
+    if _PRECOMPUTE_DISK_LOADED:
+        return
+    _PRECOMPUTE_DISK_LOADED = True
+    try:
+        if not os.path.isfile(_PRECOMPUTE_DISK):
+            return
+        import json as _json
+        raw = _json.loads(open(_PRECOMPUTE_DISK, "r", encoding="utf-8").read())
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        n = 0
+        with _PRECOMPUTE_LOCK:
+            for k, v in raw.items():
+                if not isinstance(v, dict) or not isinstance(v.get("data"), dict):
+                    continue
+                ts = float(v.get("ts") or 0)
+                if now - ts > _PRECOMPUTE_SERVE_MAX_AGE:
+                    continue
+                _PRECOMPUTE[str(k)] = {"ts": ts, "data": dict(v["data"])}
+                n += 1
+        print(f"[precompute] disk loaded {n} entries")
+    except Exception as e:
+        print("[precompute] disk load:", e)
+
+
+def _pc_disk_save() -> None:
+    try:
+        import json as _json
+        with _PRECOMPUTE_LOCK:
+            payload = {
+                k: {"ts": v.get("ts"), "data": v.get("data")}
+                for k, v in _PRECOMPUTE.items()
+                if isinstance(v, dict) and isinstance(v.get("data"), dict)
+            }
+        with open(_PRECOMPUTE_DISK, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False, default=str)
+    except Exception as e:
+        print("[precompute] disk save:", e)
+
+
 def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
+    _pc_disk_load()
     with _PRECOMPUTE_LOCK:
         _PRECOMPUTE[_pc_key(ticker, horizon_label)] = {
             "ts": time.time(),
             "data": dict(data),
         }
+    # persist async-ish (cheap enough)
+    try:
+        _pc_disk_save()
+    except Exception:
+        pass
 
 
-def _pc_get(ticker: str, horizon_label: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Zwraca skopiowane data lub None. max_age domyślnie 2x interval."""
+def _pc_get(
+    ticker: str,
+    horizon_label: str,
+    max_age: Optional[float] = None,
+    *,
+    allow_stale: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Return cached analysis. allow_stale=True → serve last known even if old (no empty UI)."""
+    _pc_disk_load()
     if max_age is None:
-        max_age = max(float(_PRECOMPUTE_INTERVAL) * 3.0, 10800.0)  # min 3h świeżości precompute
+        max_age = _PRECOMPUTE_SERVE_MAX_AGE if allow_stale else max(
+            float(_PRECOMPUTE_INTERVAL) * 3.0, 10800.0
+        )
     with _PRECOMPUTE_LOCK:
         row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
         if not row:
             return None
-        if time.time() - row["ts"] > max_age:
+        age = time.time() - float(row.get("ts") or 0)
+        if age > max_age:
             return None
-        return dict(row["data"])
+        out = dict(row["data"])
+        out["_cache_age_sec"] = round(age, 1)
+        out["_cache_ts"] = row.get("ts")
+        return out
+
+
+def _pc_age(ticker: str, horizon_label: str) -> Optional[float]:
+    _pc_disk_load()
+    with _PRECOMPUTE_LOCK:
+        row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
+        if not row:
+            return None
+        return time.time() - float(row.get("ts") or 0)
+
+
+def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
+    """Refresh one ticker in background; keep serving old data until done."""
+    key = _pc_key(ticker, horizon_label)
+    with _BG_LOCK:
+        if key in _BG_REFRESHING:
+            return
+        _BG_REFRESHING.add(key)
+
+    def _run():
+        try:
+            # Don't hammer Twelve during cooldown
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                return
+            data = _analyze_one(ticker, horizon_label, fast=True, quality=False)
+            if data and data.get("current_price") is not None:
+                _pc_store(ticker, horizon_label, data)
+                print(f"[bg-refresh] {key} updated")
+        except Exception as e:
+            print(f"[bg-refresh] {key}: {e}")
+        finally:
+            with _BG_LOCK:
+                _BG_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, name=f"bg-{key}", daemon=True).start()
 
 
 def _ticker_list_for_precompute() -> List[str]:
@@ -344,6 +448,16 @@ def _ticker_list_for_precompute() -> List[str]:
 
 def _precompute_all_once() -> None:
     """Jedna pełna runda: najpierw krypto (szybkie), potem akcje 1M+3M."""
+    # Rate-limit: nie dobijaj Twelve; stary cache zostaje widoczny dla userów
+    try:
+        if getattr(core, "_twelve_in_cooldown", lambda: False)():
+            print("[precompute] pause round — Twelve cooldown (serving last known cache)")
+            _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — serving cached forecasts"
+            _PRECOMPUTE_STATUS["running"] = False
+            _pc_disk_load()  # upewnij się że cache z dysku jest w pamięci
+            return
+    except Exception:
+        pass
     tickers = _ticker_list_for_precompute()
     _PRECOMPUTE_STATUS["running"] = True
     _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
@@ -387,6 +501,10 @@ def _precompute_all_once() -> None:
     with _PRECOMPUTE_LOCK:
         n = len(_PRECOMPUTE)
     print(f"[precompute] done, entries={n}")
+    try:
+        _pc_disk_save()
+    except Exception as e:
+        print("[precompute] disk save end:", e)
     # Right after quant precompute: fill AI 3M/6M cache (no user Twelve calls)
     try:
         if ai_full.configured():
@@ -727,6 +845,11 @@ def _analyze_one(
 
 @app.on_event("startup")
 def _startup():
+    # Od razu wczytaj ostatnie prognozy z dysku — UI nie czeka na świeże Twelve
+    try:
+        _pc_disk_load()
+    except Exception as e:
+        print("startup precompute disk:", e)
     key = core.POLYGON_API_KEY or ""
     if not key or key.startswith("WPISZ") or len(key) < 10:
         print("⚠️  Ustaw POLYGON_API_KEY w zmiennych środowiskowych!")
@@ -819,8 +942,10 @@ def analyze(
         with _PRECOMPUTE_LOCK:
             _PRECOMPUTE.pop(_pc_key(t, hz), None)
 
+    # ZAWSZE serwuj ostatnią znaną prognozę (nawet starszą cenę) — zero pustego ładowania.
+    # Odświeżenie w tle; użytkownik widzi gotowe dane od razu.
     if not refresh:
-        cached = _pc_get(t, hz)
+        cached = _pc_get(t, hz, allow_stale=True)
         if (
             cached
             and cached.get("current_price") is not None
@@ -829,7 +954,13 @@ def analyze(
             cached = dict(cached)
             cached["cached"] = True
             cached.pop("fast_mode", None)
-            # Licznik Demo – nawet przy cache (to jest „użycie” analizy przez usera)
+            age = _pc_age(t, hz)
+            # jeśli starsze niż próg — odśwież w tle (nie blokuj odpowiedzi)
+            if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
+                try:
+                    _bg_refresh_ticker(t, hz)
+                except Exception:
+                    pass
             if (prof.get("plan") or "demo").lower() == "demo":
                 new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
                 prof["analyze_count"] = new_c
@@ -838,7 +969,23 @@ def analyze(
             payload["analyze_remaining"] = auth.remaining_analyze(prof)
             return AnalyzeResponse(**payload)
 
-    data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
+    # Brak cache albo refresh=true — licz teraz, potem zapisz
+    try:
+        data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
+    except Exception as e:
+        # Ostateczny fallback: cokolwiek starego z dysku
+        stale = _pc_get(t, hz, max_age=_PRECOMPUTE_SERVE_MAX_AGE, allow_stale=True)
+        if stale and stale.get("current_price") is not None:
+            stale = dict(stale)
+            stale["cached"] = True
+            if (prof.get("plan") or "demo").lower() == "demo":
+                new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
+                prof["analyze_count"] = new_c
+            payload = {k: v for k, v in stale.items() if k in AnalyzeResponse.model_fields}
+            payload["plan"] = (prof.get("plan") or "demo").lower()
+            payload["analyze_remaining"] = auth.remaining_analyze(prof)
+            return AnalyzeResponse(**payload)
+        raise
     data.pop("fast_mode", None)
     try:
         if data.get("current_price") is not None:
@@ -885,39 +1032,45 @@ def rankings(
 
     items: List[RankingItem] = []
     hz = "3M" if _horizon_days(horizon) > 30 else "1M"
-    # dłuższa świeżość przy odczycie rankingu (akcje już wczytane = użyj ich)
-    rank_max_age = max(float(_PRECOMPUTE_INTERVAL) * 6.0, 21600.0)
+    # Ranking TYLKO z gotowego cache (nawet starsze ceny) — NIGDY nie liczy całej listy na request
+    rank_max_age = _PRECOMPUTE_SERVE_MAX_AGE
 
     def _from_analyze_mem(tk: str, hz_lab: str) -> Optional[Dict[str, Any]]:
         """Szukaj w _ANALYZE_CACHE bez ponownego liczenia."""
-        prefix = f"v8|{tk}|{hz_lab}|"
         now = time.time()
         best = None
         best_ts = 0.0
-        for k, row in list(_ANALYZE_CACHE.items()):
-            if not str(k).startswith(prefix):
-                continue
-            ts = float(row.get("ts") or 0)
-            if now - ts > _ANALYZE_CACHE_TTL * 2:
-                continue
-            if ts >= best_ts and row.get("data"):
-                best_ts = ts
-                best = dict(row["data"])
+        for prefix in (f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|"):
+            for k, row in list(_ANALYZE_CACHE.items()):
+                if not str(k).startswith(prefix):
+                    continue
+                ts = float(row.get("ts") or 0)
+                if now - ts > max(_ANALYZE_CACHE_TTL * 4, 86400):
+                    continue
+                if ts >= best_ts and row.get("data"):
+                    best_ts = ts
+                    best = dict(row["data"])
         return best
 
     for tk in tick_list:
         try:
-            d = _pc_get(tk, hz, max_age=rank_max_age)
+            d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
             if not d:
                 d = _from_analyze_mem(tk, hz)
-            # tylko gdy naprawdę brak – jedna szybka próba (nie blokuj całej listy sleepem)
+            # Brak w cache → pomiń w rankingu (nie blokuj UI liczeniem). Odśwież w tle.
             if not d:
                 try:
-                    d = _analyze_one(tk, hz, fast=True, quality=False)
-                    if d and d.get("current_price") is not None:
-                        _pc_store(tk, hz, d)
-                except Exception as e:
-                    print("rankings analyze skip", tk, e)
+                    _bg_refresh_ticker(tk, hz)
+                except Exception:
+                    pass
+                continue
+            # Stale → pokaż teraz, odśwież w tle
+            age = _pc_age(tk, hz)
+            if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
+                try:
+                    _bg_refresh_ticker(tk, hz)
+                except Exception:
+                    pass
                     d = None
             if not d or d.get("current_price") is None:
                 continue
