@@ -429,10 +429,12 @@ def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
 
 
 def _ticker_list_for_precompute() -> List[str]:
+    """Oryginalne 12 NAJPIERW, potem reszta uniwersum."""
     raw = list(getattr(core, "tickers", []) or [])
+    # Dokładnie te, które były od początku — pierwsze w kolejce Twelve
     priority = [
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
-        "JPM", "V", "JNJ", "UNH", "COST", "GS", "AMD", "INTC",
+        "NVDA", "INTC", "AMD", "CSCO", "XOM", "AMZN",
+        "AAPL", "MSFT", "META", "GOOGL", "JPM", "TSLA",
     ]
     if not raw:
         raw = list(priority)
@@ -470,18 +472,32 @@ def _precompute_all_once() -> None:
         _precompute_crypto_once()
     except Exception as e:
         print("[precompute] crypto first:", e)
-    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M/6M")
+    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M/6M (pełna lista)")
     for t in tickers:
+        # Mid-round rate limit: stop NEW twelve calls, keep what we already stored
+        try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print(f"[precompute] cooldown mid-round after {_PRECOMPUTE_STATUS.get('tickers_done')}/{len(tickers)} — keep cache")
+                _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown mid-round — partial cache kept"
+                break
+        except Exception:
+            pass
         _PRECOMPUTE_STATUS["last_ticker"] = t
         for hz in ("1M", "3M", "6M"):
+            # Skip if already fresh enough (< interval) — fills missing tickers first
+            age = _pc_age(t, hz)
+            if age is not None and age < float(_PRECOMPUTE_INTERVAL):
+                continue
             try:
                 data = _analyze_one(t, hz, fast=True, quality=False)
                 if data and data.get("current_price") is not None:
                     _pc_store(t, hz, data)
+                    print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')}")
             except Exception as e:
                 msg = f"{t}/{hz}: {e}"
                 print("[precompute]", msg)
                 _PRECOMPUTE_STATUS["last_error"] = msg
+                # 404/no data — continue other horizons; 429 handled by cooldown
         _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
         time.sleep(_PRECOMPUTE_PAUSE)
     # Po prognozach 1M/3M – odśwież board sygnałów (raz na rundę, nie per user refresh)
@@ -1004,7 +1020,7 @@ def analyze(
 @app.get("/rankings", response_model=RankingsResponse)
 def rankings(
     horizon: str = Query("1M"),
-    limit: int = Query(12, ge=1, le=30),
+    limit: int = Query(30, ge=1, le=80),
     order: str = Query("top", description="top | bottom — najwyższy / najniższy forecast %"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
@@ -1071,7 +1087,6 @@ def rankings(
                     _bg_refresh_ticker(tk, hz)
                 except Exception:
                     pass
-                    d = None
             if not d or d.get("current_price") is None:
                 continue
             items.append(
@@ -1102,6 +1117,9 @@ def rankings(
         ),
         reverse=(order_l == "top"),
     )
+    print(f"[rankings] {hz} order={order_l} rows={len(items)} from universe={len(tick_list)}")
+    if len(items) < 8:
+        print("[rankings] WARN few rows — precompute incomplete or Twelve limit; cache partial")
     items = items[:limit]
     return RankingsResponse(
         horizon=hz,
