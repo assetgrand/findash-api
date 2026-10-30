@@ -187,7 +187,7 @@ def _api_call(url, max_retries=3):
             # Hard rate limit
             if resp.status_code == 429:
                 print(f"❌ Twelve 429 rate limit (attempt {attempt+1})")
-                _twelve_trip_cooldown(1200.0)  # 20 min
+                _twelve_trip_cooldown(180.0)  # 3 min — nie blokuj całej rundy na pół godziny
                 return None
             if resp.status_code == 403:
                 print(f"❌ Twelve 403 Forbidden — key/plan issue")
@@ -202,7 +202,7 @@ def _api_call(url, max_retries=3):
                     low = msg.lower()
                     print(f"❌ Błąd Twelve Data: {msg}")
                     if code == 429 or "run out of api credits" in low or "rate limit" in low or "credits" in low:
-                        _twelve_trip_cooldown(3600.0)  # 1h when daily credits gone
+                        _twelve_trip_cooldown(900.0)  # 15 min when daily credits message
                     return None
             return data
         except requests.exceptions.RequestException as e:

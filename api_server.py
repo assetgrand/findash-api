@@ -457,35 +457,40 @@ def _precompute_all_once() -> None:
         _PRECOMPUTE_STATUS["started_ts"] = time.time()
     # Akcje 1M+3M NAJPIERW. Krypto / backtest / AI NIE startują w tej samej rundzie —
     # one dobijały Twelve zanim reszta oryginalnych 12 zdążyła się policzyć.
-    print(f"[precompute] start {len(tickers)} oryginalnych tickerów × 1M/3M")
-    for t in tickers:
+    # Najpierw 1M dla WSZYSTKICH 12 (ranking miesięczny), potem 3M.
+    # Brakujące najpierw — żeby nie utknąć na jednej NVDA.
+    jobs = []
+    for hz in ("1M", "3M"):
+        missing = [x for x in tickers if _pc_get(x, hz, allow_stale=True) is None]
+        fresh = [x for x in tickers if x not in missing]
+        # odśwież stare na końcu
+        for x in missing + fresh:
+            age = _pc_age(x, hz)
+            if age is not None and age < float(_PRECOMPUTE_INTERVAL):
+                continue
+            jobs.append((x, hz))
+    print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
+    done_tickers = set()
+    for t, hz in jobs:
         try:
             if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                print(f"[precompute] cooldown after {_PRECOMPUTE_STATUS.get('tickers_done')}/{len(tickers)} — cache zostaje")
+                print(f"[precompute] cooldown — entries kept, stop new Twelve calls")
                 _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — partial cache kept"
                 break
         except Exception:
             pass
-        _PRECOMPUTE_STATUS["last_ticker"] = t
-        for hz in ("1M", "3M"):
-            age = _pc_age(t, hz)
-            if age is not None and age < float(_PRECOMPUTE_INTERVAL):
-                continue
-            try:
-                data = _analyze_one(t, hz, fast=True, quality=False)
-                if data and data.get("current_price") is not None:
-                    _pc_store(t, hz, data)
-                    print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')}")
-            except Exception as e:
-                msg = f"{t}/{hz}: {e}"
-                print("[precompute]", msg)
-                _PRECOMPUTE_STATUS["last_error"] = msg
-                try:
-                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                        break
-                except Exception:
-                    pass
-        _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
+        _PRECOMPUTE_STATUS["last_ticker"] = f"{t}/{hz}"
+        try:
+            data = _analyze_one(t, hz, fast=True, quality=False)
+            if data and data.get("current_price") is not None:
+                _pc_store(t, hz, data)
+                print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')} chg={data.get('predicted_change_pct')}")
+        except Exception as e:
+            msg = f"{t}/{hz}: {e}"
+            print("[precompute]", msg)
+            _PRECOMPUTE_STATUS["last_error"] = msg
+        done_tickers.add(t)
+        _PRECOMPUTE_STATUS["tickers_done"] = len(done_tickers)
         time.sleep(_PRECOMPUTE_PAUSE)
 
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
@@ -733,11 +738,15 @@ def _analyze_one(
     fa = None
     fund_rating = None
     combined = None
-    try:
-        fa = core.get_comprehensive_fundamental_analysis(ticker)
-    except Exception as e:
-        print(f"fundamental error {ticker}: {e}")
+    # fast=True (ranking / precompute): bez dodatkowych calli Twelve na fundamenty
+    if fast:
         fa = {"combined_score": 50, "fundamental_rating": None}
+    else:
+        try:
+            fa = core.get_comprehensive_fundamental_analysis(ticker)
+        except Exception as e:
+            print(f"fundamental error {ticker}: {e}")
+            fa = {"combined_score": 50, "fundamental_rating": None}
 
     if fa:
         fund_rating = fa.get("fundamental_rating")
@@ -1033,15 +1042,55 @@ def rankings(
                     best = dict(row["data"])
         return best
 
+    # 1) cache
+    by_tk: Dict[str, Dict[str, Any]] = {}
+    missing: List[str] = []
     for tk in tick_list:
+        d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
+        if not d:
+            d = _from_analyze_mem(tk, hz)
+        if d and d.get("current_price") is not None:
+            by_tk[tk] = d
+        else:
+            missing.append(tk)
+
+    # 2) brakujące — policz SEKWENCYJNIE (jak wcześniej), bez równoległego dobijania Twelve
+    if missing:
+        cool = False
         try:
-            d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
-            if not d:
-                d = _from_analyze_mem(tk, hz)
-            if not d:
-                continue
-            if not d or d.get("current_price") is None:
-                continue
+            cool = bool(getattr(core, "_twelve_in_cooldown", lambda: False)())
+        except Exception:
+            cool = False
+        if cool:
+            print(f"[rankings] {hz} missing={missing} but Twelve cooldown — show cache only")
+        else:
+            print(f"[rankings] {hz} filling missing {missing}")
+            for tk in missing:
+                try:
+                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        print("[rankings] stop fill — cooldown")
+                        break
+                except Exception:
+                    pass
+                try:
+                    d = _analyze_one(tk, hz, fast=True, quality=False)
+                    if d and d.get("current_price") is not None:
+                        _pc_store(tk, hz, d)
+                        by_tk[tk] = d
+                        print(f"[rankings] filled {tk}/{hz}")
+                except Exception as e:
+                    print("rankings fill skip", tk, e)
+                time.sleep(1.2)
+            try:
+                _pc_disk_save()
+            except Exception:
+                pass
+
+    for tk in tick_list:
+        d = by_tk.get(tk)
+        if not d or d.get("current_price") is None:
+            continue
+        try:
             items.append(
                 RankingItem(
                     ticker=str(d.get("ticker") or tk).upper(),
