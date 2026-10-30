@@ -267,8 +267,8 @@ def get_live_price(ticker):
 
 # Domyślna głębokość historii pod Hit/backtest (~8 lat kalendarzowych).
 # Młodsze spółki: Twelve i tak zwróci tylko dostępne sesje.
-DEFAULT_HISTORY_DAYS = 2920  # ~8 lat
-HISTORY_START_FLOOR = "2015-01-01"  # nie prosimy starszych niż to (stabilny floor)
+DEFAULT_HISTORY_DAYS = 2500  # ~od 2020 (kalendarzowo)
+HISTORY_START_FLOOR = "2020-01-01"  # analiza od 2020, nie tylko ostatnie świece
 
 
 def get_historical_prices(ticker, days=None):
@@ -286,9 +286,9 @@ def get_historical_prices(ticker, days=None):
     # prosimy o wystarczająco barek sesyjnych (NO kalendarz 1:1)
     calendar_days = max(int(days), 800)
     # max 5000 barek (limit typowy Twelve daily)
-    outputsize = max(400, min(int(calendar_days * 0.72) + 80, 5000))
+    outputsize = max(1200, min(int(calendar_days * 0.75) + 100, 5000))  # min ~1200 sesji od 2020
 
-    cache_key = _cache_key("hist_v3", sym, outputsize)
+    cache_key = _cache_key("hist_v4_2020", sym, outputsize)
     cached = _cache_get(cache_key)
     if cached is not None:
         try:
@@ -304,7 +304,8 @@ def get_historical_prices(ticker, days=None):
             df = df.dropna(subset=["Close"])
             df = df[~df.index.duplicated(keep="last")]
             df.sort_index(inplace=True)
-            if len(df) >= 60:
+            # odrzuć krótki cache (kiedyś bywało ~60 świec) — potrzeba historii od ~2020
+            if len(df) >= 400:
                 return df
         except Exception:
             pass
@@ -312,8 +313,10 @@ def get_historical_prices(ticker, days=None):
     from urllib.parse import quote
     end_d = datetime.now().strftime("%Y-%m-%d")
     start_by_days = (datetime.now() - timedelta(days=calendar_days + 60)).strftime("%Y-%m-%d")
-    # nie wcześniej niż floor (spójny zakres); młodsze tickery i tak mają krótszy szereg
+    # twardo od 2020 (albo później jeśli days krótsze) — pełny szereg pod Hit/prognozę
     start_d = max(start_by_days, HISTORY_START_FLOOR)
+    if calendar_days >= 1500:
+        start_d = HISTORY_START_FLOOR  # zawsze od 2020 przy domyślnej głębokości
     sym_q = quote(sym, safe="/")
     url = (
         f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"

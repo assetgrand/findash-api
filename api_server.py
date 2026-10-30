@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "analysis-parity-v10"
-PRECOMPUTE_GEN = "core-v4-bust-2026-10-30b"
+API_BUILD = "hist-from-2020-v1"
+PRECOMPUTE_GEN = "hist-from-2020-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -766,7 +766,8 @@ def _analyze_one(
     hit_rate = mae = n_sig = None
     analysis_mode = "default"
     modes_tried = ["default"]
-    max_pts = 18 if quality else 12
+    # max_points=3 — przy 12/18 hit spadał; to ustawienie dawało lepsze wyniki u Ciebie
+    max_pts = 3
     try:
         if hasattr(core, "analyze_forecast_with_retries"):
             res = core.analyze_forecast_with_retries(
