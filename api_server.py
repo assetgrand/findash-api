@@ -429,23 +429,11 @@ def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
 
 
 def _ticker_list_for_precompute() -> List[str]:
-    """Oryginalne 12 NAJPIERW, potem reszta uniwersum."""
-    raw = list(getattr(core, "tickers", []) or [])
-    # Dokładnie te, które były od początku — pierwsze w kolejce Twelve
-    priority = [
+    """Tylko oryginalne 12. Większa lista zjada kredyty Twelve i zostaje sama NVDA."""
+    return [
         "NVDA", "INTC", "AMD", "CSCO", "XOM", "AMZN",
         "AAPL", "MSFT", "META", "GOOGL", "JPM", "TSLA",
     ]
-    if not raw:
-        raw = list(priority)
-    seen = set()
-    out = []
-    for t in priority + raw:
-        t = str(t).upper().strip()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
 
 
 def _precompute_all_once() -> None:
@@ -467,24 +455,19 @@ def _precompute_all_once() -> None:
     _PRECOMPUTE_STATUS["last_error"] = None
     if _PRECOMPUTE_STATUS.get("started_ts") is None:
         _PRECOMPUTE_STATUS["started_ts"] = time.time()
-    # Krypto NA START rundy (nie na końcu po 15+ akcjach) – jak reszta „od deploya”
-    try:
-        _precompute_crypto_once()
-    except Exception as e:
-        print("[precompute] crypto first:", e)
-    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M/6M (pełna lista)")
+    # Akcje 1M+3M NAJPIERW. Krypto / backtest / AI NIE startują w tej samej rundzie —
+    # one dobijały Twelve zanim reszta oryginalnych 12 zdążyła się policzyć.
+    print(f"[precompute] start {len(tickers)} oryginalnych tickerów × 1M/3M")
     for t in tickers:
-        # Mid-round rate limit: stop NEW twelve calls, keep what we already stored
         try:
             if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                print(f"[precompute] cooldown mid-round after {_PRECOMPUTE_STATUS.get('tickers_done')}/{len(tickers)} — keep cache")
-                _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown mid-round — partial cache kept"
+                print(f"[precompute] cooldown after {_PRECOMPUTE_STATUS.get('tickers_done')}/{len(tickers)} — cache zostaje")
+                _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — partial cache kept"
                 break
         except Exception:
             pass
         _PRECOMPUTE_STATUS["last_ticker"] = t
-        for hz in ("1M", "3M", "6M"):
-            # Skip if already fresh enough (< interval) — fills missing tickers first
+        for hz in ("1M", "3M"):
             age = _pc_age(t, hz)
             if age is not None and age < float(_PRECOMPUTE_INTERVAL):
                 continue
@@ -497,20 +480,13 @@ def _precompute_all_once() -> None:
                 msg = f"{t}/{hz}: {e}"
                 print("[precompute]", msg)
                 _PRECOMPUTE_STATUS["last_error"] = msg
-                # 404/no data — continue other horizons; 429 handled by cooldown
+                try:
+                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        break
+                except Exception:
+                    pass
         _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
         time.sleep(_PRECOMPUTE_PAUSE)
-    # Po prognozach 1M/3M – odśwież board sygnałów (raz na rundę, nie per user refresh)
-    try:
-        _precompute_signals_once()
-    except Exception as e:
-        print("[precompute] signals:", e)
-
-    # Domyślne backtesty (capital=10000, forecast 1M/3M) – strona bierze z cache
-    try:
-        _precompute_backtests_once()
-    except Exception as e:
-        print("[precompute] backtests:", e)
 
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
@@ -521,12 +497,6 @@ def _precompute_all_once() -> None:
         _pc_disk_save()
     except Exception as e:
         print("[precompute] disk save end:", e)
-    # Right after quant precompute: fill AI 3M/6M cache (no user Twelve calls)
-    try:
-        if ai_full.configured():
-            _ai_board_once()
-    except Exception as e:
-        print("[precompute] ai-board follow-up:", e)
 
 
 def _gemini_should_wait(err: BaseException) -> bool:
@@ -624,7 +594,7 @@ def _ai_board_once() -> None:
         _AI_BOARD_STATUS["last_error"] = "GEMINI_API_KEY not set"
         return
     tickers = _ticker_list_for_precompute()
-    horizons = ("3M", "6M")
+    horizons = ("3M",)
     pause = float(os.environ.get("AI_BOARD_PAUSE", "2"))
     _AI_BOARD_STATUS["running"] = True
     _AI_BOARD_STATUS["done"] = 0
@@ -639,7 +609,6 @@ def _ai_board_once() -> None:
                 try:
                     quant = _pc_get(t, hz)
                     if not quant:
-                        print(f"[ai-board] skip {t}/{hz}: no quant precompute yet")
                         continue
                     fundamentals = None
                     perspective = None
@@ -672,14 +641,18 @@ def _ai_board_once() -> None:
 
 
 def _ai_board_worker() -> None:
-    """Po deployu: szybki board 1M (1× Gemini na spółkę), start po kilku sekundach."""
-    time.sleep(3)
+    """AI dopiero po tym jak 12 spółek ma prognozy. Nie startuje razem z Twelve."""
+    time.sleep(int(os.environ.get("AI_BOARD_START_DELAY", "7200")))
     interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
     while True:
-        if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
+        if os.environ.get("AI_PRECOMPUTE_ENABLED", "0") != "1":
             time.sleep(60)
             continue
         try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print("[ai-board] skip round — Twelve cooldown")
+                time.sleep(900)
+                continue
             _ai_board_once()
         except Exception as e:
             print("[ai-board] worker:", e)
@@ -877,17 +850,7 @@ def _startup():
         print("startup macro:", e)
     if _PRECOMPUTE_ENABLED:
         threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
-        print(f"[precompute] worker ON interval={_PRECOMPUTE_INTERVAL}s")
-        threading.Thread(target=_ai_board_worker, name="ai-board", daemon=True).start()
-        print("[ai-board] worker ON (after first forecast round)")
-        # Osobny szybki wątek: krypto zaraz po starcie dyno (nie czeka na kolejkę akcji)
-        def _crypto_boot():
-            time.sleep(1)
-            try:
-                _precompute_crypto_once()
-            except Exception as e:
-                print("[crypto-boot]", e)
-        threading.Thread(target=_crypto_boot, name="crypto-boot", daemon=True).start()
+        print(f"[precompute] worker ON — tylko 12 spółek, 1M i 3M")
     else:
         print("[precompute] OFF (PRECOMPUTE_ENABLED=0)")
 
@@ -973,8 +936,10 @@ def analyze(
             age = _pc_age(t, hz)
             # jeśli starsze niż próg — odśwież w tle (nie blokuj odpowiedzi)
             if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
+                # nie odpalaj Twelve z widoku pojedynczej spółki gdy limit już padł
                 try:
-                    _bg_refresh_ticker(t, hz)
+                    if not getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        _bg_refresh_ticker(t, hz)
                 except Exception:
                     pass
             if (prof.get("plan") or "demo").lower() == "demo":
@@ -1073,20 +1038,8 @@ def rankings(
             d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
             if not d:
                 d = _from_analyze_mem(tk, hz)
-            # Brak w cache → pomiń w rankingu (nie blokuj UI liczeniem). Odśwież w tle.
             if not d:
-                try:
-                    _bg_refresh_ticker(tk, hz)
-                except Exception:
-                    pass
                 continue
-            # Stale → pokaż teraz, odśwież w tle
-            age = _pc_age(tk, hz)
-            if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
-                try:
-                    _bg_refresh_ticker(tk, hz)
-                except Exception:
-                    pass
             if not d or d.get("current_price") is None:
                 continue
             items.append(
@@ -1189,10 +1142,24 @@ def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
 
 
 def _precompute_backtests_once() -> None:
-    """Strategy + forecast quality dla listy priorytetowej – wspólny cache."""
-    tickers = _ticker_list_for_precompute()[:12]
+    """Tylko gdy Twelve nie jest w cooldownie i ticker ma już cache cen."""
+    try:
+        if getattr(core, "_twelve_in_cooldown", lambda: False)():
+            print("[bt-precompute] skip — Twelve cooldown")
+            return
+    except Exception:
+        pass
+    tickers = _ticker_list_for_precompute()
     cap = 10000
     for t in tickers:
+        try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print("[bt-precompute] stop — cooldown")
+                return
+        except Exception:
+            pass
+        if _pc_get(t, "1M") is None and _pc_get(t, "3M") is None:
+            continue
         try:
             key_s = _bt_cache_key("strategy", t, cap)
             data_s = reports.strategy_backtest(t, initial_capital=float(cap))

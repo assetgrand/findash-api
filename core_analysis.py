@@ -4657,16 +4657,8 @@ def get_3year_perspective(ticker, fundamental_score=None):
 # LISTA TICKERÓW DOMYŚLNA (API / rankings)
 # ============================================================
 tickers = [
-    # Oryginalne 12 — ZAWSZE pierwsze (priorytet precompute / ranking)
     "NVDA", "INTC", "AMD", "CSCO", "XOM", "AMZN",
     "AAPL", "MSFT", "META", "GOOGL", "JPM", "TSLA",
-    # Rozszerzenie (po oryginalnych)
-    "AVGO", "ORCL", "CRM", "ADBE", "NFLX", "QCOM", "TXN", "IBM",
-    "V", "MA", "BAC", "WFC", "GS", "MS", "AXP", "BLK", "SPGI",
-    "JNJ", "UNH", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT",
-    "COST", "WMT", "HD", "MCD", "NKE", "SBUX", "PG", "KO", "PEP", "DIS",
-    "CVX", "COP", "CAT", "GE", "HON", "UPS", "RTX",
-    "BA", "NOW", "INTU", "AMAT", "MU", "UBER", "PLTR",
 ]
 all_data = {}
 stock_analysis_data_1m = []
