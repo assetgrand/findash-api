@@ -2620,24 +2620,32 @@ def _build_training_set(df, horizon_days, max_samples=None):
 
 
 def _heuristic_momentum_return(feats, regime, days_forward):
+    """Heuristic edge: horizon-matched momentum + mean-reversion + volume confirm."""
     scale = days_forward / 21.0
-    # 3M: dłuższy momentum ważniejszy (ret5 często szum na 63d)
+    # 3M: dłuższy momentum; 1M: świeższy, ale ret20 nadal kotwica
     if days_forward > 30:
         mom = (
-            0.08 * feats['ret5']
-            + 0.17 * feats['ret10']
-            + 0.30 * feats['ret20']
-            + 0.45 * feats.get('ret60', 0.0)
+            0.05 * feats['ret5']
+            + 0.12 * feats['ret10']
+            + 0.28 * feats['ret20']
+            + 0.55 * feats.get('ret60', 0.0)
         )
     else:
         mom = (
-            0.25 * feats['ret5']
-            + 0.35 * feats['ret10']
-            + 0.25 * feats['ret20']
+            0.22 * feats['ret5']
+            + 0.33 * feats['ret10']
+            + 0.30 * feats['ret20']
             + 0.15 * feats.get('ret60', 0.0)
         )
     if feats.get('mom_agree', 0) > 0:
-        mom *= 1.12
+        mom *= 1.14
+    # Volume confirmation: high volume + mom_agree strengthens; high vol alone weakens noise
+    vr = float(feats.get('vol_ratio') or 1.0)
+    if vr >= 1.35 and feats.get('mom_agree', 0) > 0:
+        mom *= 1.10
+    elif vr >= 1.60 and feats.get('mom_agree', 0) <= 0:
+        mom *= 0.82
+
     mr = 0.0
     if feats['rsi'] > 70:
         mr -= (feats['rsi'] - 70) * 0.18
@@ -2651,21 +2659,30 @@ def _heuristic_momentum_return(feats, regime, days_forward):
         mr -= 0.8
     elif feats.get('stoch_k', 50) < 20:
         mr += 0.8
+    # Distance from SMA200: 3M mean-reversion / trend context
+    d200 = float(feats.get('dist_sma200') or 0.0)
+    if days_forward > 30:
+        if d200 > 25:
+            mr -= 1.2
+        elif d200 < -20:
+            mr += 1.2
     slope = feats.get('sma_slope', 0.0)
     if regime == 'TREND_UP':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
+        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
         if feats['macd_hist'] > 0:
-            pred += 0.5 * scale
+            pred += 0.55 * scale
     elif regime == 'TREND_DOWN':
-        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
+        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
         if feats['macd_hist'] < 0:
-            pred -= 0.5 * scale
+            pred -= 0.55 * scale
     elif regime == 'HIGH_VOL':
-        pred = mom * 0.20 * scale + mr * 0.50 * scale
+        pred = mom * 0.18 * scale + mr * 0.52 * scale
     else:
-        pred = mom * 0.12 * scale + mr * 0.55 * scale
+        pred = mom * 0.14 * scale + mr * 0.52 * scale
     if feats['adx'] > 30 and regime in ('TREND_UP', 'TREND_DOWN'):
         pred *= 1.12
+    elif feats['adx'] < 18:
+        pred *= 0.88  # weak trend → trust less momentum
     return float(np.clip(pred, -22, 22))
 
 
@@ -2864,13 +2881,22 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, STRONGjszy prior przy sporze."""
+    """Ensemble v4: horizon-aware model mix + agreement-aware blend."""
     built = _build_training_set(df, days_forward)
     if built[0] is None:
         X, y, sw = None, None, None
     else:
         X, y, sw = built
     weights = _calibrate_model_weights(X, y, days_forward, regime)
+    # Horizon priors: 1M more short-signal (heuristic/gb), 3M more ridge/stable
+    if days_forward <= 30:
+        hz_prior = {'ridge': 0.30, 'gb': 0.34, 'heuristic': 0.36}
+    else:
+        hz_prior = {'ridge': 0.40, 'gb': 0.32, 'heuristic': 0.28}
+    for k in weights:
+        weights[k] = 0.65 * weights.get(k, 0.33) + 0.35 * hz_prior.get(k, 0.33)
+    s = sum(weights.values()) or 1.0
+    weights = {k: weights[k] / s for k in weights}
     preds = {}
     preds['heuristic'] = _heuristic_momentum_return(feats, regime, days_forward)
     x_now = np.array([[feats[k] for k in FEATURE_KEYS]], dtype=float)
@@ -3086,11 +3112,11 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
 
 
 def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
-    """Prognoza 1M/3M v2 + wyjątki tylko dla wybranych par ticker/horyzont."""
+    """Prognoza 1M/3M ensemble v4 — horizon-aware mix, volume confirm, drift anchors (Hit definition unchanged)."""
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    _log(f"🔍 ENSEMBLE v3m | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v4 | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3117,19 +3143,29 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v3b: rozdział 1M vs 3M (jak desktop main)
+    # v4: 1M more technical; 3M more fundamental + drift (fundamentals matter more over quarters)
     if horizon == '1M':
-        tech_w = min(0.74, base_tech + 0.12)
+        tech_w = min(0.76, base_tech + 0.14)
     else:
-        tech_w = max(0.28, base_tech - 0.16)
+        tech_w = max(0.26, base_tech - 0.18)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.80 if horizon == '1M' else 0.75
+        tech_w *= 0.78 if horizon == '1M' else 0.72
     if regime == 'RANGE':
-        tech_w *= 0.90 if horizon == '1M' else 0.85
+        tech_w *= 0.88 if horizon == '1M' else 0.82
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.85, tech_w + (0.06 if horizon == '1M' else 0.04))
+        tech_w = min(0.86, tech_w + (0.07 if horizon == '1M' else 0.05))
+    # Strong fundamental extreme on 3M: allow fund more voice
+    if horizon == '3M' and abs(fund_score - 50) >= 15:
+        tech_w = max(0.22, tech_w - 0.06)
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
+    # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
+    try:
+        if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
+            if abs(tech_ret) >= 1.0 and tech_ret * blended_ret > 0:
+                blended_ret *= 1.05
+    except Exception:
+        pass
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
         blended_ret *= 1.04 if horizon == '1M' else 1.02
 
@@ -3233,13 +3269,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
-    # v3m: 3M mocniej kotwiczy w dłuższym dryfie (lepszy kierunek, bez zmiany Hit%)
+    # v4: 3M kotwica w dłuższym dryfie; 1M lekki short drift (mniej szumu)
     if horizon == '1M':
-        drift_w = 0.12
+        drift_w = 0.14
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.26
-        mix_prior = 0.50 * hist_med + 0.50 * hist_med_long
+        drift_w = 0.30
+        mix_prior = 0.45 * hist_med + 0.55 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
     # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
@@ -3272,6 +3308,15 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
           f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
           f"| w={model_weights}")
+
+    # Residual bias: if recent local accuracy is OK but magnitude systematically off, shrink toward hist median
+    # (does not redefine Hit — only improves direction/magnitude quality)
+    try:
+        if loc is not None and 0.45 <= loc <= 0.70 and abs(hist_med) >= 0.8:
+            # pull 12% toward historical median direction when models are mediocre
+            blended_ret = 0.88 * blended_ret + 0.12 * hist_med
+    except Exception:
+        pass
 
     # Kalibracja wielkości (znak bez zmian → Hit% stabilny, MAE w dół)
     pre_cal = blended_ret
@@ -3953,6 +3998,147 @@ def _own_history_conditional_dd(data, position_now, window_fwd=126, min_samples=
     }
 
 
+
+def _perspective_3y_direction_bias(price, sma200, pos, ret_63, ret_126):
+    """
+    Kierunek diagnostyczny 3Y (ten sam w live-logice hit i w backteście).
+
+    Zasada: NIE shortuj automatycznie blisko ATH przy silnym uptrendzie
+    (to psuło NVDA i podobne). Kontynuacja trendu + momentum;
+    mean-reversion tylko gdy ekstremum range I słabnący momentum.
+    """
+    if price is None or sma200 is None or sma200 <= 0 or price <= 0:
+        return 0
+    ret_63 = 0.0 if ret_63 is None else float(ret_63)
+    ret_126 = 0.0 if ret_126 is None else float(ret_126)
+    pos = 50.0 if pos is None else float(pos)
+
+    above = price > sma200 * 1.02
+    below = price < sma200 * 0.98
+    mom_up = ret_126 > 4.0 or (ret_63 > 3.0 and ret_126 > 0)
+    mom_dn = ret_126 < -4.0 or (ret_63 < -3.0 and ret_126 < 0)
+    mom_flat = abs(ret_126) <= 4.0 and abs(ret_63) <= 3.0
+
+    # 1) silny trend + zgodne momentum → kontynuacja
+    if above and mom_up:
+        bias = 1
+    elif below and mom_dn:
+        bias = -1
+    # 2) ekstremum range TYLKO ze słabnącym / przeciwnym momentum
+    elif pos >= 90 and (mom_dn or (mom_flat and ret_63 < 0)):
+        bias = -1
+    elif pos <= 20 and (mom_up or (mom_flat and ret_63 > 0)):
+        bias = 1
+    # 3) sam trend względem SMA200
+    elif above and not mom_dn:
+        bias = 1
+    elif below and not mom_up:
+        bias = -1
+    # 4) środek range, momentum rozstrzyga
+    elif mom_up and ret_126 > ret_63 * 0.3:
+        bias = 1
+    elif mom_dn and ret_126 < ret_63 * 0.3:
+        bias = -1
+    else:
+        bias = 0
+    return int(bias)
+
+
+def backtest_perspective_3y_quality(df, forward_days=126, max_points=28, step=None):
+    """
+    Walk-forward Hit% – bias 3Y (trend+momentum, bez ślepego shorta na ATH)
+    vs faktyczny return przez `forward_days` sesji (~6m).
+
+    Uczciwa metryka diagnostyczna; NIE zmienia definicji Hit 1M/3M.
+    """
+    if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+        return None
+    df_clean = df.ffill().bfill()
+    n = len(df_clean)
+    min_lookback = 252
+    if n < min_lookback + forward_days + 30:
+        return None
+
+    end = n - forward_days - 1
+    if end < min_lookback + 20:
+        return None
+
+    if step is None:
+        step = max(12, forward_days // 5)
+
+    start_i = max(min_lookback, end - max_points * step)
+    indices = list(range(start_i, end + 1, step))
+    if len(indices) < 6:
+        step = max(8, step // 2)
+        start_i = max(min_lookback, end - (max_points + 10) * step)
+        indices = list(range(start_i, end + 1, step))
+    if len(indices) < 5:
+        return None
+
+    min_move = 6.0 if forward_days <= 90 else 8.0
+    dir_hits = 0
+    significant = 0
+    abs_errors = []
+
+    closes = df_clean["Close"].astype(float)
+
+    for i in indices:
+        try:
+            if i < 200:
+                continue
+            window = closes.iloc[max(0, i - 756) : i + 1]
+            if len(window) < min_lookback:
+                continue
+            price = float(closes.iloc[i])
+            if price <= 0:
+                continue
+            high = float(window.max())
+            low = float(window.min())
+            rng = high - low
+            pos = ((price - low) / rng) * 100.0 if rng > 0 else 50.0
+
+            sma = float(closes.iloc[i - 199 : i + 1].mean())
+            p63 = float(closes.iloc[i - 63]) if i >= 63 else price
+            p126 = float(closes.iloc[i - 126]) if i >= 126 else price
+            ret_63 = (price / p63 - 1.0) * 100.0 if p63 > 0 else 0.0
+            ret_126 = (price / p126 - 1.0) * 100.0 if p126 > 0 else 0.0
+
+            bias = _perspective_3y_direction_bias(price, sma, pos, ret_63, ret_126)
+            if bias == 0:
+                continue
+
+            p1 = float(closes.iloc[i + forward_days])
+            if p1 <= 0:
+                continue
+            actual = (p1 / price - 1.0) * 100.0
+            abs_errors.append(abs(actual))
+
+            if abs(actual) < min_move:
+                continue
+            significant += 1
+            if (bias > 0 and actual > 0) or (bias < 0 and actual < 0):
+                dir_hits += 1
+        except Exception:
+            continue
+
+    if significant < 4:
+        hit = 50.0
+    else:
+        hit = 100.0 * dir_hits / significant
+
+    return {
+        "hit_rate": round(float(hit), 1),
+        "n_significant": int(significant),
+        "forward_days": int(forward_days),
+        "mae_abs_move": round(float(np.mean(abs_errors)), 2) if abs_errors else None,
+        "engine": "perspective-3y-hit-v2",
+        "note": (
+            "Directional hit of 3Y bias (trend+momentum) vs next ~"
+            f"{forward_days} sessions. No auto-short at ATH."
+        ),
+    }
+
+
 def get_3year_perspective(ticker, fundamental_score=None):
     """
     Perspektywa 3-letnia + analogie do historycznych krachów/korekt
@@ -4189,12 +4375,15 @@ def get_3year_perspective(ticker, fundamental_score=None):
         risk_pct = round(float(np.clip(risk_pct * min(downside_mult, 1.15), 8.0, 55.0)), 1)
         upside_pct = round(float(np.clip(upside_pct * min(upside_mult, 1.15), 10.0, 95.0)), 1)
 
-        # Twarde reguły okazja/zagrożeNO – spójne z crash + risk of drop
-        if crash_risk_score >= 65 or risk_pct >= 26 or position_in_10y >= 88:
+        # Reguły okazja/zagrożenie – ryzyko przy ATH zostaje, ale silny uptrend
+        # nie jest automatycznie "tylko zagrożenie bez upside"
+        if crash_risk_score >= 70 or risk_pct >= 28 or position_in_10y >= 92:
             big_threat = "YES"
-        if crash_risk_score >= 70 and position_in_10y >= 80:
-            duza_okazja = "NO"  # nigdy "okazja" przy HIGHm crash blisko szczytu
-        if duza_okazja == "YES" and (crash_risk_score >= 60 or risk_pct >= upside_pct):
+        elif crash_risk_score >= 65 and position_in_10y >= 88:
+            big_threat = "YES"
+        if crash_risk_score >= 72 and position_in_10y >= 85:
+            duza_okazja = "NO"
+        if duza_okazja == "YES" and (crash_risk_score >= 65 or risk_pct >= upside_pct * 1.05):
             duza_okazja = "NO"
         if (
             position_in_10y <= 35
@@ -4204,6 +4393,14 @@ def get_3year_perspective(ticker, fundamental_score=None):
             duza_okazja = "YES"
             if risk_pct < 22 and crash_risk_score < 55:
                 big_threat = "NO"
+        # silny uptrend + nie ekstremalny crash: nie blokuj upside narracji
+        if (
+            trend_3y in ("STRONG UPTREND", "SILNIE WZROSTOWY", "UPTREND", "WZROSTOWY")
+            and crash_risk_score < 75
+            and position_in_10y < 95
+        ):
+            if upside_pct < risk_pct:
+                upside_pct = round(max(upside_pct, risk_pct * 0.95), 1)
 
         # Krótki "why" – UX, zero wpływu na 1M/3M
         why = []
@@ -4224,6 +4421,17 @@ def get_3year_perspective(ticker, fundamental_score=None):
         why.append(
             f"Risk of drop ~{risk_pct}% vs upside ~{upside_pct}% (trend: {trend_3y})."
         )
+
+        # Hit diagnostyczny 3Y (walk-forward bias vs ~6m) – osobno od 1M/3M
+        hit_3y = None
+        try:
+            hist_for_hit = data_10y if has_10y and len(data_10y) > len(data_3y) else data_3y
+            hit_3y = backtest_perspective_3y_quality(
+                hist_for_hit, forward_days=126, max_points=24
+            )
+        except Exception as e:
+            print(f"3Y hit backtest {ticker}: {e}")
+            hit_3y = None
 
         return {
             'ticker': ticker,
@@ -4252,7 +4460,11 @@ def get_3year_perspective(ticker, fundamental_score=None):
             'analogy_details': analogies,
             'own_conditional_dd': own_dd,
             'rationale': why,
-            'engine': 'perspective-3y-v3',
+            'hit_rate': (hit_3y or {}).get('hit_rate'),
+            'n_significant': (hit_3y or {}).get('n_significant'),
+            'hit_forward_days': (hit_3y or {}).get('forward_days'),
+            'hit_details': hit_3y,
+            'engine': 'perspective-3y-v3-hit2',
         }
     except Exception as e:
         print(f"Błąd analizy 3-year dla {ticker}: {e}")
