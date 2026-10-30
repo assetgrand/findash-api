@@ -22,7 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-3m6m-cache-v1"
+API_BUILD = "analysis-parity-v10"
+PRECOMPUTE_GEN = "core-v4-bust-2026-10-30b"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -331,7 +332,14 @@ def _pc_disk_load() -> None:
                 ts = float(v.get("ts") or 0)
                 if now - ts > _PRECOMPUTE_SERVE_MAX_AGE:
                     continue
-                _PRECOMPUTE[str(k)] = {"ts": ts, "data": dict(v["data"])}
+                # tylko ta sama generacja core — inaczej po deployu stary hit wraca z dysku
+                if str(v.get("gen") or "") != str(PRECOMPUTE_GEN):
+                    continue
+                _PRECOMPUTE[str(k)] = {
+                    "ts": ts,
+                    "gen": PRECOMPUTE_GEN,
+                    "data": dict(v["data"]),
+                }
                 n += 1
         print(f"[precompute] disk loaded {n} entries")
     except Exception as e:
@@ -358,6 +366,7 @@ def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
     with _PRECOMPUTE_LOCK:
         _PRECOMPUTE[_pc_key(ticker, horizon_label)] = {
             "ts": time.time(),
+            "gen": PRECOMPUTE_GEN,
             "data": dict(data),
         }
     # persist async-ish (cheap enough)
@@ -383,6 +392,9 @@ def _pc_get(
     with _PRECOMPUTE_LOCK:
         row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
         if not row:
+            return None
+        # stary cache z poprzedniego core / build — wyrzuć
+        if str(row.get("gen") or "") != str(PRECOMPUTE_GEN):
             return None
         age = time.time() - float(row.get("ts") or 0)
         if age > max_age:
@@ -415,7 +427,7 @@ def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
             # Don't hammer Twelve during cooldown
             if getattr(core, "_twelve_in_cooldown", lambda: False)():
                 return
-            data = _analyze_one(ticker, horizon_label, fast=True, quality=False)
+            data = _analyze_one(ticker, horizon_label, fast=False, quality=True)
             if data and data.get("current_price") is not None:
                 _pc_store(ticker, horizon_label, data)
                 print(f"[bg-refresh] {key} updated")
@@ -481,7 +493,7 @@ def _precompute_all_once() -> None:
             pass
         _PRECOMPUTE_STATUS["last_ticker"] = f"{t}/{hz}"
         try:
-            data = _analyze_one(t, hz, fast=True, quality=False)
+            data = _analyze_one(t, hz, fast=False, quality=True)
             if data and data.get("current_price") is not None:
                 _pc_store(t, hz, data)
                 print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')} chg={data.get('predicted_change_pct')}")
@@ -704,7 +716,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v9|{ticker}|{horizon_label}|{mode}|{day_key}|retry2"
+    cache_key = f"v10|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -738,15 +750,12 @@ def _analyze_one(
     fa = None
     fund_rating = None
     combined = None
-    # fast=True (ranking / precompute): bez dodatkowych calli Twelve na fundamenty
-    if fast:
+    # ZAWSZE te same fundamenty co w pełnej analizie — inaczej % i hit się rozjeżdżają
+    try:
+        fa = core.get_comprehensive_fundamental_analysis(ticker)
+    except Exception as e:
+        print(f"fundamental error {ticker}: {e}")
         fa = {"combined_score": 50, "fundamental_rating": None}
-    else:
-        try:
-            fa = core.get_comprehensive_fundamental_analysis(ticker)
-        except Exception as e:
-            print(f"fundamental error {ticker}: {e}")
-            fa = {"combined_score": 50, "fundamental_rating": None}
 
     if fa:
         fund_rating = fa.get("fundamental_rating")
@@ -858,6 +867,9 @@ def _startup():
     except Exception as e:
         print("startup macro:", e)
     if _PRECOMPUTE_ENABLED:
+        # wymuszenie: pamięć analizy zawsze pusta po restarcie (deploy)
+        _ANALYZE_CACHE.clear()
+        print(f"[cache] PRECOMPUTE_GEN={PRECOMPUTE_GEN} — stare wpisy bez gen odrzucone")
         threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
         print(f"[precompute] worker ON — tylko 12 spółek, 1M i 3M")
     else:
@@ -905,7 +917,7 @@ def analyze(
     ticker: str,
     horizon: str = Query("1M", description="1M lub 3M"),
     fast: int = Query(1, description="kompatybilność"),
-    quality: int = Query(0, description="1=więcej punktów Hit% backtestu"),
+    quality: int = Query(1, description="1=więcej punktów Hit% backtestu"),
     refresh: int = Query(0, description="1=pomiń precompute/cache, przelicz teraz"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
@@ -1030,7 +1042,7 @@ def rankings(
         now = time.time()
         best = None
         best_ts = 0.0
-        for prefix in (f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|"):
+        for prefix in (f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|"):
             for k, row in list(_ANALYZE_CACHE.items()):
                 if not str(k).startswith(prefix):
                     continue
@@ -1073,7 +1085,7 @@ def rankings(
                 except Exception:
                     pass
                 try:
-                    d = _analyze_one(tk, hz, fast=True, quality=False)
+                    d = _analyze_one(tk, hz, fast=False, quality=True)
                     if d and d.get("current_price") is not None:
                         _pc_store(tk, hz, d)
                         by_tk[tk] = d

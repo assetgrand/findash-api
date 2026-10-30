@@ -153,6 +153,14 @@ def _normalize_symbol(ticker: str) -> str:
             return f"{t[:-3]}/USD"
     return t
 
+
+# kompatybilność z api_server (cooldown) — ten core nie blokuje agresywnie
+_TWELVE_COOLDOWN_UNTIL = 0.0
+def _twelve_in_cooldown() -> bool:
+    return False
+def _twelve_trip_cooldown(seconds: float = 900.0) -> None:
+    return
+
 def _api_call(url, max_retries=3):
     """Wykonuje zapytaNO do Twelve Data API."""
     for attempt in range(max_retries):
