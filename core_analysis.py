@@ -116,25 +116,19 @@ def _cache_key(func_name, *args, **kwargs):
     key_str = func_name + "_" + "_".join(str(a) for a in args) + "_" + "_".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
     return hashlib.md5(key_str.encode()).hexdigest()
 
-def _cache_get(key, hours=None, allow_stale=False):
-    """hours=None → 1h default; hist longer. allow_stale / cooldown → return old data."""
+def _cache_get(key, hours=None):
+    """hours=None → 1h default; hist_v2 może brać dłużej (more stable Hit)."""
     path = os.path.join(_CACHE_DIR, f"{key}.json")
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             ttl = hours if hours is not None else 1
+            # hist_* – 6h, żeby po limicie Twelve NO liczyć hitu na urywanej historii
             if hours is None and str(key).startswith("hist"):
-                ttl = 24  # keep history longer — protects against 429 / no data
-            age_h = (datetime.now() - datetime.fromisoformat(data['_timestamp'])).total_seconds() / 3600.0
-            if age_h < ttl:
+                ttl = 6
+            if datetime.now() - datetime.fromisoformat(data['_timestamp']) < timedelta(hours=ttl):
                 return data['data']
-            # During Twelve cooldown accept stale cache up to 7 days (better than NO DATA)
-            if allow_stale or _twelve_in_cooldown():
-                max_stale = 168.0 if str(key).startswith("hist") else 48.0
-                if age_h < max_stale:
-                    print(f"📦 stale cache {key[:12]}… age={age_h:.1f}h")
-                    return data['data']
         except Exception:
             pass
     return None
@@ -159,58 +153,22 @@ def _normalize_symbol(ticker: str) -> str:
             return f"{t[:-3]}/USD"
     return t
 
-# Global throttle when Twelve returns 429 / out of credits
-_TWELVE_COOLDOWN_UNTIL = 0.0
-_TWELVE_COOLDOWN_LOCK = threading.Lock()
-
-
-def _twelve_in_cooldown() -> bool:
-    return time.time() < _TWELVE_COOLDOWN_UNTIL
-
-
-def _twelve_trip_cooldown(seconds: float = 900.0) -> None:
-    """Stop hitting Twelve for a while after 429 / credit errors."""
-    global _TWELVE_COOLDOWN_UNTIL
-    with _TWELVE_COOLDOWN_LOCK:
-        _TWELVE_COOLDOWN_UNTIL = max(_TWELVE_COOLDOWN_UNTIL, time.time() + float(seconds))
-    print(f"⏳ Twelve Data cooldown {seconds:.0f}s — using cache only until then")
-
-
 def _api_call(url, max_retries=3):
-    """Twelve Data call with 429 / credit-limit protection."""
-    if _twelve_in_cooldown():
-        print("⏳ Twelve cooldown active — skip network call")
-        return None
+    """Wykonuje zapytaNO do Twelve Data API."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
-            # Hard rate limit
-            if resp.status_code == 429:
-                print(f"❌ Twelve 429 rate limit (attempt {attempt+1})")
-                _twelve_trip_cooldown(180.0)  # 3 min — nie blokuj całej rundy na pół godziny
-                return None
-            if resp.status_code == 403:
-                print(f"❌ Twelve 403 Forbidden — key/plan issue")
-                _twelve_trip_cooldown(1800.0)
-                return None
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
-                code = data.get("code")
-                msg = str(data.get("message") or data.get("status") or "")
-                if data.get("status") == "error" or code:
-                    low = msg.lower()
+                if data.get("status") == "error" or data.get("code"):
+                    msg = data.get("message") or data.get("status") or str(data)[:200]
                     print(f"❌ Błąd Twelve Data: {msg}")
-                    if code == 429 or "run out of api credits" in low or "rate limit" in low or "credits" in low:
-                        _twelve_trip_cooldown(900.0)  # 15 min when daily credits message
                     return None
             return data
         except requests.exceptions.RequestException as e:
             print(f"❌ Błąd sieci (próba {attempt+1}): {e}")
-            if "429" in str(e):
-                _twelve_trip_cooldown(1200.0)
-                return None
-            time.sleep(2 + attempt * 2)
+            time.sleep(2)
         except Exception as e:
             print(f"❌ Błąd (próba {attempt+1}): {e}")
             time.sleep(2)
@@ -323,7 +281,7 @@ def get_historical_prices(ticker, days=None):
     outputsize = max(400, min(int(calendar_days * 0.72) + 80, 5000))
 
     cache_key = _cache_key("hist_v3", sym, outputsize)
-    cached = _cache_get(cache_key, allow_stale=True)
+    cached = _cache_get(cache_key)
     if cached is not None:
         try:
             df = pd.DataFrame(cached)
@@ -2662,32 +2620,24 @@ def _build_training_set(df, horizon_days, max_samples=None):
 
 
 def _heuristic_momentum_return(feats, regime, days_forward):
-    """Heuristic edge: horizon-matched momentum + mean-reversion + volume confirm."""
     scale = days_forward / 21.0
-    # 3M: dłuższy momentum; 1M: świeższy, ale ret20 nadal kotwica
+    # 3M: dłuższy momentum ważniejszy (ret5 często szum na 63d)
     if days_forward > 30:
         mom = (
-            0.05 * feats['ret5']
-            + 0.12 * feats['ret10']
-            + 0.28 * feats['ret20']
-            + 0.55 * feats.get('ret60', 0.0)
+            0.08 * feats['ret5']
+            + 0.17 * feats['ret10']
+            + 0.30 * feats['ret20']
+            + 0.45 * feats.get('ret60', 0.0)
         )
     else:
         mom = (
-            0.22 * feats['ret5']
-            + 0.33 * feats['ret10']
-            + 0.30 * feats['ret20']
+            0.25 * feats['ret5']
+            + 0.35 * feats['ret10']
+            + 0.25 * feats['ret20']
             + 0.15 * feats.get('ret60', 0.0)
         )
     if feats.get('mom_agree', 0) > 0:
-        mom *= 1.14
-    # Volume confirmation: high volume + mom_agree strengthens; high vol alone weakens noise
-    vr = float(feats.get('vol_ratio') or 1.0)
-    if vr >= 1.35 and feats.get('mom_agree', 0) > 0:
-        mom *= 1.10
-    elif vr >= 1.60 and feats.get('mom_agree', 0) <= 0:
-        mom *= 0.82
-
+        mom *= 1.12
     mr = 0.0
     if feats['rsi'] > 70:
         mr -= (feats['rsi'] - 70) * 0.18
@@ -2701,30 +2651,21 @@ def _heuristic_momentum_return(feats, regime, days_forward):
         mr -= 0.8
     elif feats.get('stoch_k', 50) < 20:
         mr += 0.8
-    # Distance from SMA200: 3M mean-reversion / trend context
-    d200 = float(feats.get('dist_sma200') or 0.0)
-    if days_forward > 30:
-        if d200 > 25:
-            mr -= 1.2
-        elif d200 < -20:
-            mr += 1.2
     slope = feats.get('sma_slope', 0.0)
     if regime == 'TREND_UP':
-        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
+        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
         if feats['macd_hist'] > 0:
-            pred += 0.55 * scale
+            pred += 0.5 * scale
     elif regime == 'TREND_DOWN':
-        pred = mom * 0.52 * scale + mr * 0.11 * scale + slope * 0.16 * scale
+        pred = mom * 0.50 * scale + mr * 0.12 * scale + slope * 0.15 * scale
         if feats['macd_hist'] < 0:
-            pred -= 0.55 * scale
+            pred -= 0.5 * scale
     elif regime == 'HIGH_VOL':
-        pred = mom * 0.18 * scale + mr * 0.52 * scale
+        pred = mom * 0.20 * scale + mr * 0.50 * scale
     else:
-        pred = mom * 0.14 * scale + mr * 0.52 * scale
+        pred = mom * 0.12 * scale + mr * 0.55 * scale
     if feats['adx'] > 30 and regime in ('TREND_UP', 'TREND_DOWN'):
         pred *= 1.12
-    elif feats['adx'] < 18:
-        pred *= 0.88  # weak trend → trust less momentum
     return float(np.clip(pred, -22, 22))
 
 
@@ -2923,22 +2864,13 @@ def _calibrate_model_weights(X, y, horizon_days, regime):
 
 
 def _ensemble_expected_return(df, days_forward, sector, regime, feats):
-    """Ensemble v4: horizon-aware model mix + agreement-aware blend."""
+    """Ensemble v3: Ridge+GB z wagami recency, krok próbek, STRONGjszy prior przy sporze."""
     built = _build_training_set(df, days_forward)
     if built[0] is None:
         X, y, sw = None, None, None
     else:
         X, y, sw = built
     weights = _calibrate_model_weights(X, y, days_forward, regime)
-    # Horizon priors: 1M more short-signal (heuristic/gb), 3M more ridge/stable
-    if days_forward <= 30:
-        hz_prior = {'ridge': 0.30, 'gb': 0.34, 'heuristic': 0.36}
-    else:
-        hz_prior = {'ridge': 0.40, 'gb': 0.32, 'heuristic': 0.28}
-    for k in weights:
-        weights[k] = 0.65 * weights.get(k, 0.33) + 0.35 * hz_prior.get(k, 0.33)
-    s = sum(weights.values()) or 1.0
-    weights = {k: weights[k] / s for k in weights}
     preds = {}
     preds['heuristic'] = _heuristic_momentum_return(feats, regime, days_forward)
     x_now = np.array([[feats[k] for k in FEATURE_KEYS]], dtype=float)
@@ -3153,17 +3085,12 @@ def _special_case_prediction(df, days_forward, fund_ret, hist_med, ticker=None):
     return float(pred)
 
 
-def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False, analysis_mode="default"):
-    """Prognoza 1M/3M ensemble v4 + optional alt modes when hit < 50% (max 2 retries upstream).
-    analysis_mode: default | alt_mr | alt_trend. Hit definition unchanged.
-    """
+def predict_with_technical_influence(df, fundamental_analysis, days_forward, sector, ticker=None, quiet=False):
+    """Prognoza 1M/3M v2 + wyjątki tylko dla wybranych par ticker/horyzont."""
     def _log(*a, **k):
         if not quiet:
             print(*a, **k)
-    mode = (analysis_mode or "default").strip().lower()
-    if mode not in ("default", "alt_mr", "alt_trend"):
-        mode = "default"
-    _log(f"🔍 ENSEMBLE v4 mode={mode} | ticker={ticker} sektor={sector} | dni={days_forward}")
+    _log(f"🔍 ENSEMBLE v3m | ticker={ticker} sektor={sector} | dni={days_forward}")
     if df is None or df.empty or len(df) < 5:
         return 0.0, "NEUTRAL", 0.0
     df_clean = df.ffill().bfill()
@@ -3190,63 +3117,19 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v4: 1M more technical; 3M more fundamental + drift (fundamentals matter more over quarters)
+    # v3b: rozdział 1M vs 3M (jak desktop main)
     if horizon == '1M':
-        tech_w = min(0.76, base_tech + 0.14)
+        tech_w = min(0.74, base_tech + 0.12)
     else:
-        tech_w = max(0.26, base_tech - 0.18)
+        tech_w = max(0.28, base_tech - 0.16)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.78 if horizon == '1M' else 0.72
+        tech_w *= 0.80 if horizon == '1M' else 0.75
     if regime == 'RANGE':
-        tech_w *= 0.88 if horizon == '1M' else 0.82
+        tech_w *= 0.90 if horizon == '1M' else 0.85
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.86, tech_w + (0.07 if horizon == '1M' else 0.05))
-    # Strong fundamental extreme on 3M: allow fund more voice
-    if horizon == '3M' and abs(fund_score - 50) >= 15:
-        tech_w = max(0.22, tech_w - 0.06)
+        tech_w = min(0.85, tech_w + (0.06 if horizon == '1M' else 0.04))
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
-    # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
-    try:
-        if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
-            if abs(tech_ret) >= 1.0 and tech_ret * blended_ret > 0:
-                blended_ret *= 1.05
-    except Exception:
-        pass
-
-    # Alternate analysis paths (only when caller retries on hit < 50%)
-    # alt_mr: mean-reversion + historical drift
-    # alt_trend: momentum / ADX trend-follow
-    if mode == "alt_mr":
-        try:
-            hm = _historical_drift(df_clean, days_forward)
-            rsi = float(feats.get('rsi') or 50)
-            mr_nudge = 0.0
-            if rsi >= 65:
-                mr_nudge = -abs(hm) * 0.35 - 0.6
-            elif rsi <= 35:
-                mr_nudge = abs(hm) * 0.35 + 0.6
-            blended_ret = 0.45 * blended_ret + 0.35 * hm + 0.20 * mr_nudge
-            _log(f"   ALT_MR path rsi={rsi:.1f} hm={hm:+.2f} → {blended_ret:+.2f}%")
-        except Exception as e:
-            _log(f"   ALT_MR fail: {e}")
-    elif mode == "alt_trend":
-        try:
-            mom = (
-                0.20 * float(feats.get('ret5') or 0)
-                + 0.30 * float(feats.get('ret10') or 0)
-                + 0.30 * float(feats.get('ret20') or 0)
-                + 0.20 * float(feats.get('ret60') or 0)
-            )
-            scale = days_forward / 21.0
-            trend_core = mom * 0.55 * scale
-            if float(feats.get('adx') or 0) >= 25 and float(feats.get('mom_agree') or 0) > 0:
-                trend_core *= 1.15
-            blended_ret = 0.35 * blended_ret + 0.55 * trend_core + 0.10 * tech_ret
-            _log(f"   ALT_TREND path mom={mom:+.2f} → {blended_ret:+.2f}%")
-        except Exception as e:
-            _log(f"   ALT_TREND fail: {e}")
-
     if feats['vol_ratio'] > 1.8 and abs(blended_ret) > 1.0:
         blended_ret *= 1.04 if horizon == '1M' else 1.02
 
@@ -3350,13 +3233,13 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     except Exception:
         hist_med_long = hist_med
 
-    # v4: 3M kotwica w dłuższym dryfie; 1M lekki short drift (mniej szumu)
+    # v3m: 3M mocniej kotwiczy w dłuższym dryfie (lepszy kierunek, bez zmiany Hit%)
     if horizon == '1M':
-        drift_w = 0.14
+        drift_w = 0.12
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * hist_med
     else:
-        drift_w = 0.30
-        mix_prior = 0.45 * hist_med + 0.55 * hist_med_long
+        drift_w = 0.26
+        mix_prior = 0.50 * hist_med + 0.50 * hist_med_long
         blended_ret = (1.0 - drift_w) * blended_ret + drift_w * mix_prior
 
     # Symetryczne tłumienie sprzecznego znaku z reżimem (wcześniej UP mocniej pchało w plus)
@@ -3389,15 +3272,6 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     _log(f"   models: ridge={model_preds.get('ridge', 0):+.2f} "
           f"gb={model_preds.get('gb', 0):+.2f} heur={model_preds.get('heuristic', 0):+.2f} "
           f"| w={model_weights}")
-
-    # Residual bias: if recent local accuracy is OK but magnitude systematically off, shrink toward hist median
-    # (does not redefine Hit — only improves direction/magnitude quality)
-    try:
-        if loc is not None and 0.45 <= loc <= 0.70 and abs(hist_med) >= 0.8:
-            # pull 12% toward historical median direction when models are mediocre
-            blended_ret = 0.88 * blended_ret + 0.12 * hist_med
-    except Exception:
-        pass
 
     # Kalibracja wielkości (znak bez zmian → Hit% stabilny, MAE w dół)
     pre_cal = blended_ret
@@ -3437,101 +3311,8 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 
 
 
-
-
-def analyze_forecast_with_retries(df, fundamental_analysis, days_forward, sector, ticker=None,
-                                  max_retries=2, hit_threshold=50.0, max_points=12):
-    """
-    Default 1M/3M path first. If walk-forward hit < threshold, try up to max_retries
-    alternate modes (alt_mr, then alt_trend). Keeps the best hit among tries.
-    Does not change Hit definition — only the prediction path.
-    """
-    modes = ["default"]
-    for a in ["alt_mr", "alt_trend"][: max(0, int(max_retries))]:
-        modes.append(a)
-
-    fa = fundamental_analysis or {}
-    fund_score = fa.get("combined_score", 50)
-    if fund_score is None:
-        fund_score = 50
-
-    best = None
-    tried = []
-
-    for mode in modes:
-        try:
-            pred_price, direction, chg = predict_with_technical_influence(
-                df, fa, days_forward, sector, ticker=ticker, quiet=True, analysis_mode=mode,
-            )
-        except Exception as e:
-            print(f"[retry] predict fail {ticker} mode={mode}: {e}")
-            continue
-        q = None
-        try:
-            q = backtest_forecast_quality(
-                df,
-                days_forward=days_forward,
-                sector=sector,
-                fund_score=fund_score,
-                ticker=ticker,
-                max_points=max_points,
-                analysis_mode=mode,
-            )
-        except Exception as e:
-            print(f"[retry] quality fail {ticker} mode={mode}: {e}")
-
-        hit = mae = n_sig = None
-        if q:
-            try:
-                hit = float(q["hit_rate"]) if q.get("hit_rate") is not None else None
-            except Exception:
-                hit = None
-            try:
-                mae = float(q["mae"]) if q.get("mae") is not None else None
-            except Exception:
-                mae = None
-            n_sig = q.get("n_significant")
-
-        row = {
-            "pred_price": pred_price,
-            "direction": direction,
-            "change_pct": chg,
-            "hit_rate": hit,
-            "mae": mae,
-            "n_significant": n_sig,
-            "analysis_mode": mode,
-        }
-        tried.append(mode)
-
-        def _score(r):
-            h = r.get("hit_rate")
-            return float(h) if h is not None else -1.0
-
-        if best is None or _score(row) > _score(best):
-            best = row
-
-        if hit is not None and hit >= float(hit_threshold):
-            break
-
-    if best is None:
-        return {
-            "pred_price": None,
-            "direction": "NEUTRAL",
-            "change_pct": None,
-            "hit_rate": None,
-            "mae": None,
-            "n_significant": None,
-            "analysis_mode": "default",
-            "modes_tried": tried,
-        }
-    best = dict(best)
-    best["modes_tried"] = tried
-    return best
-
-
 def backtest_forecast_quality(df, days_forward=21, sector='Default',
-                              fund_score=50, step=None, max_points=48, ticker=None,
-                              analysis_mode="default"):
+                              fund_score=50, step=None, max_points=48, ticker=None):
     """
     Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mNOj inflacji).
 
@@ -3597,8 +3378,7 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
             continue
         try:
             _, _, pred_ret = predict_with_technical_influence(
-                hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True,
-                analysis_mode=analysis_mode,
+                hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True
             )
             if pred_ret is None:
                 continue
