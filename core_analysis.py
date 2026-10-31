@@ -153,14 +153,6 @@ def _normalize_symbol(ticker: str) -> str:
             return f"{t[:-3]}/USD"
     return t
 
-
-# kompatybilność z api_server (cooldown) — ten core nie blokuje agresywnie
-_TWELVE_COOLDOWN_UNTIL = 0.0
-def _twelve_in_cooldown() -> bool:
-    return False
-def _twelve_trip_cooldown(seconds: float = 900.0) -> None:
-    return
-
 def _api_call(url, max_retries=3):
     """Wykonuje zapytaNO do Twelve Data API."""
     for attempt in range(max_retries):
@@ -267,8 +259,8 @@ def get_live_price(ticker):
 
 # Domyślna głębokość historii pod Hit/backtest (~8 lat kalendarzowych).
 # Młodsze spółki: Twelve i tak zwróci tylko dostępne sesje.
-DEFAULT_HISTORY_DAYS = 2500  # ~od 2020 (kalendarzowo)
-HISTORY_START_FLOOR = "2020-01-01"  # analiza od 2020, nie tylko ostatnie świece
+DEFAULT_HISTORY_DAYS = 2920  # ~8 lat
+HISTORY_START_FLOOR = "2015-01-01"  # nie prosimy starszych niż to (stabilny floor)
 
 
 def get_historical_prices(ticker, days=None):
@@ -286,9 +278,9 @@ def get_historical_prices(ticker, days=None):
     # prosimy o wystarczająco barek sesyjnych (NO kalendarz 1:1)
     calendar_days = max(int(days), 800)
     # max 5000 barek (limit typowy Twelve daily)
-    outputsize = max(1200, min(int(calendar_days * 0.75) + 100, 5000))  # min ~1200 sesji od 2020
+    outputsize = max(400, min(int(calendar_days * 0.72) + 80, 5000))
 
-    cache_key = _cache_key("hist_v4_2020", sym, outputsize)
+    cache_key = _cache_key("hist_v3", sym, outputsize)
     cached = _cache_get(cache_key)
     if cached is not None:
         try:
@@ -304,8 +296,7 @@ def get_historical_prices(ticker, days=None):
             df = df.dropna(subset=["Close"])
             df = df[~df.index.duplicated(keep="last")]
             df.sort_index(inplace=True)
-            # odrzuć krótki cache (kiedyś bywało ~60 świec) — potrzeba historii od ~2020
-            if len(df) >= 400:
+            if len(df) >= 60:
                 return df
         except Exception:
             pass
@@ -313,10 +304,8 @@ def get_historical_prices(ticker, days=None):
     from urllib.parse import quote
     end_d = datetime.now().strftime("%Y-%m-%d")
     start_by_days = (datetime.now() - timedelta(days=calendar_days + 60)).strftime("%Y-%m-%d")
-    # twardo od 2020 (albo później jeśli days krótsze) — pełny szereg pod Hit/prognozę
+    # nie wcześniej niż floor (spójny zakres); młodsze tickery i tak mają krótszy szereg
     start_d = max(start_by_days, HISTORY_START_FLOOR)
-    if calendar_days >= 1500:
-        start_d = HISTORY_START_FLOOR  # zawsze od 2020 przy domyślnej głębokości
     sym_q = quote(sym, safe="/")
     url = (
         f"{TWELVE_BASE_URL}/time_series?symbol={sym_q}"
@@ -3370,8 +3359,14 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
 def backtest_forecast_quality(df, days_forward=21, sector='Default',
                               fund_score=50, step=None, max_points=48, ticker=None):
     """
-    Walk-forward Hit% 1M/3M — ustawienia zbliżone do okresu ~55–65% u Ciebie:
-    historia od 2020, gęstsze próbki, umiarkowane progi (nie soft-oszustwo).
+    Walk-forward jakości prognoz 1M/3M – twardszy Hit% (mNOj inflacji).
+
+    Hit tylko gdy:
+      1) |actual| >= min_move
+      2) |pred|   >= min_pred   (prognoza NO jest „płaska”)
+      3) ten sam znak actual i pred
+
+    Bez soft_hit i bez fallbacku na łagodną definicję przy małej próbie.
     """
     if df is None or df.empty:
         return None
@@ -3380,9 +3375,10 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if len(df) < min_len:
         return None
 
-    # Umiarkowane progi (wcześniejsze 2.0/3.5 + max_points=18 zbijały hit do ~40%)
-    min_move = 1.5 if days_forward <= 30 else 2.5
-    min_pred = 0.75 if days_forward <= 30 else 1.25
+    # Trochę ostrzejsze progi niż wcześNOj (2.0 / 3.5)
+    min_move = 2.0 if days_forward <= 30 else 3.5
+    # Prognoza musi być „wyraźna” – inaczej NO liczymy hitu
+    min_pred = 1.0 if days_forward <= 30 else 2.0
 
     df_clean = df.ffill().bfill()
     n = len(df_clean)
@@ -3390,39 +3386,26 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if end < 60:
         return None
 
-    # Próbkuj głównie od 2020 (jeśli indeks datowy)
-    start_floor_i = 60
-    try:
-        idx = df_clean.index
-        if hasattr(idx, 'year'):
-            for j in range(len(idx)):
-                try:
-                    if int(getattr(idx[j], 'year', 0) or 0) >= 2020:
-                        start_floor_i = max(60, j)
-                        break
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
     def _make_indices(step_val, max_pts):
-        start_i = max(start_floor_i, end - max_pts * step_val)
+        start_i = max(60, end - max_pts * step_val)
         return list(range(start_i, end + 1, step_val))
 
-    # Domyślnie gęściej na oknie 2020→teraz
     if step is None:
+        target_points = 12
+        span = max(1, end - 60)
+        auto_step = max(8, span // target_points)
         if days_forward <= 30:
-            step = 12
+            step = max(10, min(auto_step, max(10, days_forward // 2)))
         else:
-            step = 18
+            step = max(12, min(auto_step, max(15, days_forward // 3)))
     indices = _make_indices(step, max_points)
 
     if len(indices) < 6:
-        step = max(7, step // 2)
-        indices = _make_indices(step, max_points + 8)
+        step = max(8, step // 2)
+        indices = _make_indices(step, max_points + 10)
     if len(indices) < 5:
         step = max(5, step // 2)
-        indices = _make_indices(step, max_points + 12)
+        indices = _make_indices(step, max_points + 20)
     if len(indices) < 4:
         return None
 
@@ -3455,6 +3438,7 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
             bias_sum += float(pred_ret) - actual_ret
             total += 1
 
+            # Twardy hit: istotny ruch RYNKU + istotna PROGNOZA + ten sam znak
             if abs(actual_ret) >= min_move and abs(pred_ret) >= min_pred:
                 significant += 1
                 if (pred_ret > 0 and actual_ret > 0) or (pred_ret < 0 and actual_ret < 0):
@@ -3466,41 +3450,17 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     if total < min_total or not errors:
         return None
 
-    if significant >= 3:
+    # Brak soft-fallbacku: za mało istotnych prób → NO udawaj HIGHego Hit%
+    if significant >= 5:
         dir_rate = 100.0 * dir_hits / significant
+    elif significant >= 3:
+        dir_rate = 100.0 * dir_hits / significant  # raportuj, ale UI i YES zobaczy n_sig
     else:
-        # mało „twardych” — kierunek na wszystkich istotnych ruchach rynku (bez progu pred)
-        soft_hits = soft_n = 0
-        # policz z już zebranych errors nie mamy znaków — powtórka lekka na indices
-        for i in indices:
-            try:
-                hist = df_clean.iloc[:i + 1]
-                _, _, pred_ret = predict_with_technical_influence(
-                    hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True
-                )
-                if pred_ret is None:
-                    continue
-                p0 = float(df_clean['Close'].iloc[i])
-                p1 = float(df_clean['Close'].iloc[i + days_forward])
-                if p0 <= 0:
-                    continue
-                actual_ret = (p1 / p0 - 1.0) * 100.0
-                if abs(actual_ret) < min_move:
-                    continue
-                soft_n += 1
-                if (pred_ret > 0 and actual_ret > 0) or (pred_ret < 0 and actual_ret < 0):
-                    soft_hits += 1
-            except Exception:
-                continue
-        if soft_n < 3:
-            return None
-        dir_rate = 100.0 * soft_hits / soft_n
-        significant = soft_n
-        dir_hits = soft_hits
+        return None  # za mało twardych przypadków → brak Hit% zamiast zawyżonego
 
     return {
         'hit_rate': round(float(dir_rate), 1),
-        'soft_hit_rate': round(float(dir_rate), 1),
+        'soft_hit_rate': round(float(dir_rate), 1),  # świadomie = hard (bez soft)
         'dir_hit_rate': round(float(dir_rate), 1),
         'mae': round(float(np.mean(errors)), 2),
         'bias': round(bias_sum / total, 2),
