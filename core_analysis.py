@@ -3513,6 +3513,160 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     }
 
 
+def analyze_forecast_with_retries(
+    df,
+    fundamental_analysis=None,
+    days_forward=21,
+    sector="Default",
+    ticker=None,
+    max_retries=2,
+    hit_threshold=50.0,
+    max_points=14,
+):
+    """
+    Potrójna (lub więcej) analiza gdy Hit% < threshold.
+    Dodatkowo kalibruje % prognozy po historycznym bias/MAE
+    (np. model +10%, realnie +3% → ściąga magnitude).
+    """
+    fa = fundamental_analysis or {"combined_score": 50}
+    fund_score = fa.get("combined_score", 50)
+    try:
+        fund_score = float(fund_score)
+    except Exception:
+        fund_score = 50.0
+
+    # warianty: różne wagi tech/fund + korekta magnitude
+    modes = [
+        {"name": "default", "tech_boost": 0.0, "mag_scale": 1.0},
+        {"name": "more_tech", "tech_boost": 0.12, "mag_scale": 1.0},
+        {"name": "more_fund", "tech_boost": -0.12, "mag_scale": 1.0},
+        {"name": "shrink", "tech_boost": 0.0, "mag_scale": 0.72},
+        {"name": "expand", "tech_boost": 0.05, "mag_scale": 1.15},
+    ]
+    modes = modes[: max(2, min(len(modes), 2 + int(max_retries)))]
+
+    results = []
+    modes_tried = []
+
+    for mode in modes:
+        modes_tried.append(mode["name"])
+        pred_price, direction, chg = predict_with_technical_influence(
+            df, fa, days_forward, sector, ticker=ticker, quiet=True
+        )
+        if chg is None:
+            continue
+        chg = float(chg) * float(mode["mag_scale"])
+        # lekki tech/fund tilt na znaku magnitude (bez drugiego pełnego ensemble)
+        if mode["tech_boost"] > 0 and abs(chg) >= 0.5:
+            chg = chg * (1.0 + 0.08 * (1 if chg > 0 else -1) * (1 if mode["tech_boost"] > 0 else 0))
+            chg = float(chg) * (1.0 + abs(mode["tech_boost"]) * 0.25)
+        elif mode["tech_boost"] < 0 and abs(chg) >= 0.5:
+            chg = float(chg) * (1.0 - 0.12)
+
+        q = backtest_forecast_quality(
+            df,
+            days_forward=days_forward,
+            sector=sector,
+            fund_score=fund_score,
+            ticker=ticker,
+            max_points=max_points,
+        )
+        if not q:
+            continue
+
+        hit = float(q.get("hit_rate") or 0)
+        mae = q.get("mae")
+        bias = q.get("bias")  # pred - actual, średnio
+
+        # kalibracja procentowa: jeśli historycznie przeszacowujemy o bias, ściągnij prognozę
+        cal_chg = float(chg)
+        if bias is not None:
+            try:
+                b = float(bias)
+                # ściągnij część systematycznego błędu (nie kasuj całego sygnału)
+                cal_chg = cal_chg - 0.55 * b
+                # nie odwracaj znaku wyłącznie kalibracją przy mocnym sygnale
+                if chg > 2 and cal_chg < 0:
+                    cal_chg = abs(cal_chg) * 0.35
+                if chg < -2 and cal_chg > 0:
+                    cal_chg = -abs(cal_chg) * 0.35
+            except Exception:
+                pass
+
+        # score: najpierw hit, potem niższy MAE (dokładniejsze %)
+        mae_v = float(mae) if mae is not None else 99.0
+        score = hit - 0.35 * min(mae_v, 20.0)
+
+        price0 = float(df["Close"].iloc[-1])
+        cal_price = price0 * (1.0 + cal_chg / 100.0)
+        if cal_chg > 1.0:
+            direction = "UPTREND"
+        elif cal_chg < -1.0:
+            direction = "DOWNTREND"
+        else:
+            direction = "NEUTRAL"
+
+        results.append({
+            "mode": mode["name"],
+            "hit_rate": hit,
+            "mae": mae_v,
+            "bias": bias,
+            "score": score,
+            "predicted_change_pct": round(cal_chg, 2),
+            "predicted_price": round(cal_price, 4),
+            "direction": direction,
+            "n_significant": q.get("n_significant"),
+        })
+
+        # jeśli już >= threshold i MAE nie jest kosmiczne — można przerwać wcześniej
+        if hit >= hit_threshold and mae_v <= 12.0 and mode["name"] != "default":
+            break
+
+    if not results:
+        # fallback sam predict
+        pred_price, direction, chg = predict_with_technical_influence(
+            df, fa, days_forward, sector, ticker=ticker, quiet=True
+        )
+        return {
+            "predicted_price": pred_price,
+            "pred_price": pred_price,
+            "direction": direction,
+            "predicted_change_pct": chg,
+            "change_pct": chg,
+            "hit_rate": None,
+            "mae": None,
+            "bias": None,
+            "n_significant": None,
+            "analysis_mode": "fallback",
+            "modes_tried": modes_tried,
+        }
+
+    # wybór: najlepszy score; przy hicie < threshold preferuj max hit
+    below = [r for r in results if r["hit_rate"] < hit_threshold]
+    if len(results) == len(below):
+        # wszystkie < 50% — bierz najwyższy hit, potem niższy MAE
+        best = sorted(results, key=lambda r: (-r["hit_rate"], r["mae"]))[0]
+    else:
+        ok = [r for r in results if r["hit_rate"] >= hit_threshold]
+        best = sorted(ok, key=lambda r: (-r["score"], r["mae"]))[0]
+
+    return {
+        "predicted_price": best["predicted_price"],
+        "pred_price": best["predicted_price"],
+        "direction": best["direction"],
+        "predicted_change_pct": best["predicted_change_pct"],
+        "change_pct": best["predicted_change_pct"],
+        "hit_rate": best["hit_rate"],
+        "mae": best["mae"],
+        "bias": best.get("bias"),
+        "n_significant": best.get("n_significant"),
+        "analysis_mode": best["mode"],
+        "modes_tried": modes_tried,
+    }
+
+
+
+
 def get_risk_and_potential(current_price, low_3y, high_3y, data_3y,
                            fundamental_score=None, is_index=False, trend="",
                            data_10y=None, crash_risk_score=None):

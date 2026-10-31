@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "hit-stable-all-v2"
-PRECOMPUTE_GEN = "hit-stable-all-v2"
+API_BUILD = "pct-calibrate-retry-v1"
+PRECOMPUTE_GEN = "pct-calibrate-retry-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -776,16 +776,21 @@ def _analyze_one(
                 days,
                 sector,
                 ticker=ticker,
-                max_retries=2,
+                max_retries=3 if days > 30 else 2,
                 hit_threshold=50.0,
                 max_points=max_pts,
             )
-            pred_price = _safe_float(res.get("pred_price"))
-            chg = _safe_float(res.get("change_pct"))
+            pred_price = _safe_float(res.get("pred_price") or res.get("predicted_price"))
+            chg = _safe_float(res.get("change_pct") or res.get("predicted_change_pct"))
             direction = res.get("direction") or "NEUTRAL"
             hit_rate = _safe_float(res.get("hit_rate"))
             mae = _safe_float(res.get("mae"))
             n_sig = res.get("n_significant")
+            # bias / rozjazd % (pred - actual historycznie) – do debug / UI
+            try:
+                data_bias = _safe_float(res.get("bias"))
+            except Exception:
+                data_bias = None
             analysis_mode = res.get("analysis_mode") or "default"
             modes_tried = res.get("modes_tried") or [analysis_mode]
             print(
@@ -837,6 +842,7 @@ def _analyze_one(
         "combined_score": round(combined, 2) if combined is not None else None,
         "hit_rate": hit_rate,
         "mae": mae,
+        "bias": locals().get("data_bias"),
         "n_significant": n_sig,
         "analysis_mode": analysis_mode,
         "modes_tried": modes_tried,
