@@ -22,7 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "ai-agents-pct-v3"
+API_BUILD = "hit-stable-all-v2"
+PRECOMPUTE_GEN = "hit-stable-all-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -222,10 +223,30 @@ class RankingsResponse(BaseModel):
 
 
 def _horizon_days(horizon: str) -> int:
+    """Trading-day horizons: 1M≈21, 3M≈63, 6M≈126."""
     h = (horizon or "1M").upper().strip()
+    if h in ("6M", "6", "180", "126"):
+        return 126
     if h in ("3M", "3", "90", "63"):
         return 63
     return 21
+
+
+def _horizon_label(horizon: str) -> str:
+    days = _horizon_days(horizon)
+    if days >= 100:
+        return "6M"
+    if days > 30:
+        return "3M"
+    return "1M"
+
+
+def _ai_horizon_label(horizon: str) -> str:
+    """AI Brief tab only: 3M or 6M (default 3M)."""
+    h = (horizon or "3M").upper().strip()
+    if h in ("6M", "6", "180", "126") or h.startswith("6"):
+        return "6M"
+    return "3M"
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -264,10 +285,17 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "3600"))  # pełna runda co 1h
-_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "1.0"))
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # co 2h — mniej kredytów Twelve
+_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "3.0"))  # pauza między tickerami
+# Serve even old forecasts (user sees last known price/prediction — never empty loading)
+_PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(7 * 24 * 3600)))  # 7 dni
+_PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "3600"))  # po 1h odśwież w tle
 _PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
 _PRECOMPUTE_LOCK = threading.Lock()
+_PRECOMPUTE_DISK = os.path.join(os.path.dirname(__file__), "precompute_cache.json")
+_PRECOMPUTE_DISK_LOADED = False
+_BG_REFRESHING: set = set()
+_BG_LOCK = threading.Lock()
 _PRECOMPUTE_STATUS: Dict[str, Any] = {
     "running": False,
     "last_full_run_ts": None,
@@ -283,47 +311,155 @@ def _pc_key(ticker: str, horizon_label: str) -> str:
     return f"{str(ticker).upper()}|{horizon_label}"
 
 
+def _pc_disk_load() -> None:
+    global _PRECOMPUTE_DISK_LOADED
+    if _PRECOMPUTE_DISK_LOADED:
+        return
+    _PRECOMPUTE_DISK_LOADED = True
+    try:
+        if not os.path.isfile(_PRECOMPUTE_DISK):
+            return
+        import json as _json
+        raw = _json.loads(open(_PRECOMPUTE_DISK, "r", encoding="utf-8").read())
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        n = 0
+        with _PRECOMPUTE_LOCK:
+            for k, v in raw.items():
+                if not isinstance(v, dict) or not isinstance(v.get("data"), dict):
+                    continue
+                ts = float(v.get("ts") or 0)
+                if now - ts > _PRECOMPUTE_SERVE_MAX_AGE:
+                    continue
+                # tylko ta sama generacja core — inaczej po deployu stary hit wraca z dysku
+                if str(v.get("gen") or "") != str(PRECOMPUTE_GEN):
+                    continue
+                _PRECOMPUTE[str(k)] = {
+                    "ts": ts,
+                    "gen": PRECOMPUTE_GEN,
+                    "data": dict(v["data"]),
+                }
+                n += 1
+        print(f"[precompute] disk loaded {n} entries")
+    except Exception as e:
+        print("[precompute] disk load:", e)
+
+
+def _pc_disk_save() -> None:
+    try:
+        import json as _json
+        with _PRECOMPUTE_LOCK:
+            payload = {
+                k: {"ts": v.get("ts"), "data": v.get("data")}
+                for k, v in _PRECOMPUTE.items()
+                if isinstance(v, dict) and isinstance(v.get("data"), dict)
+            }
+        with open(_PRECOMPUTE_DISK, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False, default=str)
+    except Exception as e:
+        print("[precompute] disk save:", e)
+
+
 def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
+    _pc_disk_load()
     with _PRECOMPUTE_LOCK:
         _PRECOMPUTE[_pc_key(ticker, horizon_label)] = {
             "ts": time.time(),
+            "gen": PRECOMPUTE_GEN,
             "data": dict(data),
         }
+    # persist async-ish (cheap enough)
+    try:
+        _pc_disk_save()
+    except Exception:
+        pass
 
 
-def _pc_get(ticker: str, horizon_label: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Zwraca skopiowane data lub None. max_age domyślnie 2x interval."""
+def _pc_get(
+    ticker: str,
+    horizon_label: str,
+    max_age: Optional[float] = None,
+    *,
+    allow_stale: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Return cached analysis. allow_stale=True → serve last known even if old (no empty UI)."""
+    _pc_disk_load()
     if max_age is None:
-        max_age = max(float(_PRECOMPUTE_INTERVAL) * 3.0, 10800.0)  # min 3h świeżości precompute
+        max_age = _PRECOMPUTE_SERVE_MAX_AGE if allow_stale else max(
+            float(_PRECOMPUTE_INTERVAL) * 3.0, 10800.0
+        )
     with _PRECOMPUTE_LOCK:
         row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
         if not row:
             return None
-        if time.time() - row["ts"] > max_age:
+        # stary cache z poprzedniego core / build — wyrzuć
+        if str(row.get("gen") or "") != str(PRECOMPUTE_GEN):
             return None
-        return dict(row["data"])
+        age = time.time() - float(row.get("ts") or 0)
+        if age > max_age:
+            return None
+        out = dict(row["data"])
+        out["_cache_age_sec"] = round(age, 1)
+        out["_cache_ts"] = row.get("ts")
+        return out
+
+
+def _pc_age(ticker: str, horizon_label: str) -> Optional[float]:
+    _pc_disk_load()
+    with _PRECOMPUTE_LOCK:
+        row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
+        if not row:
+            return None
+        return time.time() - float(row.get("ts") or 0)
+
+
+def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
+    """Refresh one ticker in background; keep serving old data until done."""
+    key = _pc_key(ticker, horizon_label)
+    with _BG_LOCK:
+        if key in _BG_REFRESHING:
+            return
+        _BG_REFRESHING.add(key)
+
+    def _run():
+        try:
+            # Don't hammer Twelve during cooldown
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                return
+            data = _analyze_one(ticker, horizon_label, fast=False, quality=True)
+            if data and data.get("current_price") is not None:
+                _pc_store(ticker, horizon_label, data)
+                print(f"[bg-refresh] {key} updated")
+        except Exception as e:
+            print(f"[bg-refresh] {key}: {e}")
+        finally:
+            with _BG_LOCK:
+                _BG_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, name=f"bg-{key}", daemon=True).start()
 
 
 def _ticker_list_for_precompute() -> List[str]:
-    raw = list(getattr(core, "tickers", []) or [])
-    priority = [
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
-        "JPM", "V", "JNJ", "UNH", "COST", "GS", "AMD", "INTC",
+    """Tylko oryginalne 12. Większa lista zjada kredyty Twelve i zostaje sama NVDA."""
+    return [
+        "NVDA", "INTC", "AMD", "CSCO", "XOM", "AMZN",
+        "AAPL", "MSFT", "META", "GOOGL", "JPM", "TSLA",
     ]
-    if not raw:
-        raw = list(priority)
-    seen = set()
-    out = []
-    for t in priority + raw:
-        t = str(t).upper().strip()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
 
 
 def _precompute_all_once() -> None:
     """Jedna pełna runda: najpierw krypto (szybkie), potem akcje 1M+3M."""
+    # Rate-limit: nie dobijaj Twelve; stary cache zostaje widoczny dla userów
+    try:
+        if getattr(core, "_twelve_in_cooldown", lambda: False)():
+            print("[precompute] pause round — Twelve cooldown (serving last known cache)")
+            _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — serving cached forecasts"
+            _PRECOMPUTE_STATUS["running"] = False
+            _pc_disk_load()  # upewnij się że cache z dysku jest w pamięci
+            return
+    except Exception:
+        pass
     tickers = _ticker_list_for_precompute()
     _PRECOMPUTE_STATUS["running"] = True
     _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
@@ -331,42 +467,53 @@ def _precompute_all_once() -> None:
     _PRECOMPUTE_STATUS["last_error"] = None
     if _PRECOMPUTE_STATUS.get("started_ts") is None:
         _PRECOMPUTE_STATUS["started_ts"] = time.time()
-    # Krypto NA START rundy (nie na końcu po 15+ akcjach) – jak reszta „od deploya”
-    try:
-        _precompute_crypto_once()
-    except Exception as e:
-        print("[precompute] crypto first:", e)
-    print(f"[precompute] start {len(tickers)} tickerów × 1M/3M")
-    for t in tickers:
-        _PRECOMPUTE_STATUS["last_ticker"] = t
-        for hz in ("1M", "3M"):
-            try:
-                data = _analyze_one(t, hz, fast=True, quality=False)
-                if data and data.get("current_price") is not None:
-                    _pc_store(t, hz, data)
-            except Exception as e:
-                msg = f"{t}/{hz}: {e}"
-                print("[precompute]", msg)
-                _PRECOMPUTE_STATUS["last_error"] = msg
-        _PRECOMPUTE_STATUS["tickers_done"] = _PRECOMPUTE_STATUS.get("tickers_done", 0) + 1
+    # Akcje 1M+3M NAJPIERW. Krypto / backtest / AI NIE startują w tej samej rundzie —
+    # one dobijały Twelve zanim reszta oryginalnych 12 zdążyła się policzyć.
+    # Najpierw 1M dla WSZYSTKICH 12 (ranking miesięczny), potem 3M.
+    # Brakujące najpierw — żeby nie utknąć na jednej NVDA.
+    jobs = []
+    for hz in ("1M", "3M"):
+        missing = [x for x in tickers if _pc_get(x, hz, allow_stale=True) is None]
+        fresh = [x for x in tickers if x not in missing]
+        # odśwież stare na końcu
+        for x in missing + fresh:
+            age = _pc_age(x, hz)
+            if age is not None and age < float(_PRECOMPUTE_INTERVAL):
+                continue
+            jobs.append((x, hz))
+    print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
+    done_tickers = set()
+    for t, hz in jobs:
+        try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print(f"[precompute] cooldown — entries kept, stop new Twelve calls")
+                _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — partial cache kept"
+                break
+        except Exception:
+            pass
+        _PRECOMPUTE_STATUS["last_ticker"] = f"{t}/{hz}"
+        try:
+            data = _analyze_one(t, hz, fast=False, quality=True)
+            if data and data.get("current_price") is not None:
+                _pc_store(t, hz, data)
+                print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')} chg={data.get('predicted_change_pct')}")
+        except Exception as e:
+            msg = f"{t}/{hz}: {e}"
+            print("[precompute]", msg)
+            _PRECOMPUTE_STATUS["last_error"] = msg
+        done_tickers.add(t)
+        _PRECOMPUTE_STATUS["tickers_done"] = len(done_tickers)
         time.sleep(_PRECOMPUTE_PAUSE)
-    # Po prognozach 1M/3M – odśwież board sygnałów (raz na rundę, nie per user refresh)
-    try:
-        _precompute_signals_once()
-    except Exception as e:
-        print("[precompute] signals:", e)
-
-    # Domyślne backtesty (capital=10000, forecast 1M/3M) – strona bierze z cache
-    try:
-        _precompute_backtests_once()
-    except Exception as e:
-        print("[precompute] backtests:", e)
 
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
     with _PRECOMPUTE_LOCK:
         n = len(_PRECOMPUTE)
     print(f"[precompute] done, entries={n}")
+    try:
+        _pc_disk_save()
+    except Exception as e:
+        print("[precompute] disk save end:", e)
 
 
 def _gemini_should_wait(err: BaseException) -> bool:
@@ -403,12 +550,17 @@ def _ai_board_one(ticker: str, horizon: str) -> None:
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
     t = ticker.upper().strip()
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = _ai_horizon_label(horizon)
     # Richer note needs more time than the old 3-line summary
     budget = float(os.environ.get("AI_BOARD_TICKER_TIMEOUT", "90"))
 
     def _run() -> None:
-        quant = _analyze_one(t, hz, fast=True, quality=False)
+        # Twelve only via precompute worker — never on user/AI path
+        quant = _pc_get(t, hz)
+        if not quant:
+            quant = _pc_get(t, "3M") if hz == "6M" else None
+        if not quant:
+            raise RuntimeError(f"no precompute quant for {t}/{hz}")
         fundamentals = None
         perspective = None
         try:
@@ -453,25 +605,52 @@ def _ai_board_one(ticker: str, horizon: str) -> None:
 
 
 def _ai_board_once() -> None:
+    """After deploy: AI for every ticker × 3M and 6M, saved in ai_full cache."""
     if not ai_full.configured():
         print("[ai-board] GEMINI_API_KEY missing — skip")
         _AI_BOARD_STATUS["last_error"] = "GEMINI_API_KEY not set"
         return
     tickers = _ticker_list_for_precompute()
-    # Only 1M on board (table is 1M by default). Manual full AI still uses /ai/full.
-    pause = float(os.environ.get("AI_BOARD_PAUSE", "1"))
+    horizons = ("3M",)
+    pause = float(os.environ.get("AI_BOARD_PAUSE", "2"))
     _AI_BOARD_STATUS["running"] = True
     _AI_BOARD_STATUS["done"] = 0
-    _AI_BOARD_STATUS["total"] = len(tickers)
+    _AI_BOARD_STATUS["total"] = len(tickers) * len(horizons)
     _AI_BOARD_STATUS["last_error"] = None
-    print(f"[ai-board] fast 1M board: {len(tickers)} tickers")
+    print(f"[ai-board] full AI cache {len(tickers)} tickers × {horizons}")
     try:
         for t in tickers:
-            _AI_BOARD_STATUS["last_ticker"] = t
-            _AI_BOARD_STATUS["last_horizon"] = "1M"
-            _ai_board_one(t, "1M")
-            _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
-            time.sleep(pause)
+            for hz in horizons:
+                _AI_BOARD_STATUS["last_ticker"] = t
+                _AI_BOARD_STATUS["last_horizon"] = hz
+                try:
+                    quant = _pc_get(t, hz)
+                    if not quant:
+                        continue
+                    fundamentals = None
+                    perspective = None
+                    try:
+                        fundamentals = core.get_comprehensive_fundamental_analysis(t)
+                    except Exception as e:
+                        print(f"[ai-board] fundamentals {t}: {e}")
+                    try:
+                        perspective = core.get_3year_perspective(t, None)
+                    except Exception as e:
+                        print(f"[ai-board] perspective {t}: {e}")
+                    # 4-agent desk — writes into AI cache (client later only reads)
+                    ai_full.build_full(
+                        t,
+                        quant,
+                        fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+                        perspective=perspective if isinstance(perspective, dict) else None,
+                        horizon=hz,
+                        use_cache=True,
+                    )
+                except Exception as e:
+                    _AI_BOARD_STATUS["last_error"] = f"{t}/{hz}: {e}"
+                    print(f"[ai-board] {t}/{hz}: {e}")
+                _AI_BOARD_STATUS["done"] = int(_AI_BOARD_STATUS.get("done") or 0) + 1
+                time.sleep(pause)
     finally:
         _AI_BOARD_STATUS["running"] = False
         _AI_BOARD_STATUS["last_run_ts"] = time.time()
@@ -479,14 +658,18 @@ def _ai_board_once() -> None:
 
 
 def _ai_board_worker() -> None:
-    """Po deployu: szybki board 1M (1× Gemini na spółkę), start po kilku sekundach."""
-    time.sleep(3)
+    """AI dopiero po tym jak 12 spółek ma prognozy. Nie startuje razem z Twelve."""
+    time.sleep(int(os.environ.get("AI_BOARD_START_DELAY", "7200")))
     interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
     while True:
-        if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
+        if os.environ.get("AI_PRECOMPUTE_ENABLED", "0") != "1":
             time.sleep(60)
             continue
         try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print("[ai-board] skip round — Twelve cooldown")
+                time.sleep(900)
+                continue
             _ai_board_once()
         except Exception as e:
             print("[ai-board] worker:", e)
@@ -529,11 +712,11 @@ def _analyze_one(
         raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
 
     days = _horizon_days(horizon)
-    horizon_label = "3M" if days > 30 else "1M"
+    horizon_label = _horizon_label(horizon)
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v8|{ticker}|{horizon_label}|{mode}|{day_key}|mp12"
+    cache_key = f"v10|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -567,6 +750,7 @@ def _analyze_one(
     fa = None
     fund_rating = None
     combined = None
+    # ZAWSZE te same fundamenty co w pełnej analizie — inaczej % i hit się rozjeżdżają
     try:
         fa = core.get_comprehensive_fundamental_analysis(ticker)
     except Exception as e:
@@ -577,13 +761,55 @@ def _analyze_one(
         fund_rating = fa.get("fundamental_rating")
         combined = _safe_float(fa.get("combined_score"))
 
+    # Forecast + Hit with up to 2 alternate analysis modes if hit < 50%
     pred_price, direction, chg = None, "NEUTRAL", None
+    hit_rate = mae = n_sig = None
+    analysis_mode = "default"
+    modes_tried = ["default"]
+    # więcej okien = mniej losowych 8%/20% na pojedynczych spółkach
+    max_pts = 14
     try:
-        pred_price, direction, chg = core.predict_with_technical_influence(
-            df, fa or {}, days, sector, ticker=ticker, quiet=True
-        )
-        pred_price = _safe_float(pred_price)
-        chg = _safe_float(chg)
+        if hasattr(core, "analyze_forecast_with_retries"):
+            res = core.analyze_forecast_with_retries(
+                df,
+                fa or {},
+                days,
+                sector,
+                ticker=ticker,
+                max_retries=2,
+                hit_threshold=50.0,
+                max_points=max_pts,
+            )
+            pred_price = _safe_float(res.get("pred_price"))
+            chg = _safe_float(res.get("change_pct"))
+            direction = res.get("direction") or "NEUTRAL"
+            hit_rate = _safe_float(res.get("hit_rate"))
+            mae = _safe_float(res.get("mae"))
+            n_sig = res.get("n_significant")
+            analysis_mode = res.get("analysis_mode") or "default"
+            modes_tried = res.get("modes_tried") or [analysis_mode]
+            print(
+                f"[analyze] {ticker} {horizon_label}: mode={analysis_mode} "
+                f"hit={hit_rate} tried={modes_tried}"
+            )
+        else:
+            pred_price, direction, chg = core.predict_with_technical_influence(
+                df, fa or {}, days, sector, ticker=ticker, quiet=True
+            )
+            pred_price = _safe_float(pred_price)
+            chg = _safe_float(chg)
+            q = core.backtest_forecast_quality(
+                df,
+                days_forward=days,
+                sector=sector,
+                fund_score=combined or 50,
+                ticker=ticker,
+                max_points=max_pts,
+            )
+            if q:
+                hit_rate = _safe_float(q.get("hit_rate"))
+                mae = _safe_float(q.get("mae"))
+                n_sig = q.get("n_significant")
     except TypeError:
         try:
             pred_price, direction, chg = core.predict_with_technical_influence(
@@ -594,26 +820,7 @@ def _analyze_one(
         except Exception as e:
             print(f"predict error {ticker}: {e}")
     except Exception as e:
-        print(f"predict error {ticker}: {e}")
-
-    # Hit%: 12 punktów (std) / 18 (quality) — stabilny sample, bez skrajności 3 ani 30+
-    hit_rate = mae = n_sig = None
-    max_pts = 18 if quality else 12
-    try:
-        q = core.backtest_forecast_quality(
-            df,
-            days_forward=days,
-            sector=sector,
-            fund_score=combined or 50,
-            ticker=ticker,
-            max_points=max_pts,
-        )
-        if q:
-            hit_rate = _safe_float(q.get("hit_rate"))
-            mae = _safe_float(q.get("mae"))
-            n_sig = q.get("n_significant")
-    except Exception as e:
-        print(f"backtest quality {ticker}: {e}")
+        print(f"predict/retry error {ticker}: {e}")
 
     data = {
         "ticker": ticker,
@@ -631,6 +838,8 @@ def _analyze_one(
         "hit_rate": hit_rate,
         "mae": mae,
         "n_significant": n_sig,
+        "analysis_mode": analysis_mode,
+        "modes_tried": modes_tried,
         "fast_mode": False,
         "cached": False,
     }
@@ -644,6 +853,11 @@ def _analyze_one(
 
 @app.on_event("startup")
 def _startup():
+    # Od razu wczytaj ostatnie prognozy z dysku — UI nie czeka na świeże Twelve
+    try:
+        _pc_disk_load()
+    except Exception as e:
+        print("startup precompute disk:", e)
     key = core.POLYGON_API_KEY or ""
     if not key or key.startswith("WPISZ") or len(key) < 10:
         print("⚠️  Ustaw POLYGON_API_KEY w zmiennych środowiskowych!")
@@ -654,18 +868,11 @@ def _startup():
     except Exception as e:
         print("startup macro:", e)
     if _PRECOMPUTE_ENABLED:
+        # wymuszenie: pamięć analizy zawsze pusta po restarcie (deploy)
+        _ANALYZE_CACHE.clear()
+        print(f"[cache] PRECOMPUTE_GEN={PRECOMPUTE_GEN} — stare wpisy bez gen odrzucone")
         threading.Thread(target=_precompute_worker, name="precompute", daemon=True).start()
-        print(f"[precompute] worker ON interval={_PRECOMPUTE_INTERVAL}s")
-        threading.Thread(target=_ai_board_worker, name="ai-board", daemon=True).start()
-        print("[ai-board] worker ON (after first forecast round)")
-        # Osobny szybki wątek: krypto zaraz po starcie dyno (nie czeka na kolejkę akcji)
-        def _crypto_boot():
-            time.sleep(1)
-            try:
-                _precompute_crypto_once()
-            except Exception as e:
-                print("[crypto-boot]", e)
-        threading.Thread(target=_crypto_boot, name="crypto-boot", daemon=True).start()
+        print(f"[precompute] worker ON — tylko 12 spółek, 1M i 3M")
     else:
         print("[precompute] OFF (PRECOMPUTE_ENABLED=0)")
 
@@ -711,7 +918,7 @@ def analyze(
     ticker: str,
     horizon: str = Query("1M", description="1M lub 3M"),
     fast: int = Query(1, description="kompatybilność"),
-    quality: int = Query(0, description="1=więcej punktów Hit% backtestu"),
+    quality: int = Query(1, description="1=więcej punktów Hit% backtestu"),
     refresh: int = Query(0, description="1=pomiń precompute/cache, przelicz teraz"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
@@ -727,7 +934,7 @@ def analyze(
 
     t = ticker.upper().strip()
     days = _horizon_days(horizon)
-    hz = "3M" if days > 30 else "1M"
+    hz = _horizon_label(horizon)
 
     if refresh:
         for k in list(_ANALYZE_CACHE.keys()):
@@ -736,8 +943,10 @@ def analyze(
         with _PRECOMPUTE_LOCK:
             _PRECOMPUTE.pop(_pc_key(t, hz), None)
 
+    # ZAWSZE serwuj ostatnią znaną prognozę (nawet starszą cenę) — zero pustego ładowania.
+    # Odświeżenie w tle; użytkownik widzi gotowe dane od razu.
     if not refresh:
-        cached = _pc_get(t, hz)
+        cached = _pc_get(t, hz, allow_stale=True)
         if (
             cached
             and cached.get("current_price") is not None
@@ -746,7 +955,15 @@ def analyze(
             cached = dict(cached)
             cached["cached"] = True
             cached.pop("fast_mode", None)
-            # Licznik Demo – nawet przy cache (to jest „użycie” analizy przez usera)
+            age = _pc_age(t, hz)
+            # jeśli starsze niż próg — odśwież w tle (nie blokuj odpowiedzi)
+            if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
+                # nie odpalaj Twelve z widoku pojedynczej spółki gdy limit już padł
+                try:
+                    if not getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        _bg_refresh_ticker(t, hz)
+                except Exception:
+                    pass
             if (prof.get("plan") or "demo").lower() == "demo":
                 new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
                 prof["analyze_count"] = new_c
@@ -755,7 +972,23 @@ def analyze(
             payload["analyze_remaining"] = auth.remaining_analyze(prof)
             return AnalyzeResponse(**payload)
 
-    data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
+    # Brak cache albo refresh=true — licz teraz, potem zapisz
+    try:
+        data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
+    except Exception as e:
+        # Ostateczny fallback: cokolwiek starego z dysku
+        stale = _pc_get(t, hz, max_age=_PRECOMPUTE_SERVE_MAX_AGE, allow_stale=True)
+        if stale and stale.get("current_price") is not None:
+            stale = dict(stale)
+            stale["cached"] = True
+            if (prof.get("plan") or "demo").lower() == "demo":
+                new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
+                prof["analyze_count"] = new_c
+            payload = {k: v for k, v in stale.items() if k in AnalyzeResponse.model_fields}
+            payload["plan"] = (prof.get("plan") or "demo").lower()
+            payload["analyze_remaining"] = auth.remaining_analyze(prof)
+            return AnalyzeResponse(**payload)
+        raise
     data.pop("fast_mode", None)
     try:
         if data.get("current_price") is not None:
@@ -774,7 +1007,7 @@ def analyze(
 @app.get("/rankings", response_model=RankingsResponse)
 def rankings(
     horizon: str = Query("1M"),
-    limit: int = Query(12, ge=1, le=30),
+    limit: int = Query(30, ge=1, le=80),
     order: str = Query("top", description="top | bottom — najwyższy / najniższy forecast %"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
@@ -802,42 +1035,75 @@ def rankings(
 
     items: List[RankingItem] = []
     hz = "3M" if _horizon_days(horizon) > 30 else "1M"
-    # dłuższa świeżość przy odczycie rankingu (akcje już wczytane = użyj ich)
-    rank_max_age = max(float(_PRECOMPUTE_INTERVAL) * 6.0, 21600.0)
+    # Ranking TYLKO z gotowego cache (nawet starsze ceny) — NIGDY nie liczy całej listy na request
+    rank_max_age = _PRECOMPUTE_SERVE_MAX_AGE
 
     def _from_analyze_mem(tk: str, hz_lab: str) -> Optional[Dict[str, Any]]:
         """Szukaj w _ANALYZE_CACHE bez ponownego liczenia."""
-        prefix = f"v8|{tk}|{hz_lab}|"
         now = time.time()
         best = None
         best_ts = 0.0
-        for k, row in list(_ANALYZE_CACHE.items()):
-            if not str(k).startswith(prefix):
-                continue
-            ts = float(row.get("ts") or 0)
-            if now - ts > _ANALYZE_CACHE_TTL * 2:
-                continue
-            if ts >= best_ts and row.get("data"):
-                best_ts = ts
-                best = dict(row["data"])
+        for prefix in (f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|"):
+            for k, row in list(_ANALYZE_CACHE.items()):
+                if not str(k).startswith(prefix):
+                    continue
+                ts = float(row.get("ts") or 0)
+                if now - ts > max(_ANALYZE_CACHE_TTL * 4, 86400):
+                    continue
+                if ts >= best_ts and row.get("data"):
+                    best_ts = ts
+                    best = dict(row["data"])
         return best
 
+    # 1) cache
+    by_tk: Dict[str, Dict[str, Any]] = {}
+    missing: List[str] = []
     for tk in tick_list:
+        d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
+        if not d:
+            d = _from_analyze_mem(tk, hz)
+        if d and d.get("current_price") is not None:
+            by_tk[tk] = d
+        else:
+            missing.append(tk)
+
+    # 2) brakujące — policz SEKWENCYJNIE (jak wcześniej), bez równoległego dobijania Twelve
+    if missing:
+        cool = False
         try:
-            d = _pc_get(tk, hz, max_age=rank_max_age)
-            if not d:
-                d = _from_analyze_mem(tk, hz)
-            # tylko gdy naprawdę brak – jedna szybka próba (nie blokuj całej listy sleepem)
-            if not d:
+            cool = bool(getattr(core, "_twelve_in_cooldown", lambda: False)())
+        except Exception:
+            cool = False
+        if cool:
+            print(f"[rankings] {hz} missing={missing} but Twelve cooldown — show cache only")
+        else:
+            print(f"[rankings] {hz} filling missing {missing}")
+            for tk in missing:
                 try:
-                    d = _analyze_one(tk, hz, fast=True, quality=False)
+                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        print("[rankings] stop fill — cooldown")
+                        break
+                except Exception:
+                    pass
+                try:
+                    d = _analyze_one(tk, hz, fast=False, quality=True)
                     if d and d.get("current_price") is not None:
                         _pc_store(tk, hz, d)
+                        by_tk[tk] = d
+                        print(f"[rankings] filled {tk}/{hz}")
                 except Exception as e:
-                    print("rankings analyze skip", tk, e)
-                    d = None
-            if not d or d.get("current_price") is None:
-                continue
+                    print("rankings fill skip", tk, e)
+                time.sleep(1.2)
+            try:
+                _pc_disk_save()
+            except Exception:
+                pass
+
+    for tk in tick_list:
+        d = by_tk.get(tk)
+        if not d or d.get("current_price") is None:
+            continue
+        try:
             items.append(
                 RankingItem(
                     ticker=str(d.get("ticker") or tk).upper(),
@@ -866,6 +1132,9 @@ def rankings(
         ),
         reverse=(order_l == "top"),
     )
+    print(f"[rankings] {hz} order={order_l} rows={len(items)} from universe={len(tick_list)}")
+    if len(items) < 8:
+        print("[rankings] WARN few rows — precompute incomplete or Twelve limit; cache partial")
     items = items[:limit]
     return RankingsResponse(
         horizon=hz,
@@ -935,10 +1204,24 @@ def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
 
 
 def _precompute_backtests_once() -> None:
-    """Strategy + forecast quality dla listy priorytetowej – wspólny cache."""
-    tickers = _ticker_list_for_precompute()[:12]
+    """Tylko gdy Twelve nie jest w cooldownie i ticker ma już cache cen."""
+    try:
+        if getattr(core, "_twelve_in_cooldown", lambda: False)():
+            print("[bt-precompute] skip — Twelve cooldown")
+            return
+    except Exception:
+        pass
+    tickers = _ticker_list_for_precompute()
     cap = 10000
     for t in tickers:
+        try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print("[bt-precompute] stop — cooldown")
+                return
+        except Exception:
+            pass
+        if _pc_get(t, "1M") is None and _pc_get(t, "3M") is None:
+            continue
         try:
             key_s = _bt_cache_key("strategy", t, cap)
             data_s = reports.strategy_backtest(t, initial_capital=float(cap))
@@ -2134,14 +2417,14 @@ def crypto_rankings(
 @app.get("/ai/full/{ticker}")
 def ai_full_analysis(
     ticker: str,
-    horizon: str = Query("1M", description="1M or 3M"),
-    refresh: bool = Query(False),
+    horizon: str = Query("3M", description="3M or 6M only"),
+    refresh: bool = Query(False, description="ignored — AI serves post-deploy cache only"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    Full 4-agent AI desk (always):
-      Fundamentals → Quant → World/News → Editor
-    Agents may adjust the displayed forecast % within hard caps on top of AssetCore model base.
+    AI Brief: horizons 3M / 6M only.
+    Quant prices come ONLY from server precompute (Twelve at deploy/worker — not per client).
+    AI text is served from server cache filled after deploy; client cannot force Twelve.
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
@@ -2150,12 +2433,35 @@ def ai_full_analysis(
             detail="GEMINI_API_KEY not configured on server. Set it in Render Environment.",
         )
     t = ticker.upper().strip()
-    days = _horizon_days(horizon)
-    hz = "3M" if days > 30 else "1M"
+    hz = _ai_horizon_label(horizon)
+
+    # Quant: precompute only (no Twelve on this path)
+    quant = _pc_get(t, hz)
+    if not quant:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Forecast for {t}/{hz} not ready yet. "
+                "Server fills 3M/6M AI after deploy precompute — try again shortly."
+            ),
+        )
+    quant = dict(quant)
+    quant["cached"] = True
+
+    # Prefer fully cached AI row (post-deploy). Client cannot force rebuild.
     try:
-        quant = _analyze_one(t, hz, fast=True, quality=False)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Quant analyze failed: {e}")
+        cached_ai = ai_full.peek_cache(t, hz)
+        if cached_ai:
+            data = dict(cached_ai)
+            data["cached"] = True
+            data["plan"] = (prof.get("plan") or "demo").lower()
+            data["mode"] = "four_agents_cached"
+            data["quant_source"] = "precompute"
+            data["client_refresh_ignored"] = True
+            return data
+    except Exception:
+        pass
+
     fundamentals = None
     perspective = None
     try:
@@ -2173,7 +2479,7 @@ def ai_full_analysis(
             fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
             perspective=perspective if isinstance(perspective, dict) else None,
             horizon=hz,
-            use_cache=not refresh,
+            use_cache=True,  # always cache; client cannot bust Twelve
         )
     except Exception as e:
         print("[ai_full] error", e)
@@ -2181,6 +2487,8 @@ def ai_full_analysis(
     data = dict(data)
     data["plan"] = (prof.get("plan") or "demo").lower()
     data["mode"] = "four_agents"
+    data["quant_source"] = "precompute"
+    data["client_refresh_ignored"] = True
     data["agents_used"] = data.get("agents_used") or [
         "fundamentals",
         "quant",
@@ -2265,13 +2573,13 @@ def ai_news_brief(
 
 @app.get("/ai/rankings")
 def ai_rankings(
-    horizon: str = Query("1M"),
+    horizon: str = Query("3M"),
     limit: int = Query(12, ge=1, le=50),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Top AI briefs already computed after deploy. Fills in as the board finishes."""
+    """Top AI briefs already computed after deploy (3M/6M). Fills in as the board finishes."""
     _gate(prof, "ai_brief")
-    hz = "3M" if str(horizon).upper().startswith("3") else "1M"
+    hz = _ai_horizon_label(horizon)
     items = ai_full.ranking_rows(hz, limit=limit)
     return {
         "horizon": hz,
