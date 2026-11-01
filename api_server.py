@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "alt-technique-hit50-v1"
-PRECOMPUTE_GEN = "alt-technique-hit50-v1"
+API_BUILD = "force-alt-hit50-v2"
+PRECOMPUTE_GEN = "force-alt-hit50-v2"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -351,7 +351,11 @@ def _pc_disk_save() -> None:
         import json as _json
         with _PRECOMPUTE_LOCK:
             payload = {
-                k: {"ts": v.get("ts"), "data": v.get("data")}
+                k: {
+                    "ts": v.get("ts"),
+                    "gen": v.get("gen") or PRECOMPUTE_GEN,
+                    "data": v.get("data"),
+                }
                 for k, v in _PRECOMPUTE.items()
                 if isinstance(v, dict) and isinstance(v.get("data"), dict)
             }
@@ -716,7 +720,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v11|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v12|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -1068,7 +1072,20 @@ def rankings(
         d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
         if not d:
             d = _from_analyze_mem(tk, hz)
+        # Stary wpis bez analysis_mode albo hit<50 bez retry → przelicz (alt technique)
+        need_re = False
         if d and d.get("current_price") is not None:
+            am = d.get("analysis_mode")
+            hr = d.get("hit_rate")
+            try:
+                hr_f = float(hr) if hr is not None else None
+            except Exception:
+                hr_f = None
+            if am is None:
+                need_re = True
+            elif hr_f is not None and hr_f < 50.0 and str(am) == "default":
+                need_re = True
+        if d and d.get("current_price") is not None and not need_re:
             by_tk[tk] = d
         else:
             missing.append(tk)

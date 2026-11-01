@@ -3173,28 +3173,28 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     # --- tryby alternatywne (retry gdy Hit < 50%) ---
     _mode = (mode or "default").strip().lower()
     if _mode == "more_tech":
-        tech_w2 = min(0.88, tech_w + 0.16)
+        tech_w2 = min(0.92, tech_w + 0.22)
         blended_ret = tech_w2 * tech_ret + (1.0 - tech_w2) * fund_ret
-        blended_ret *= 1.08
+        blended_ret *= 1.12
     elif _mode == "more_fund":
-        tech_w2 = max(0.18, tech_w - 0.16)
+        tech_w2 = max(0.12, tech_w - 0.22)
         blended_ret = tech_w2 * tech_ret + (1.0 - tech_w2) * fund_ret
     elif _mode == "shrink":
-        blended_ret *= 0.65
+        blended_ret *= 0.50
     elif _mode == "momentum":
-        # mocniej pod krótkie momentum z features
         try:
             m21 = float(feats.get("ret_21") or 0.0)
-            blended_ret = 0.55 * blended_ret + 0.45 * m21 * (days_forward / 21.0)
+            m63 = float(feats.get("ret_63") or 0.0)
+            blended_ret = 0.35 * blended_ret + 0.40 * m21 * (days_forward / 21.0) + 0.25 * m63 * (days_forward / 63.0)
         except Exception:
-            blended_ret *= 1.05
+            blended_ret *= 1.12
     elif _mode == "meanrev":
-        # lekka mean-reversion vs 63d
         try:
             m63 = float(feats.get("ret_63") or 0.0)
-            blended_ret = 0.60 * blended_ret - 0.25 * m63
+            m21 = float(feats.get("ret_21") or 0.0)
+            blended_ret = 0.40 * blended_ret - 0.35 * m63 - 0.15 * m21
         except Exception:
-            blended_ret *= 0.85
+            blended_ret *= 0.75
     # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
     try:
         if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
