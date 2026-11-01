@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "pct-calibrate-retry-v1"
-PRECOMPUTE_GEN = "pct-calibrate-retry-v1"
+API_BUILD = "alt-technique-hit50-v1"
+PRECOMPUTE_GEN = "alt-technique-hit50-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -716,7 +716,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v10|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v11|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -776,7 +776,7 @@ def _analyze_one(
                 days,
                 sector,
                 ticker=ticker,
-                max_retries=3 if days > 30 else 2,
+                max_retries=4 if days > 30 else 3,
                 hit_threshold=50.0,
                 max_points=max_pts,
             )
