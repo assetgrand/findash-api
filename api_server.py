@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "force-alt-hit50-v2"
-PRECOMPUTE_GEN = "force-alt-hit50-v2"
+API_BUILD = "rankings-nonblock-v1"
+PRECOMPUTE_GEN = "rankings-nonblock-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -1100,27 +1100,13 @@ def rankings(
         if cool:
             print(f"[rankings] {hz} missing={missing} but Twelve cooldown — show cache only")
         else:
-            print(f"[rankings] {hz} filling missing {missing}")
+            # NIE blokuj HTTP rankingu — brakujące licz w tle (TSLA + multi-mode bywa 30-90s)
+            print(f"[rankings] {hz} missing={missing} → background fill (non-blocking)")
             for tk in missing:
                 try:
-                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                        print("[rankings] stop fill — cooldown")
-                        break
-                except Exception:
-                    pass
-                try:
-                    d = _analyze_one(tk, hz, fast=False, quality=True)
-                    if d and d.get("current_price") is not None:
-                        _pc_store(tk, hz, d)
-                        by_tk[tk] = d
-                        print(f"[rankings] filled {tk}/{hz}")
+                    _bg_refresh_ticker(tk, hz)
                 except Exception as e:
-                    print("rankings fill skip", tk, e)
-                time.sleep(1.2)
-            try:
-                _pc_disk_save()
-            except Exception:
-                pass
+                    print("rankings bg schedule skip", tk, e)
 
     for tk in tick_list:
         d = by_tk.get(tk)
@@ -1509,7 +1495,7 @@ def precompute_run():
     return {"started": True, "message": "Precompute uruchomiony w tle – nie blokuje UI"}
 
 
-@app.get("/keepalive")
+@app.api_route("/keepalive", methods=["GET", "HEAD"])
 def keepalive():
     """
     Ping dla UptimeRobot / cron (co 5 min) – trzyma Render Free przy życiu.
