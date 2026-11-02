@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "real-alt-methods-v1"
-PRECOMPUTE_GEN = "real-alt-methods-v1"
+API_BUILD = "rankings-keep-12-v1"
+PRECOMPUTE_GEN = "rankings-keep-12-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -1072,7 +1072,7 @@ def rankings(
         d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
         if not d:
             d = _from_analyze_mem(tk, hz)
-        # Stary wpis bez analysis_mode albo hit<50 bez retry → przelicz (alt technique)
+        # hit<50 / brak mode → odśwież w tle, ALE zostaw w tabeli (nie znikaj z rankingu)
         need_re = False
         if d and d.get("current_price") is not None:
             am = d.get("analysis_mode")
@@ -1085,8 +1085,9 @@ def rankings(
                 need_re = True
             elif hr_f is not None and hr_f < 50.0 and str(am) == "default":
                 need_re = True
-        if d and d.get("current_price") is not None and not need_re:
             by_tk[tk] = d
+            if need_re:
+                missing.append(tk)  # tylko do bg refresh
         else:
             missing.append(tk)
 
