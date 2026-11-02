@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "real-alt-methods-v1"
-PRECOMPUTE_GEN = "real-alt-methods-v1"
+API_BUILD = "stable-rank-v1"
+PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -332,12 +332,10 @@ def _pc_disk_load() -> None:
                 ts = float(v.get("ts") or 0)
                 if now - ts > _PRECOMPUTE_SERVE_MAX_AGE:
                     continue
-                # tylko ta sama generacja core — inaczej po deployu stary hit wraca z dysku
-                if str(v.get("gen") or "") != str(PRECOMPUTE_GEN):
-                    continue
+                # ładuj WSZYSTKIE gen — po deployu ranking nie może być pusty (sama NVDA)
                 _PRECOMPUTE[str(k)] = {
                     "ts": ts,
-                    "gen": PRECOMPUTE_GEN,
+                    "gen": str(v.get("gen") or PRECOMPUTE_GEN),
                     "data": dict(v["data"]),
                 }
                 n += 1
@@ -397,11 +395,11 @@ def _pc_get(
         row = _PRECOMPUTE.get(_pc_key(ticker, horizon_label))
         if not row:
             return None
-        # stary cache z poprzedniego core / build — wyrzuć
-        if str(row.get("gen") or "") != str(PRECOMPUTE_GEN):
+        row_gen = str(row.get("gen") or "")
+        if row_gen != str(PRECOMPUTE_GEN) and not allow_stale:
             return None
         age = time.time() - float(row.get("ts") or 0)
-        if age > max_age:
+        if age > max_age and not allow_stale:
             return None
         out = dict(row["data"])
         out["_cache_age_sec"] = round(age, 1)
@@ -1053,7 +1051,10 @@ def rankings(
         now = time.time()
         best = None
         best_ts = 0.0
-        for prefix in (f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|"):
+        for prefix in (
+            f"v13|{tk}|{hz_lab}|", f"v12|{tk}|{hz_lab}|", f"v11|{tk}|{hz_lab}|",
+            f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|",
+        ):
             for k, row in list(_ANALYZE_CACHE.items()):
                 if not str(k).startswith(prefix):
                     continue
@@ -1072,7 +1073,7 @@ def rankings(
         d = _pc_get(tk, hz, max_age=rank_max_age, allow_stale=True)
         if not d:
             d = _from_analyze_mem(tk, hz)
-        # Stary wpis bez analysis_mode albo hit<50 bez retry → przelicz (alt technique)
+        # hit<50 / brak mode → odśwież w tle, ALE zostaw w tabeli (nie znikaj z rankingu)
         need_re = False
         if d and d.get("current_price") is not None:
             am = d.get("analysis_mode")
@@ -1085,8 +1086,9 @@ def rankings(
                 need_re = True
             elif hr_f is not None and hr_f < 50.0 and str(am) == "default":
                 need_re = True
-        if d and d.get("current_price") is not None and not need_re:
             by_tk[tk] = d
+            if need_re:
+                missing.append(tk)  # tylko do bg refresh
         else:
             missing.append(tk)
 
@@ -1100,8 +1102,32 @@ def rankings(
         if cool:
             print(f"[rankings] {hz} missing={missing} but Twelve cooldown — show cache only")
         else:
-            # NIE blokuj HTTP rankingu — brakujące licz w tle (TSLA + multi-mode bywa 30-90s)
-            print(f"[rankings] {hz} missing={missing} → background fill (non-blocking)")
+            # Mało wierszy po deployu (np. sama NVDA) → dociągnij synchronicznie kilka,
+            # resztę w tle. Nie zostawiaj tabeli z 1 spółką.
+            have = len(by_tk)
+            print(f"[rankings] {hz} have={have} missing={missing}")
+            if have < 8:
+                for tk in list(missing)[:12]:
+                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                        print("[rankings] cooldown — stop sync fill")
+                        break
+                    try:
+                        d = _analyze_one(tk, hz, fast=False, quality=True)
+                        if d and d.get("current_price") is not None:
+                            _pc_store(tk, hz, d)
+                            by_tk[tk] = d
+                            print(f"[rankings] sync filled {tk}")
+                    except Exception as e:
+                        print("rankings sync fill skip", tk, e)
+                    try:
+                        missing.remove(tk)
+                    except ValueError:
+                        pass
+                    time.sleep(0.8)
+                try:
+                    _pc_disk_save()
+                except Exception:
+                    pass
             for tk in missing:
                 try:
                     _bg_refresh_ticker(tk, hz)
