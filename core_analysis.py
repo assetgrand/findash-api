@@ -3170,8 +3170,9 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         tech_w = max(0.22, tech_w - 0.06)
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
-    # --- tryby alternatywne (retry gdy Hit < 50%) ---
+    # --- tryby ALTERNATYWNE (gdy Hit < 50%) — inne reguły, nie tylko wagi ensemble ---
     _mode = (mode or "default").strip().lower()
+    scale = (float(days_forward) / 21.0) if days_forward else 1.0
     if _mode == "more_tech":
         tech_w2 = min(0.92, tech_w + 0.22)
         blended_ret = tech_w2 * tech_ret + (1.0 - tech_w2) * fund_ret
@@ -3182,19 +3183,54 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     elif _mode == "shrink":
         blended_ret *= 0.50
     elif _mode == "momentum":
+        # czyste momentum: znak z ret_21/63, bez ensemble
         try:
             m21 = float(feats.get("ret_21") or 0.0)
             m63 = float(feats.get("ret_63") or 0.0)
-            blended_ret = 0.35 * blended_ret + 0.40 * m21 * (days_forward / 21.0) + 0.25 * m63 * (days_forward / 63.0)
+            blended_ret = 0.55 * m21 * scale + 0.45 * m63 * (float(days_forward) / 63.0)
         except Exception:
-            blended_ret *= 1.12
+            blended_ret = tech_ret
     elif _mode == "meanrev":
+        # mean-reversion: odwrotnie do krótkiego ruchu
         try:
-            m63 = float(feats.get("ret_63") or 0.0)
             m21 = float(feats.get("ret_21") or 0.0)
-            blended_ret = 0.40 * blended_ret - 0.35 * m63 - 0.15 * m21
+            m63 = float(feats.get("ret_63") or 0.0)
+            blended_ret = -0.65 * m21 * scale - 0.20 * m63 * (float(days_forward) / 63.0)
+            # lekki fund bias
+            blended_ret += 0.15 * fund_ret
         except Exception:
-            blended_ret *= 0.75
+            blended_ret = -0.5 * tech_ret
+    elif _mode == "trend200":
+        # tylko pozycja vs SMA / trend długi
+        try:
+            r63 = float(feats.get("ret_63") or 0.0)
+            r126 = float(feats.get("ret_126") or feats.get("ret_63") or 0.0)
+            sma_sig = float(feats.get("sma_spread") or feats.get("dist_sma50") or 0.0)
+            # jeśli brak feata — użyj znaku r63/r126
+            blended_ret = 0.5 * r63 * (float(days_forward) / 63.0) + 0.3 * r126 * (float(days_forward) / 126.0)
+            if abs(sma_sig) > 0:
+                blended_ret += 0.2 * (3.0 if sma_sig > 0 else -3.0) * scale
+        except Exception:
+            blended_ret = tech_ret
+    elif _mode == "rsi_revert":
+        # RSI: wyprzedanie → long, wykupienie → short
+        try:
+            rsi_v = float(feats.get("rsi") or feats.get("RSI") or 50.0)
+            if rsi_v < 35:
+                blended_ret = 4.0 * scale
+            elif rsi_v > 65:
+                blended_ret = -4.0 * scale
+            elif rsi_v < 45:
+                blended_ret = 1.5 * scale
+            elif rsi_v > 55:
+                blended_ret = -1.5 * scale
+            else:
+                blended_ret = 0.3 * fund_ret
+        except Exception:
+            blended_ret = fund_ret
+    elif _mode == "flip":
+        # systematycznie odwrotny znak ensemble (gdy model bywa lustrzany)
+        blended_ret = -1.0 * float(tech_w * tech_ret + (1.0 - tech_w) * fund_ret)
     # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
     try:
         if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
@@ -3561,9 +3597,20 @@ def analyze_forecast_with_retries(
     except Exception:
         fund_score = 50.0
 
-    all_modes = ["default", "more_tech", "more_fund", "momentum", "meanrev", "shrink"]
-    # zawsze default + kolejne według max_retries
-    modes = all_modes[: max(2, min(len(all_modes), 1 + int(max_retries) + 1))]
+    # default + prawdziwie inne reguły (nie tylko wagi)
+    all_modes = [
+        "default",
+        "momentum",
+        "meanrev",
+        "trend200",
+        "rsi_revert",
+        "flip",
+        "more_fund",
+        "shrink",
+    ]
+    # przy słabym hicie próbuj więcej technik
+    n_try = max(3, min(len(all_modes), 2 + int(max_retries)))
+    modes = all_modes[:n_try]
 
     results = []
     modes_tried = []
@@ -3624,11 +3671,11 @@ def analyze_forecast_with_retries(
             "score": hit - 0.30 * min(mae, 20.0),
         })
 
-        # early stop: mamy technikę >= threshold
-        if hit >= float(hit_threshold) and mname != "default":
-            break
-        # early stop: default już OK
+        # early stop: default już >= 50% — nie szukaj dalej
         if mname == "default" and hit >= float(hit_threshold):
+            break
+        # early stop: znaleziono lepszą technikę >= 50% (po default)
+        if mname != "default" and hit >= float(hit_threshold):
             break
 
     if not results:
