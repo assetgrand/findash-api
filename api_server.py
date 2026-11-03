@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "full-12-table-v1"
+API_BUILD = "horizon-modes-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -782,8 +782,8 @@ def _analyze_one(
     hit_rate = mae = n_sig = None
     analysis_mode = "default"
     modes_tried = ["default"]
-    # więcej okien = mniej losowych 8%/20% na pojedynczych spółkach
-    max_pts = 14
+    # więcej okien na 3M; 1M bez zmian
+    max_pts = 18 if days > 30 else 14
     try:
         if hasattr(core, "analyze_forecast_with_retries"):
             res = core.analyze_forecast_with_retries(
@@ -792,7 +792,7 @@ def _analyze_one(
                 days,
                 sector,
                 ticker=ticker,
-                max_retries=5 if days > 30 else 4,
+                max_retries=6 if days > 30 else 4,
                 hit_threshold=50.0,
                 max_points=max_pts,
             )

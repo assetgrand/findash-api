@@ -3589,7 +3589,7 @@ def analyze_forecast_with_retries(
     """
     Jeśli Hit% < threshold → liczy INNĄ techniką (mode) w całym walk-forward,
     nie tylko skaluje finalny %.
-    Kolejność: default → more_tech → more_fund → momentum → meanrev → shrink.
+    default najpierw; przy hit<50% inne mode'y (osobna kolejność 1M vs 3M).
     """
     fa = fundamental_analysis or {"combined_score": 50}
     try:
@@ -3674,17 +3674,37 @@ def analyze_forecast_with_retries(
                 "modes_tried": list(modes_tried),
             }
 
-    # default < 50% → inne techniki
-    alt_modes = [
-        "momentum",
-        "meanrev",
-        "trend200",
-        "rsi_revert",
-        "flip",
-        "more_fund",
-        "shrink",
-    ]
-    n_alt = max(2, min(len(alt_modes), 1 + int(max_retries)))
+    # default < 50% → inne techniki (INNY zestaw / kolejność na 1M vs 3M)
+    if int(days_forward) > 30:
+        # 3M: trend / stabilizacja najpierw; krótkie momentum na końcu
+        alt_modes = [
+            "trend200",
+            "shrink",
+            "more_fund",
+            "meanrev",
+            "rsi_revert",
+            "momentum",
+            "flip",
+        ]
+        # więcej prób na dłuższym horyzoncie
+        n_alt = max(4, min(len(alt_modes), 2 + int(max_retries)))
+        # gęstszy backtest tylko gdy i tak retry (słaby hit)
+        try:
+            max_points = max(int(max_points or 14), 18)
+        except Exception:
+            max_points = 18
+    else:
+        # 1M: świeższe techniki najpierw
+        alt_modes = [
+            "momentum",
+            "meanrev",
+            "rsi_revert",
+            "trend200",
+            "flip",
+            "more_fund",
+            "shrink",
+        ]
+        n_alt = max(3, min(len(alt_modes), 1 + int(max_retries)))
     for mname in alt_modes[:n_alt]:
         row = _run_mode(mname)
         if row is None:
@@ -4738,6 +4758,7 @@ def get_3year_perspective(ticker, fundamental_score=None):
 # ============================================================
 # KLASA HYBRYDOWEGO ANALIZATORA
 # ============================================================
+
 
 
 # ============================================================
