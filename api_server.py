@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "horizon-modes-v1"
+API_BUILD = "force-weak-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -488,9 +488,8 @@ def _precompute_all_once() -> None:
                 hr = None
             age = _pc_age(x, hz)
             if hr is not None and hr < 50.0:
-                # poniżej 50% — wolno liczyć ponownie (alt techniques)
-                if age is None or age >= float(_PRECOMPUTE_INTERVAL):
-                    weak.append(x)
+                # poniżej 50% — ZAWSZE w kolejce (stary cache blokował nowe mode'y)
+                weak.append(x)
             else:
                 # >=50% lub brak hr — NIE przeliczaj często (tylko co 24h)
                 if age is None or age >= max(float(_PRECOMPUTE_INTERVAL) * 8.0, 86400.0):
@@ -732,7 +731,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v13|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v14|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -862,6 +861,7 @@ def _analyze_one(
         "n_significant": n_sig,
         "analysis_mode": analysis_mode,
         "modes_tried": modes_tried,
+        "engine_build": API_BUILD,
         "fast_mode": False,
         "cached": False,
     }
@@ -1072,8 +1072,8 @@ def rankings(
         best = None
         best_ts = 0.0
         for prefix in (
-            f"v13|{tk}|{hz_lab}|", f"v12|{tk}|{hz_lab}|", f"v11|{tk}|{hz_lab}|",
-            f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|", f"v8|{tk}|{hz_lab}|",
+            f"v14|{tk}|{hz_lab}|", f"v13|{tk}|{hz_lab}|", f"v12|{tk}|{hz_lab}|",
+            f"v11|{tk}|{hz_lab}|", f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|",
         ):
             for k, row in list(_ANALYZE_CACHE.items()):
                 if not str(k).startswith(prefix):
@@ -1107,9 +1107,10 @@ def rankings(
                 need_re = True
             elif am is None and (hr_f is None):
                 need_re = True
+            # stary wynik <50% pokazuj, ale MUSI wejść do sync/bg (nowe mode'y)
             by_tk[tk] = d
             if need_re:
-                missing.append(tk)  # tylko do bg refresh
+                missing.append(tk)
         else:
             missing.append(tk)
 
@@ -1127,28 +1128,33 @@ def rankings(
             # resztę w tle. Nie zostawiaj tabeli z 1 spółką.
             have = len(by_tk)
             print(f"[rankings] {hz} have={have} missing={missing}")
-            if have < 12:
-                for tk in list(missing)[:16]:
-                    if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                        print("[rankings] cooldown — stop sync fill")
-                        break
-                    try:
-                        d = _analyze_one(tk, hz, fast=False, quality=True)
-                        if d and d.get("current_price") is not None:
-                            _pc_store(tk, hz, d)
-                            by_tk[tk] = d
-                            print(f"[rankings] sync filled {tk}")
-                    except Exception as e:
-                        print("rankings sync fill skip", tk, e)
-                    try:
-                        missing.remove(tk)
-                    except ValueError:
-                        pass
-                    time.sleep(0.8)
+            # zawsze dociągaj słabe / brakujące synchronicznie (max 12), reszta w tle
+            to_sync = list(missing)[:12]
+            print(f"[rankings] {hz} have={have} sync={to_sync}")
+            for tk in to_sync:
+                if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                    print("[rankings] cooldown — stop sync fill")
+                    break
                 try:
-                    _pc_disk_save()
-                except Exception:
+                    d = _analyze_one(tk, hz, fast=False, quality=True)
+                    if d and d.get("current_price") is not None:
+                        _pc_store(tk, hz, d)
+                        by_tk[tk] = d
+                        print(
+                            f"[rankings] sync filled {tk} hit={d.get('hit_rate')} "
+                            f"mode={d.get('analysis_mode')}"
+                        )
+                except Exception as e:
+                    print("rankings sync fill skip", tk, e)
+                try:
+                    missing.remove(tk)
+                except ValueError:
                     pass
+                time.sleep(0.8)
+            try:
+                _pc_disk_save()
+            except Exception:
+                pass
             for tk in missing:
                 try:
                     _bg_refresh_ticker(tk, hz)
