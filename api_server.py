@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "only-weak-retry-v1"
+API_BUILD = "full-12-table-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -1042,13 +1042,19 @@ def rankings(
     order_l = (order or "top").strip().lower()
     if order_l not in ("top", "bottom"):
         order_l = "top"
+    # ZAWSZE te 12 — ranking nie może spaść do 9/1 spółki
+    CORE12 = [
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+        "TSLA", "JPM", "XOM", "JNJ", "AMD", "INTC",
+    ]
+    # CSCO bywa na liście zamiast JNJ — dołącz obie, unikaj duplikatów
+    EXTRA = ["CSCO"]
     tick_list = list(getattr(core, "tickers", []) or [])
     if not tick_list:
         tick_list = _ticker_list_for_precompute()
-    # unia z listą precompute (priorytet + core.tickers)
     seen = set()
     full = []
-    for t in list(tick_list) + _ticker_list_for_precompute():
+    for t in list(CORE12) + list(EXTRA) + list(tick_list) + _ticker_list_for_precompute():
         u = str(t).upper().strip()
         if u and u not in seen:
             seen.add(u)
@@ -1121,8 +1127,8 @@ def rankings(
             # resztę w tle. Nie zostawiaj tabeli z 1 spółką.
             have = len(by_tk)
             print(f"[rankings] {hz} have={have} missing={missing}")
-            if have < 8:
-                for tk in list(missing)[:12]:
+            if have < 12:
+                for tk in list(missing)[:16]:
                     if getattr(core, "_twelve_in_cooldown", lambda: False)():
                         print("[rankings] cooldown — stop sync fill")
                         break
@@ -1149,9 +1155,11 @@ def rankings(
                 except Exception as e:
                     print("rankings bg schedule skip", tk, e)
 
+    missing_rows = []
     for tk in tick_list:
         d = by_tk.get(tk)
         if not d or d.get("current_price") is None:
+            missing_rows.append(tk)
             continue
         try:
             items.append(
@@ -1182,9 +1190,9 @@ def rankings(
         ),
         reverse=(order_l == "top"),
     )
-    print(f"[rankings] {hz} order={order_l} rows={len(items)} from universe={len(tick_list)}")
-    if len(items) < 8:
-        print("[rankings] WARN few rows — precompute incomplete or Twelve limit; cache partial")
+    print(f"[rankings] {hz} order={order_l} rows={len(items)} from universe={len(tick_list)} missing_rows={missing_rows[:20]}")
+    if len(items) < 12:
+        print("[rankings] WARN incomplete table — will bg/sync fill missing")
     items = items[:limit]
     return RankingsResponse(
         horizon=hz,
