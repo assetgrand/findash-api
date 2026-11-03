@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "stable-rank-v1"
+API_BUILD = "only-weak-retry-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -476,12 +476,26 @@ def _precompute_all_once() -> None:
     jobs = []
     for hz in ("1M", "3M"):
         missing = [x for x in tickers if _pc_get(x, hz, allow_stale=True) is None]
-        fresh = [x for x in tickers if x not in missing]
-        # odśwież stare na końcu
-        for x in missing + fresh:
-            age = _pc_age(x, hz)
-            if age is not None and age < float(_PRECOMPUTE_INTERVAL):
+        # słabe (hit<50) odświeżaj częściej; mocne (hit>=50) tylko gdy bardzo stare
+        weak, strong = [], []
+        for x in tickers:
+            if x in missing:
                 continue
+            d = _pc_get(x, hz, allow_stale=True) or {}
+            try:
+                hr = float(d.get("hit_rate")) if d.get("hit_rate") is not None else None
+            except Exception:
+                hr = None
+            age = _pc_age(x, hz)
+            if hr is not None and hr < 50.0:
+                # poniżej 50% — wolno liczyć ponownie (alt techniques)
+                if age is None or age >= float(_PRECOMPUTE_INTERVAL):
+                    weak.append(x)
+            else:
+                # >=50% lub brak hr — NIE przeliczaj często (tylko co 24h)
+                if age is None or age >= max(float(_PRECOMPUTE_INTERVAL) * 8.0, 86400.0):
+                    strong.append(x)
+        for x in missing + weak + strong:
             jobs.append((x, hz))
     print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
     done_tickers = set()
@@ -1082,9 +1096,10 @@ def rankings(
                 hr_f = float(hr) if hr is not None else None
             except Exception:
                 hr_f = None
-            if am is None:
+            # tylko hit < 50% wymaga ponownego liczenia (alt); >=50% zostaw
+            if hr_f is not None and hr_f < 50.0:
                 need_re = True
-            elif hr_f is not None and hr_f < 50.0 and str(am) == "default":
+            elif am is None and (hr_f is None):
                 need_re = True
             by_tk[tk] = d
             if need_re:

@@ -3597,25 +3597,13 @@ def analyze_forecast_with_retries(
     except Exception:
         fund_score = 50.0
 
-    # default + prawdziwie inne reguły (nie tylko wagi)
-    all_modes = [
-        "default",
-        "momentum",
-        "meanrev",
-        "trend200",
-        "rsi_revert",
-        "flip",
-        "more_fund",
-        "shrink",
-    ]
-    # przy słabym hicie próbuj więcej technik
-    n_try = max(3, min(len(all_modes), 2 + int(max_retries)))
-    modes = all_modes[:n_try]
-
+    # 1) ZAWSZE najpierw tylko default.
+    # 2) Inne techniki TYLKO gdy default ma hit < threshold (50%).
+    #    Spółki >= 50% nie są "przerabiane" momentum/meanrev/flip.
     results = []
     modes_tried = []
 
-    for mname in modes:
+    def _run_mode(mname: str):
         modes_tried.append(mname)
         q = backtest_forecast_quality(
             df,
@@ -3630,14 +3618,11 @@ def analyze_forecast_with_retries(
             df, fa, days_forward, sector, ticker=ticker, quiet=True, mode=mname
         )
         if chg is None:
-            continue
-
+            return None
         hit = float(q.get("hit_rate") or 0) if q else 0.0
         mae = float(q.get("mae") or 99.0) if q else 99.0
         bias = q.get("bias") if q else None
         n_sig = q.get("n_significant") if q else None
-
-        # kalibracja % po historycznym bias
         cal_chg = float(chg)
         if bias is not None:
             try:
@@ -3649,7 +3634,6 @@ def analyze_forecast_with_retries(
                     cal_chg = -abs(cal_chg) * 0.35
             except Exception:
                 pass
-
         price0 = float(df["Close"].iloc[-1])
         cal_price = price0 * (1.0 + cal_chg / 100.0)
         if cal_chg > 1.0:
@@ -3658,8 +3642,7 @@ def analyze_forecast_with_retries(
             direction = "DOWNTREND"
         else:
             direction = "NEUTRAL"
-
-        results.append({
+        return {
             "mode": mname,
             "hit_rate": hit,
             "mae": mae,
@@ -3669,13 +3652,45 @@ def analyze_forecast_with_retries(
             "predicted_price": round(cal_price, 4),
             "direction": direction,
             "score": hit - 0.30 * min(mae, 20.0),
-        })
+        }
 
-        # early stop: default już >= 50% — nie szukaj dalej
-        if mname == "default" and hit >= float(hit_threshold):
-            break
-        # early stop: znaleziono lepszą technikę >= 50% (po default)
-        if mname != "default" and hit >= float(hit_threshold):
+    default_row = _run_mode("default")
+    if default_row is not None:
+        results.append(default_row)
+        if float(default_row["hit_rate"]) >= float(hit_threshold):
+            # hit OK — ZERO innych technik
+            best = default_row
+            return {
+                "predicted_price": best["predicted_price"],
+                "pred_price": best["predicted_price"],
+                "direction": best["direction"],
+                "predicted_change_pct": best["predicted_change_pct"],
+                "change_pct": best["predicted_change_pct"],
+                "hit_rate": best["hit_rate"],
+                "mae": best["mae"],
+                "bias": best["bias"],
+                "n_significant": best["n_significant"],
+                "analysis_mode": "default",
+                "modes_tried": list(modes_tried),
+            }
+
+    # default < 50% → inne techniki
+    alt_modes = [
+        "momentum",
+        "meanrev",
+        "trend200",
+        "rsi_revert",
+        "flip",
+        "more_fund",
+        "shrink",
+    ]
+    n_alt = max(2, min(len(alt_modes), 1 + int(max_retries)))
+    for mname in alt_modes[:n_alt]:
+        row = _run_mode(mname)
+        if row is None:
+            continue
+        results.append(row)
+        if float(row["hit_rate"]) >= float(hit_threshold):
             break
 
     if not results:
@@ -4747,6 +4762,7 @@ def init_macro_for_api():
         load_macro_csv()
     except Exception as e:
         print("Makro init:", e)
+
 
 
 # ============================================================
