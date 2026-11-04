@@ -3242,6 +3242,43 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     elif _mode == "flip":
         # systematycznie odwrotny znak ensemble (gdy model bywa lustrzany)
         blended_ret = -1.0 * float(tech_w * tech_ret + (1.0 - tech_w) * fund_ret)
+    elif _mode == "vol_trend":
+        # wysoka zmienność (TSLA-like): tylko średni trend, mocno przycięta wielkość
+        try:
+            r63 = float(feats.get("ret_63") or 0.0)
+            r21 = float(feats.get("ret_21") or 0.0)
+            # kierunek z dłuższego okna, lekki filtr krótkiego
+            direction_sig = r63 if abs(r63) >= abs(r21) * 0.5 else (r63 + r21) * 0.5
+            mag = min(6.0, abs(direction_sig) * 0.35) * scale
+            blended_ret = (1.0 if direction_sig >= 0 else -1.0) * mag
+            blended_ret += 0.10 * fund_ret
+        except Exception:
+            blended_ret = 0.45 * tech_ret
+    elif _mode == "breakout":
+        # kontynuacja przy zgodnym krótkim/średnim ruchu; przy ekstremum – lekki odwrót
+        try:
+            dist = float(feats.get("dist_sma50") or feats.get("sma_spread") or 0.0)
+            r21 = float(feats.get("ret_21") or 0.0)
+            r5 = float(feats.get("ret_5") or feats.get("ret_10") or 0.0)
+            if abs(r5) >= 3.0 and r5 * r21 > 0:
+                blended_ret = 0.55 * r21 * scale + 0.15 * fund_ret
+            elif abs(r21) >= 8.0:
+                blended_ret = -0.35 * r21 * scale + 0.10 * fund_ret
+            else:
+                blended_ret = 0.40 * r21 * scale + 0.20 * fund_ret
+            if abs(dist) > 0 and abs(blended_ret) < 0.5:
+                blended_ret += (1.2 if dist > 0 else -1.2) * scale * 0.3
+        except Exception:
+            blended_ret = tech_ret
+    elif _mode == "slow_drift":
+        # bardzo konserwatywny drift (dobry gdy agresywne mode'y się mylą)
+        try:
+            r126 = float(feats.get("ret_126") or feats.get("ret_63") or 0.0)
+            blended_ret = 0.25 * r126 * (float(days_forward) / 126.0)
+            blended_ret = max(-4.0, min(4.0, blended_ret))
+            blended_ret += 0.20 * fund_ret
+        except Exception:
+            blended_ret = 0.25 * fund_ret
     # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
     try:
         if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
@@ -3685,43 +3722,72 @@ def analyze_forecast_with_retries(
                 "modes_tried": list(modes_tried),
             }
 
-    # default < 50% → inne techniki (INNY zestaw / kolejność na 1M vs 3M)
+    # default < 50% → inne techniki (1M vs 3M + ścieżka high-vol)
+    # oszacuj zmienność z df (TSLA-like)
+    high_vol = False
+    try:
+        rets = df["Close"].pct_change().dropna().tail(60)
+        if len(rets) >= 20:
+            high_vol = bool(float(rets.std()) * (252 ** 0.5) >= 0.45)  # ~45%+ ann.
+    except Exception:
+        high_vol = False
+
     if int(days_forward) > 30:
-        # 3M: trend / stabilizacja najpierw; krótkie momentum na końcu
         alt_modes = [
+            "vol_trend",
+            "slow_drift",
             "trend200",
             "shrink",
             "more_fund",
             "meanrev",
+            "breakout",
             "rsi_revert",
             "momentum",
             "flip",
         ]
-        # więcej prób na dłuższym horyzoncie
-        n_alt = max(4, min(len(alt_modes), 2 + int(max_retries)))
-        # gęstszy backtest tylko gdy i tak retry (słaby hit)
+        n_alt = max(5, min(len(alt_modes), 3 + int(max_retries)))
         try:
-            max_points = max(int(max_points or 14), 18)
+            max_points = max(int(max_points or 14), 20 if high_vol else 18)
         except Exception:
             max_points = 18
     else:
-        # 1M: świeższe techniki najpierw
         alt_modes = [
-            "momentum",
+            "vol_trend",
+            "breakout",
             "meanrev",
+            "slow_drift",
+            "momentum",
             "rsi_revert",
             "trend200",
             "flip",
             "more_fund",
             "shrink",
         ]
-        n_alt = max(3, min(len(alt_modes), 1 + int(max_retries)))
+        n_alt = max(4, min(len(alt_modes), 2 + int(max_retries)))
+        if high_vol:
+            # przy bardzo niskim default hit — sprawdź WSZYSTKIE mode'y
+            n_alt = len(alt_modes)
+            try:
+                max_points = max(int(max_points or 14), 20)
+            except Exception:
+                max_points = 20
+
+    # jeśli default był fatalny (<35%), nie przerywaj po pierwszym >=50 z kiepskim MAE —
+    # zbierz więcej i wybierz best na końcu (nadal bez fałszowania)
+    greedy_stop = True
+    try:
+        if results and float(results[0]["hit_rate"]) < 35.0:
+            greedy_stop = False
+            n_alt = len(alt_modes)
+    except Exception:
+        pass
+
     for mname in alt_modes[:n_alt]:
         row = _run_mode(mname)
         if row is None:
             continue
         results.append(row)
-        if float(row["hit_rate"]) >= float(hit_threshold):
+        if greedy_stop and float(row["hit_rate"]) >= float(hit_threshold):
             break
 
     if not results:

@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "rank-nonsync-v1"
+API_BUILD = "vol-modes-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -731,7 +731,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v14|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v15|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -1071,7 +1071,7 @@ def rankings(
         best = None
         best_ts = 0.0
         for prefix in (
-            f"v14|{tk}|{hz_lab}|", f"v13|{tk}|{hz_lab}|", f"v12|{tk}|{hz_lab}|",
+            f"v15|{tk}|{hz_lab}|", f"v14|{tk}|{hz_lab}|", f"v13|{tk}|{hz_lab}|",
             f"v11|{tk}|{hz_lab}|", f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|",
         ):
             for k, row in list(_ANALYZE_CACHE.items()):
