@@ -162,10 +162,21 @@ def _twelve_trip_cooldown(seconds: float = 900.0) -> None:
     return
 
 def _api_call(url, max_retries=3):
-    """Wykonuje zapytaNO do Twelve Data API."""
+    """Wykonuje zapytanie do Twelve Data API."""
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=30)
+            # 403 = brak uprawnień / limit planu — nie ma sensu 3× retry (wiesza ranking)
+            if resp.status_code == 403:
+                print(f"❌ Twelve 403 (bez retry): {url.split('?', 1)[0]}")
+                return None
+            if resp.status_code == 429:
+                print(f"❌ Twelve 429 rate limit: {url.split('?', 1)[0]}")
+                try:
+                    _twelve_trip_cooldown(600.0)
+                except Exception:
+                    pass
+                return None
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict):
@@ -176,10 +187,10 @@ def _api_call(url, max_retries=3):
             return data
         except requests.exceptions.RequestException as e:
             print(f"❌ Błąd sieci (próba {attempt+1}): {e}")
-            time.sleep(2)
+            time.sleep(1.2)
         except Exception as e:
             print(f"❌ Błąd (próba {attempt+1}): {e}")
-            time.sleep(2)
+            time.sleep(1.2)
     return None
 
 def test_api_key():

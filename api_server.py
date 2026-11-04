@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "force-weak-v1"
+API_BUILD = "rank-nonsync-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -1045,10 +1045,9 @@ def rankings(
     # ZAWSZE te 12 — ranking nie może spaść do 9/1 spółki
     CORE12 = [
         "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
-        "TSLA", "JPM", "XOM", "JNJ", "AMD", "INTC",
+        "TSLA", "JPM", "XOM", "CSCO", "AMD", "INTC",
     ]
-    # CSCO bywa na liście zamiast JNJ — dołącz obie, unikaj duplikatów
-    EXTRA = ["CSCO"]
+    EXTRA = []
     tick_list = list(getattr(core, "tickers", []) or [])
     if not tick_list:
         tick_list = _ticker_list_for_precompute()
@@ -1121,16 +1120,20 @@ def rankings(
             cool = bool(getattr(core, "_twelve_in_cooldown", lambda: False)())
         except Exception:
             cool = False
-        if cool:
-            print(f"[rankings] {hz} missing={missing} but Twelve cooldown — show cache only")
+        have = len(by_tk)
+        print(f"[rankings] {hz} have={have} missing={missing} cool={cool}")
+        # Mamy już pełną/prawie pełną tabelę z cache → NIGDY nie blokuj requestu Twelve.
+        # Słabe (TSLA itd.) odświeżaj TYLKO w tle.
+        if cool or have >= 10:
+            for tk in missing:
+                try:
+                    _bg_refresh_ticker(tk, hz)
+                except Exception as e:
+                    print("rankings bg schedule skip", tk, e)
         else:
-            # Mało wierszy po deployu (np. sama NVDA) → dociągnij synchronicznie kilka,
-            # resztę w tle. Nie zostawiaj tabeli z 1 spółką.
-            have = len(by_tk)
-            print(f"[rankings] {hz} have={have} missing={missing}")
-            # zawsze dociągaj słabe / brakujące synchronicznie (max 12), reszta w tle
-            to_sync = list(missing)[:12]
-            print(f"[rankings] {hz} have={have} sync={to_sync}")
+            # Tabela prawie pusta — dociągaj synchronicznie max kilka
+            to_sync = list(missing)[:8]
+            print(f"[rankings] {hz} emergency sync={to_sync}")
             for tk in to_sync:
                 if getattr(core, "_twelve_in_cooldown", lambda: False)():
                     print("[rankings] cooldown — stop sync fill")
@@ -1150,7 +1153,7 @@ def rankings(
                     missing.remove(tk)
                 except ValueError:
                     pass
-                time.sleep(0.8)
+                time.sleep(0.5)
             try:
                 _pc_disk_save()
             except Exception:
