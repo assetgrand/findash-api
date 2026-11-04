@@ -3635,9 +3635,11 @@ def analyze_forecast_with_retries(
     max_points=14,
 ):
     """
-    Jeśli Hit% < threshold → liczy INNĄ techniką (mode) w całym walk-forward,
-    nie tylko skaluje finalny %.
-    default najpierw; przy hit<50% inne mode'y (osobna kolejność 1M vs 3M).
+    OSTATECZNY PLAN: zawsze 3 RÓŻNE analizy na tych samych danych (1× Twelve),
+    wybór najlepszej po Hit% (potem niższe MAE).
+
+    Twelve / historia: bez dodatkowego kosztu — ten sam df.
+    max_retries / hit_threshold: kompatybilność wsteczna (nie sterują już early-exit).
     """
     fa = fundamental_analysis or {"combined_score": 50}
     try:
@@ -3645,11 +3647,27 @@ def analyze_forecast_with_retries(
     except Exception:
         fund_score = 50.0
 
-    # 1) ZAWSZE najpierw tylko default.
-    # 2) Inne techniki TYLKO gdy default ma hit < threshold (50%).
-    #    Spółki >= 50% nie są "przerabiane" momentum/meanrev/flip.
     results = []
     modes_tried = []
+
+    # high-vol → inny zestaw 3 technik
+    high_vol = False
+    try:
+        rets = df["Close"].pct_change().dropna().tail(60)
+        if len(rets) >= 20:
+            high_vol = bool(float(rets.std()) * (252 ** 0.5) >= 0.45)
+    except Exception:
+        high_vol = False
+
+    # gęstszy backtest przy high-vol / 3M
+    try:
+        mp = int(max_points or 14)
+    except Exception:
+        mp = 14
+    if int(days_forward) > 30:
+        mp = max(mp, 18)
+    if high_vol:
+        mp = max(mp, 20)
 
     def _run_mode(mname: str):
         modes_tried.append(mname)
@@ -3659,7 +3677,7 @@ def analyze_forecast_with_retries(
             sector=sector,
             fund_score=fund_score,
             ticker=ticker,
-            max_points=max_points,
+            max_points=mp,
             predict_mode=mname,
         )
         pred_price, direction, chg = predict_with_technical_influence(
@@ -3699,96 +3717,24 @@ def analyze_forecast_with_retries(
             "predicted_change_pct": round(cal_chg, 2),
             "predicted_price": round(cal_price, 4),
             "direction": direction,
-            "score": hit - 0.30 * min(mae, 20.0),
         }
 
-    default_row = _run_mode("default")
-    if default_row is not None:
-        results.append(default_row)
-        if float(default_row["hit_rate"]) >= float(hit_threshold):
-            # hit OK — ZERO innych technik
-            best = default_row
-            return {
-                "predicted_price": best["predicted_price"],
-                "pred_price": best["predicted_price"],
-                "direction": best["direction"],
-                "predicted_change_pct": best["predicted_change_pct"],
-                "change_pct": best["predicted_change_pct"],
-                "hit_rate": best["hit_rate"],
-                "mae": best["mae"],
-                "bias": best["bias"],
-                "n_significant": best["n_significant"],
-                "analysis_mode": "default",
-                "modes_tried": list(modes_tried),
-            }
-
-    # default < 50% → inne techniki (1M vs 3M + ścieżka high-vol)
-    # oszacuj zmienność z df (TSLA-like)
-    high_vol = False
-    try:
-        rets = df["Close"].pct_change().dropna().tail(60)
-        if len(rets) >= 20:
-            high_vol = bool(float(rets.std()) * (252 ** 0.5) >= 0.45)  # ~45%+ ann.
-    except Exception:
-        high_vol = False
-
+    # --- zawsze dokładnie 3 RÓŻNE techniki ---
     if int(days_forward) > 30:
-        alt_modes = [
-            "vol_trend",
-            "slow_drift",
-            "trend200",
-            "shrink",
-            "more_fund",
-            "meanrev",
-            "breakout",
-            "rsi_revert",
-            "momentum",
-            "flip",
-        ]
-        n_alt = max(5, min(len(alt_modes), 3 + int(max_retries)))
-        try:
-            max_points = max(int(max_points or 14), 20 if high_vol else 18)
-        except Exception:
-            max_points = 18
-    else:
-        alt_modes = [
-            "vol_trend",
-            "breakout",
-            "meanrev",
-            "slow_drift",
-            "momentum",
-            "rsi_revert",
-            "trend200",
-            "flip",
-            "more_fund",
-            "shrink",
-        ]
-        n_alt = max(4, min(len(alt_modes), 2 + int(max_retries)))
         if high_vol:
-            # przy bardzo niskim default hit — sprawdź WSZYSTKIE mode'y
-            n_alt = len(alt_modes)
-            try:
-                max_points = max(int(max_points or 14), 20)
-            except Exception:
-                max_points = 20
+            trio = ["default", "vol_trend", "slow_drift"]
+        else:
+            trio = ["default", "trend200", "more_fund"]
+    else:
+        if high_vol:
+            trio = ["default", "vol_trend", "breakout"]
+        else:
+            trio = ["default", "momentum", "meanrev"]
 
-    # jeśli default był fatalny (<35%), nie przerywaj po pierwszym >=50 z kiepskim MAE —
-    # zbierz więcej i wybierz best na końcu (nadal bez fałszowania)
-    greedy_stop = True
-    try:
-        if results and float(results[0]["hit_rate"]) < 35.0:
-            greedy_stop = False
-            n_alt = len(alt_modes)
-    except Exception:
-        pass
-
-    for mname in alt_modes[:n_alt]:
+    for mname in trio:
         row = _run_mode(mname)
-        if row is None:
-            continue
-        results.append(row)
-        if greedy_stop and float(row["hit_rate"]) >= float(hit_threshold):
-            break
+        if row is not None:
+            results.append(row)
 
     if not results:
         pred_price, direction, chg = predict_with_technical_influence(
@@ -3808,13 +3754,8 @@ def analyze_forecast_with_retries(
             "modes_tried": modes_tried,
         }
 
-    # jeśli jest jakikolwiek mode >= threshold → najlepszy z nich (hit, potem MAE)
-    ok = [r for r in results if r["hit_rate"] >= float(hit_threshold)]
-    if ok:
-        best = sorted(ok, key=lambda r: (-r["hit_rate"], r["mae"]))[0]
-    else:
-        # wszystkie < 50% → najwyższy hit (inna technika i tak wybrana)
-        best = sorted(results, key=lambda r: (-r["hit_rate"], r["mae"]))[0]
+    # najlepsza z 3: najwyższy hit, potem niższe MAE
+    best = sorted(results, key=lambda r: (-float(r["hit_rate"]), float(r["mae"])))[0]
 
     return {
         "predicted_price": best["predicted_price"],
@@ -3829,7 +3770,6 @@ def analyze_forecast_with_retries(
         "analysis_mode": best["mode"],
         "modes_tried": modes_tried,
     }
-
 
 
 
