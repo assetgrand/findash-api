@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "weak-extra-v1"
+API_BUILD = "confidence-rank-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -214,6 +214,8 @@ class RankingItem(BaseModel):
     sector: str = "Unknown"
     fundamental_rating: Optional[str] = None
     hit_rate: Optional[float] = None
+    confidence: Optional[str] = None
+    low_confidence: Optional[bool] = None
 
 
 class RankingsResponse(BaseModel):
@@ -221,6 +223,61 @@ class RankingsResponse(BaseModel):
     items: List[RankingItem]
     disclaimer: str = "Analytical tool, not investment advice."
 
+
+
+def _confidence_from_hit(hit_rate: Optional[float]) -> Dict[str, Any]:
+    """Map walk-forward Hit% → confidence for UI / ranking weight."""
+    try:
+        h = float(hit_rate) if hit_rate is not None else None
+    except Exception:
+        h = None
+    if h is None:
+        return {
+            "confidence": "unknown",
+            "low_confidence": False,
+            "confidence_note": "Hit% unavailable for this window.",
+            "rank_weight": 0.55,
+        }
+    if h < 40.0:
+        return {
+            "confidence": "low",
+            "low_confidence": True,
+            "confidence_note": "Low historical direction accuracy (Hit < 40%). Treat forecast as weak.",
+            "rank_weight": 0.28,
+        }
+    if h < 55.0:
+        return {
+            "confidence": "moderate",
+            "low_confidence": False,
+            "confidence_note": "Moderate historical accuracy.",
+            "rank_weight": 0.70,
+        }
+    return {
+        "confidence": "high",
+        "low_confidence": False,
+        "confidence_note": "Solid historical direction accuracy.",
+        "rank_weight": 1.0,
+    }
+
+
+def _ranking_sort_score(change_pct: Optional[float], hit_rate: Optional[float], order: str) -> float:
+    """Quality-weighted score: weak Hit% cannot dominate Top by raw % alone."""
+    try:
+        chg = float(change_pct) if change_pct is not None else None
+    except Exception:
+        chg = None
+    if chg is None:
+        return -1e9 if order == "top" else 1e9
+    conf = _confidence_from_hit(hit_rate)
+    w = float(conf.get("rank_weight") or 0.55)
+    # additional soft curve on hit
+    try:
+        h = float(hit_rate) if hit_rate is not None else 50.0
+    except Exception:
+        h = 50.0
+    h = max(0.0, min(100.0, h))
+    w *= 0.50 + 0.50 * (h / 100.0)
+    return chg * w
 
 def _horizon_days(horizon: str) -> int:
     """Trading-day horizons: 1M≈21, 3M≈63, 6M≈126."""
@@ -1171,6 +1228,8 @@ def rankings(
             missing_rows.append(tk)
             continue
         try:
+            hr_f = _safe_float(d.get("hit_rate"))
+            conf = _confidence_from_hit(hr_f)
             items.append(
                 RankingItem(
                     ticker=str(d.get("ticker") or tk).upper(),
@@ -1183,19 +1242,19 @@ def rankings(
                         if d.get("fundamental_rating") is not None
                         else None
                     ),
-                    hit_rate=_safe_float(d.get("hit_rate")),
+                    hit_rate=hr_f,
+                    confidence=str(conf.get("confidence") or "unknown"),
+                    low_confidence=bool(conf.get("low_confidence")),
                 )
             )
         except Exception as e:
             print("rankings skip", tk, e)
             continue
 
+    # Top/Bottom by quality-weighted change (low Hit% cannot lead Top on raw % alone)
     items.sort(
-        key=lambda x: (
-            x.predicted_change_pct is not None,
-            x.predicted_change_pct
-            if x.predicted_change_pct is not None
-            else (999.0 if order_l == "bottom" else -999.0),
+        key=lambda x: _ranking_sort_score(
+            x.predicted_change_pct, x.hit_rate, order_l
         ),
         reverse=(order_l == "top"),
     )
@@ -1207,7 +1266,7 @@ def rankings(
         horizon=hz,
         items=items,
         disclaimer=(
-            "Analytical tool, not investment advice. Rankings use cached model forecasts."
+            "Analytical tool, not investment advice. Rankings weight forecast by historical Hit% (low confidence sinks in Top)."
         ),
     )
 
