@@ -3737,6 +3737,51 @@ def analyze_forecast_with_retries(
         if row is not None:
             results.append(row)
 
+    # --- tylko gdy najlepsza z bazowych < 50%: poszerz o BARDZIEJ różne techniki ---
+    best_so_far = None
+    try:
+        if results:
+            best_so_far = max(float(r["hit_rate"]) for r in results)
+    except Exception:
+        best_so_far = None
+
+    if best_so_far is not None and best_so_far < 50.0:
+        used = {str(r.get("mode") or "").lower() for r in results}
+        if int(days_forward) > 30:
+            extra = [
+                "flip",
+                "shrink",
+                "rsi_revert",
+                "momentum",
+                "breakout",
+                "more_tech",
+                "vol_trend",
+            ]
+        else:
+            extra = [
+                "flip",
+                "shrink",
+                "rsi_revert",
+                "slow_drift",
+                "breakout",
+                "more_tech",
+                "vol_trend",
+            ]
+        # high-vol: jeszcze mean-rev ekstremalny już mógł być — dopchnij inne
+        for mname in extra:
+            if mname.lower() in used:
+                continue
+            row = _run_mode(mname)
+            if row is not None:
+                results.append(row)
+                used.add(mname.lower())
+                # jak już mamy >= 50% — wystarczy (oszczędność CPU)
+                try:
+                    if float(row["hit_rate"]) >= 50.0:
+                        break
+                except Exception:
+                    pass
+
     if not results:
         pred_price, direction, chg = predict_with_technical_influence(
             df, fa, days_forward, sector, ticker=ticker, quiet=True, mode="default"
