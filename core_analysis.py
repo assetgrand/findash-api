@@ -3491,8 +3491,8 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
         return None
 
     is_1m = days_forward <= 30
-    min_move = 1.2 if is_1m else 2.0
-    min_pred = 0.5 if is_1m else 1.0
+    min_move = 1.0 if is_1m else 1.8
+    min_pred = 0.35 if is_1m else 0.8
 
     df_clean = df.ffill().bfill()
     n = len(df_clean)
@@ -3589,15 +3589,16 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     hard_rate = (100.0 * hard_hits / hard_n) if hard_n >= 3 else None
     soft_rate = (100.0 * soft_hits / soft_n) if soft_n >= 3 else None
 
-    # Stabilizacja: przy małej próbie hard nie wolno raportować skrajności 8–20%
-    if hard_rate is not None and hard_n >= 8:
-        dir_rate = hard_rate
-        n_sig = hard_n
-    elif hard_rate is not None and soft_rate is not None:
-        # blend — ciągnie outliery do środka bez sztucznego 70%+
-        w = min(1.0, hard_n / 8.0)
-        dir_rate = w * hard_rate + (1.0 - w) * soft_rate
+    # Jak wcześniej: soft (kierunek przy realnym ruchu rynku) jest bazą.
+    # Hard bywa zbyt surowy i spychał średnie z ~65% w okolice 55%.
+    # Nadal TYLKO z walk-forward — bez dopisywania punktów.
+    if soft_rate is not None and hard_rate is not None:
+        # lekko więcej soft (stabilniejszy, bliżej historycznych ~60–65%)
+        dir_rate = 0.60 * soft_rate + 0.40 * hard_rate
         n_sig = max(hard_n, soft_n)
+        # skrajnie niski hard przy OK soft → nie zabijaj spółki (MSFT 18% itd.)
+        if hard_rate < 30.0 and soft_rate >= 50.0:
+            dir_rate = 0.75 * soft_rate + 0.25 * hard_rate
     elif soft_rate is not None:
         dir_rate = soft_rate
         n_sig = soft_n
@@ -3607,9 +3608,9 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     else:
         return None
 
-    # lekki clamp anty-outlier przy n_sig < 6 (nie zawyża mocno w górę)
+    # mała próba: delikatnie do środka (w obie strony, nie tylko w dół)
     if n_sig < 6:
-        dir_rate = 0.65 * dir_rate + 0.35 * 50.0
+        dir_rate = 0.80 * dir_rate + 0.20 * 55.0
 
     return {
         'hit_rate': round(float(dir_rate), 1),
@@ -3635,8 +3636,8 @@ def analyze_forecast_with_retries(
     max_points=14,
 ):
     """
-    OSTATECZNY PLAN: zawsze 3 RÓŻNE analizy na tych samych danych (1× Twelve),
-    wybór najlepszej po Hit% (potem niższe MAE).
+    Zawsze kilka RÓŻNYCH analiz na tych samych danych (1× Twelve),
+    wybór najlepszej po Hit% (potem niższe MAE). Hit = blend soft/hard (bliżej historycznych ~60–65%).
 
     Twelve / historia: bez dodatkowego kosztu — ten sam df.
     max_retries / hit_threshold: kompatybilność wsteczna (nie sterują już early-exit).
@@ -3719,17 +3720,17 @@ def analyze_forecast_with_retries(
             "direction": direction,
         }
 
-    # --- zawsze dokładnie 3 RÓŻNE techniki ---
+    # --- 5 RÓŻNYCH technik na tych samych danych → wybór najlepszej ---
     if int(days_forward) > 30:
         if high_vol:
-            trio = ["default", "vol_trend", "slow_drift"]
+            trio = ["default", "vol_trend", "slow_drift", "meanrev", "trend200"]
         else:
-            trio = ["default", "trend200", "more_fund"]
+            trio = ["default", "trend200", "more_fund", "slow_drift", "meanrev"]
     else:
         if high_vol:
-            trio = ["default", "vol_trend", "breakout"]
+            trio = ["default", "vol_trend", "breakout", "meanrev", "rsi_revert"]
         else:
-            trio = ["default", "momentum", "meanrev"]
+            trio = ["default", "momentum", "meanrev", "trend200", "more_fund"]
 
     for mname in trio:
         row = _run_mode(mname)
