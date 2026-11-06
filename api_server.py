@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "confidence-rank-v1"
+API_BUILD = "monthly-hit-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -788,7 +788,7 @@ def _analyze_one(
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v18|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v19|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -856,6 +856,8 @@ def _analyze_one(
             chg = _safe_float(res.get("change_pct") or res.get("predicted_change_pct"))
             direction = res.get("direction") or "NEUTRAL"
             hit_rate = _safe_float(res.get("hit_rate"))
+            monthly_hit_rate = _safe_float(res.get("monthly_hit_rate"))
+            monthly_n = res.get("monthly_n")
             mae = _safe_float(res.get("mae"))
             n_sig = res.get("n_significant")
             # bias / rozjazd % (pred - actual historycznie) – do debug / UI
@@ -913,6 +915,8 @@ def _analyze_one(
         "fundamental_rating": fund_rating,
         "combined_score": round(combined, 2) if combined is not None else None,
         "hit_rate": hit_rate,
+        "monthly_hit_rate": locals().get("monthly_hit_rate"),
+        "monthly_n": locals().get("monthly_n"),
         "mae": mae,
         "bias": locals().get("data_bias"),
         "n_significant": n_sig,
@@ -1128,7 +1132,7 @@ def rankings(
         best = None
         best_ts = 0.0
         for prefix in (
-            f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|", f"v16|{tk}|{hz_lab}|",
+            f"v19|{tk}|{hz_lab}|", f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|",
             f"v11|{tk}|{hz_lab}|", f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|",
         ):
             for k, row in list(_ANALYZE_CACHE.items()):
