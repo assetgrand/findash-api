@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "monthly-hit-v1"
+API_BUILD = "confidence-rank-v1"
 PRECOMPUTE_GEN = "stable-rank-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -781,7 +781,7 @@ def _analyze_one(
     ticker = ticker.upper().strip()
     # BTC/USD = 7 znaków; pozwól do 16 (pary krypto)
     if not ticker or len(ticker) > 16:
-        raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
+        raise HTTPException(status_code=400, detail="Invalid ticker")
 
     days = _horizon_days(horizon)
     horizon_label = _horizon_label(horizon)
@@ -808,7 +808,7 @@ def _analyze_one(
 
     df = core.calculate_indicators_on_df(df)
     if df is None or getattr(df, "empty", True):
-        raise HTTPException(status_code=500, detail="Błąd wskaźników technicznych")
+        raise HTTPException(status_code=500, detail="Technical indicators error")
 
     current_price = _safe_float(df["Close"].iloc[-1])
     rsi = _safe_float(df["RSI"].iloc[-1]) if "RSI" in df.columns else None
@@ -856,8 +856,6 @@ def _analyze_one(
             chg = _safe_float(res.get("change_pct") or res.get("predicted_change_pct"))
             direction = res.get("direction") or "NEUTRAL"
             hit_rate = _safe_float(res.get("hit_rate"))
-            monthly_hit_rate = _safe_float(res.get("monthly_hit_rate"))
-            monthly_n = res.get("monthly_n")
             mae = _safe_float(res.get("mae"))
             n_sig = res.get("n_significant")
             # bias / rozjazd % (pred - actual historycznie) – do debug / UI
@@ -915,8 +913,6 @@ def _analyze_one(
         "fundamental_rating": fund_rating,
         "combined_score": round(combined, 2) if combined is not None else None,
         "hit_rate": hit_rate,
-        "monthly_hit_rate": locals().get("monthly_hit_rate"),
-        "monthly_n": locals().get("monthly_n"),
         "mae": mae,
         "bias": locals().get("data_bias"),
         "n_significant": n_sig,
@@ -2197,7 +2193,7 @@ def _require_admin(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-S
     if not expected:
         raise HTTPException(
             status_code=503,
-            detail="Ustaw ADMIN_SECRET na Renderze, żeby zarządzać planami",
+            detail="Set ADMIN_SECRET on Render to manage plans",
         )
     if not x_admin_secret or x_admin_secret.strip() != expected:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
@@ -2276,7 +2272,7 @@ def set_plan_dev(
 ):
     """Tylko gdy DEV_AUTH_BYPASS=1 – ręczne ustawienie planu do testów."""
     if not auth.DEV_AUTH_BYPASS:
-        raise HTTPException(status_code=403, detail="Tylko w trybie DEV_AUTH_BYPASS")
+        raise HTTPException(status_code=403, detail="Only available when DEV_AUTH_BYPASS=1")
     auth.set_plan(prof["id"], plan)
     prof2 = auth.ensure_profile(prof["id"], email=prof.get("email"))
     return auth.public_me(prof2)

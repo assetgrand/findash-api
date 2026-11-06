@@ -161,13 +161,13 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
     """
     token = (token or "").strip()
     if not token:
-        raise ValueError("Pusty token")
+        raise ValueError("Empty token")
 
     try:
         import jwt
         from jwt import algorithms as jwt_algorithms
     except ImportError as e:
-        raise RuntimeError("Zainstaluj PyJWT cryptography: pip install PyJWT cryptography") from e
+        raise RuntimeError("Install PyJWT cryptography: pip install PyJWT cryptography") from e
 
     errors: List[str] = []
 
@@ -177,14 +177,14 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
         kid = header.get("kid")
         unverified = jwt.decode(token, options={"verify_signature": False})
     except Exception as e:
-        raise ValueError(f"Nieczytelny JWT: {e}") from e
+        raise ValueError(f"Unreadable JWT: {e}") from e
 
     # wygaśnięcie
     exp = unverified.get("exp")
     if exp is not None:
         try:
             if int(exp) < int(time.time()) - 30:
-                raise ValueError("Token wygasł — wyloguj się i zaloguj ponownie")
+                raise ValueError("Token expired — sign out and sign in again")
         except ValueError:
             raise
         except Exception:
@@ -314,10 +314,10 @@ def verify_supabase_jwt(token: str) -> Dict[str, Any]:
             errors.append(f"hs256:{e}")
 
     raise RuntimeError(
-        "Nie zweryfikowano tokena. "
+        "Token could not be verified. "
         f"iss={iss or '?'}, alg={alg or '?'}, kid={kid or '?'}, "
         f"sub={uid_preview or '?'}, bases={bases}. "
-        f"Szczegóły: {' | '.join(errors) if errors else 'brak'}"
+        f"Details: {' | '.join(errors) if errors else 'none'}"
     )
 
 
@@ -383,10 +383,10 @@ def _normalize_month(prof: Dict[str, Any]) -> Dict[str, Any]:
 
 def _update_profile(user_id: str, fields: Dict[str, Any]) -> None:
     if not SUPABASE_URL:
-        raise RuntimeError("Brak SUPABASE_URL — nie można zapisać planu")
+        raise RuntimeError("SUPABASE_URL missing — cannot save plan")
     if not SUPABASE_SERVICE:
         raise RuntimeError(
-            "Brak SUPABASE_SERVICE_ROLE_KEY na Renderze — set_plan nie zapisze planu"
+            "SUPABASE_SERVICE_ROLE_KEY missing on Render — set_plan will not save"
         )
     url = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
     headers = _sb_headers(True)
@@ -588,8 +588,8 @@ def check_analyze_quota(prof: Dict[str, Any]) -> None:
     cnt = int(prof.get("analyze_count") or 0)
     if cnt >= DEMO_ANALYZE_LIMIT:
         raise PermissionError(
-            f"Limit Demo: {DEMO_ANALYZE_LIMIT} analizy 1M/3M na miesiąc. "
-            f"Użyto {cnt}. Ulepsz plan Standard lub Pro."
+            f"Demo limit: {DEMO_ANALYZE_LIMIT} 1M/3M analyses per month. "
+            f"Used {cnt}. Upgrade to Standard or Pro."
         )
 
 
@@ -598,7 +598,7 @@ def require_feature(prof: Dict[str, Any], feature: str) -> None:
     if not plan_allows(plan, feature):
         need = "pro" if feature in ("hybrid", "signals", "portfolio") else "standard"
         raise PermissionError(
-            f"Funkcja '{feature}' wymaga planu {need}+ (Twój plan: {plan})."
+            f"Feature '{feature}' requires plan {need}+ (your plan: {plan})."
         )
 
 
