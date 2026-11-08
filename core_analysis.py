@@ -3625,6 +3625,112 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     }
 
 
+
+
+def backtest_monthly_hit_rate(
+    df,
+    days_forward=21,
+    sector="Default",
+    fund_score=50,
+    ticker=None,
+    predict_mode="default",
+    min_months=8,
+):
+    """
+    Hit kalendarzowy: pierwsza sesja miesiąca → wynik po `days_forward` sesjach
+    (1M≈21, 3M≈63). Kierunek prognozy vs rzeczywisty ruch.
+    Liczony OBOk głównego walk-forward Hit% — nie zastępuje go.
+    """
+    if df is None or df.empty or len(df) < days_forward + 80:
+        return None
+    try:
+        import pandas as pd
+        import numpy as np
+    except Exception:
+        return None
+
+    df_clean = df.copy()
+    if "Close" not in df_clean.columns:
+        return None
+    # Datetime index
+    try:
+        if not hasattr(df_clean.index, "year"):
+            if "Date" in df_clean.columns:
+                df_clean = df_clean.set_index(pd.to_datetime(df_clean["Date"]))
+            else:
+                df_clean.index = pd.to_datetime(df_clean.index, errors="coerce")
+        df_clean = df_clean[~df_clean.index.isna()].sort_index()
+    except Exception:
+        return None
+    if len(df_clean) < days_forward + 80:
+        return None
+
+    is_1m = int(days_forward) <= 30
+    min_move = 1.0 if is_1m else 1.8
+    fa_neutral = {"combined_score": fund_score if fund_score is not None else 50}
+
+    # pierwsza sesja każdego miesiąca (indeks całkowity)
+    month_starts = []
+    try:
+        seen = set()
+        for pos, ts in enumerate(df_clean.index):
+            try:
+                key = (int(ts.year), int(ts.month))
+            except Exception:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            # pomiń zbyt wczesne (za mało historii do wskaźników)
+            if pos < 60:
+                continue
+            if pos + int(days_forward) >= len(df_clean):
+                continue
+            month_starts.append(pos)
+    except Exception:
+        return None
+
+    if len(month_starts) < min_months:
+        return None
+
+    hits = 0
+    total = 0
+    for i in month_starts:
+        try:
+            hist = df_clean.iloc[: i + 1].copy()
+            if len(hist) < 50:
+                continue
+            _, _, pred_ret = predict_with_technical_influence(
+                hist, fa_neutral, days_forward, sector, ticker=ticker, quiet=True,
+                mode=predict_mode,
+            )
+            if pred_ret is None:
+                continue
+            p0 = float(df_clean["Close"].iloc[i])
+            p1 = float(df_clean["Close"].iloc[i + int(days_forward)])
+            if p0 <= 0:
+                continue
+            actual_ret = (p1 / p0 - 1.0) * 100.0
+            pred_ret = float(pred_ret)
+            if abs(actual_ret) < min_move:
+                continue  # miesiąc prawie bez ruchu — nie liczymy
+            total += 1
+            same = (pred_ret > 0 and actual_ret > 0) or (pred_ret < 0 and actual_ret < 0)
+            if same:
+                hits += 1
+        except Exception:
+            continue
+
+    if total < max(6, min_months // 2):
+        return None
+    return {
+        "monthly_hit_rate": round(100.0 * hits / total, 1),
+        "monthly_n": int(total),
+        "monthly_hits": int(hits),
+        "monthly_min_move": min_move,
+    }
+
+
 def analyze_forecast_with_retries(
     df,
     fundamental_analysis=None,
@@ -3720,67 +3826,44 @@ def analyze_forecast_with_retries(
             "direction": direction,
         }
 
-    # --- 5 RÓŻNYCH technik na tych samych danych → wybór najlepszej ---
+    # Stała lista mode'ów (bez high_vol / early-stop).
+    # Wcześniej: inny trio przy vol i break przy pierwszym Hit>=50
+    # — ten sam df dawał inny Hit i gorszy mode wygrywał przez przypadek.
     if int(days_forward) > 30:
-        if high_vol:
-            trio = ["default", "vol_trend", "slow_drift", "meanrev", "trend200"]
-        else:
-            trio = ["default", "trend200", "more_fund", "slow_drift", "meanrev"]
+        modes = [
+            "default",
+            "trend200",
+            "more_fund",
+            "slow_drift",
+            "meanrev",
+            "vol_trend",
+            "momentum",
+            "breakout",
+            "rsi_revert",
+            "more_tech",
+            "shrink",
+            "flip",
+        ]
     else:
-        if high_vol:
-            trio = ["default", "vol_trend", "breakout", "meanrev", "rsi_revert"]
-        else:
-            trio = ["default", "momentum", "meanrev", "trend200", "more_fund"]
+        modes = [
+            "default",
+            "momentum",
+            "meanrev",
+            "trend200",
+            "more_fund",
+            "vol_trend",
+            "breakout",
+            "rsi_revert",
+            "slow_drift",
+            "more_tech",
+            "shrink",
+            "flip",
+        ]
 
-    for mname in trio:
+    for mname in modes:
         row = _run_mode(mname)
         if row is not None:
             results.append(row)
-
-    # --- tylko gdy najlepsza z bazowych < 50%: poszerz o BARDZIEJ różne techniki ---
-    best_so_far = None
-    try:
-        if results:
-            best_so_far = max(float(r["hit_rate"]) for r in results)
-    except Exception:
-        best_so_far = None
-
-    if best_so_far is not None and best_so_far < 50.0:
-        used = {str(r.get("mode") or "").lower() for r in results}
-        if int(days_forward) > 30:
-            extra = [
-                "flip",
-                "shrink",
-                "rsi_revert",
-                "momentum",
-                "breakout",
-                "more_tech",
-                "vol_trend",
-            ]
-        else:
-            extra = [
-                "flip",
-                "shrink",
-                "rsi_revert",
-                "slow_drift",
-                "breakout",
-                "more_tech",
-                "vol_trend",
-            ]
-        # high-vol: jeszcze mean-rev ekstremalny już mógł być — dopchnij inne
-        for mname in extra:
-            if mname.lower() in used:
-                continue
-            row = _run_mode(mname)
-            if row is not None:
-                results.append(row)
-                used.add(mname.lower())
-                # jak już mamy >= 50% — wystarczy (oszczędność CPU)
-                try:
-                    if float(row["hit_rate"]) >= 50.0:
-                        break
-                except Exception:
-                    pass
 
     if not results:
         pred_price, direction, chg = predict_with_technical_influence(
@@ -3800,7 +3883,7 @@ def analyze_forecast_with_retries(
             "modes_tried": modes_tried,
         }
 
-    # najlepsza z 3: najwyższy hit, potem niższe MAE
+    # najlepsza: najwyższy hit, potem niższe MAE
     best = sorted(results, key=lambda r: (-float(r["hit_rate"]), float(r["mae"])))[0]
 
     return {

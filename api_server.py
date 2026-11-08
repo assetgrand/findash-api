@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "confidence-rank-v1"
-PRECOMPUTE_GEN = "stable-rank-v1"
+API_BUILD = "stable-fullmode-v1"
+PRECOMPUTE_GEN = "stable-fullmode-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -533,25 +533,20 @@ def _precompute_all_once() -> None:
     jobs = []
     for hz in ("1M", "3M"):
         missing = [x for x in tickers if _pc_get(x, hz, allow_stale=True) is None]
-        # słabe (hit<50) odświeżaj częściej; mocne (hit>=50) tylko gdy bardzo stare
-        weak, strong = [], []
+        # Hit < 50% NIE wymusza przeliczenia (to skakało w weekend).
+        # Odśwież tylko brak cache, stary gen albo wiek >= 24h.
+        due = []
         for x in tickers:
             if x in missing:
                 continue
-            d = _pc_get(x, hz, allow_stale=True) or {}
-            try:
-                hr = float(d.get("hit_rate")) if d.get("hit_rate") is not None else None
-            except Exception:
-                hr = None
             age = _pc_age(x, hz)
-            if hr is not None and hr < 50.0:
-                # poniżej 50% — ZAWSZE w kolejce (stary cache blokował nowe mode'y)
-                weak.append(x)
-            else:
-                # >=50% lub brak hr — NIE przeliczaj często (tylko co 24h)
-                if age is None or age >= max(float(_PRECOMPUTE_INTERVAL) * 8.0, 86400.0):
-                    strong.append(x)
-        for x in missing + weak + strong:
+            gen = ""
+            with _PRECOMPUTE_LOCK:
+                row = _PRECOMPUTE.get(_pc_key(x, hz)) or {}
+                gen = str(row.get("gen") or "")
+            if gen != str(PRECOMPUTE_GEN) or age is None or age >= 86400.0:
+                due.append(x)
+        for x in missing + due:
             jobs.append((x, hz))
     print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
     done_tickers = set()
@@ -781,14 +776,14 @@ def _analyze_one(
     ticker = ticker.upper().strip()
     # BTC/USD = 7 znaków; pozwól do 16 (pary krypto)
     if not ticker or len(ticker) > 16:
-        raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
+        raise HTTPException(status_code=400, detail="Invalid ticker")
 
     days = _horizon_days(horizon)
     horizon_label = _horizon_label(horizon)
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v18|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v19|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -808,7 +803,7 @@ def _analyze_one(
 
     df = core.calculate_indicators_on_df(df)
     if df is None or getattr(df, "empty", True):
-        raise HTTPException(status_code=500, detail="Błąd wskaźników technicznych")
+        raise HTTPException(status_code=500, detail="Technical indicators error")
 
     current_price = _safe_float(df["Close"].iloc[-1])
     rsi = _safe_float(df["RSI"].iloc[-1]) if "RSI" in df.columns else None
@@ -1128,7 +1123,7 @@ def rankings(
         best = None
         best_ts = 0.0
         for prefix in (
-            f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|", f"v16|{tk}|{hz_lab}|",
+            f"v19|{tk}|{hz_lab}|", f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|",
             f"v11|{tk}|{hz_lab}|", f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|",
         ):
             for k, row in list(_ANALYZE_CACHE.items()):
@@ -1158,10 +1153,8 @@ def rankings(
                 hr_f = float(hr) if hr is not None else None
             except Exception:
                 hr_f = None
-            # tylko hit < 50% wymaga ponownego liczenia (alt); >=50% zostaw
-            if hr_f is not None and hr_f < 50.0:
-                need_re = True
-            elif am is None and (hr_f is None):
+            # brak ceny albo brak hitu → dociągnij. Hit < 50% zostaje (nie skacze).
+            if hr_f is None and am is None:
                 need_re = True
             # stary wynik <50% pokazuj, ale MUSI wejść do sync/bg (nowe mode'y)
             by_tk[tk] = d
@@ -2193,7 +2186,7 @@ def _require_admin(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-S
     if not expected:
         raise HTTPException(
             status_code=503,
-            detail="Ustaw ADMIN_SECRET na Renderze, żeby zarządzać planami",
+            detail="Set ADMIN_SECRET on Render to manage plans",
         )
     if not x_admin_secret or x_admin_secret.strip() != expected:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
@@ -2272,7 +2265,7 @@ def set_plan_dev(
 ):
     """Tylko gdy DEV_AUTH_BYPASS=1 – ręczne ustawienie planu do testów."""
     if not auth.DEV_AUTH_BYPASS:
-        raise HTTPException(status_code=403, detail="Tylko w trybie DEV_AUTH_BYPASS")
+        raise HTTPException(status_code=403, detail="Only available when DEV_AUTH_BYPASS=1")
     auth.set_plan(prof["id"], plan)
     prof2 = auth.ensure_profile(prof["id"], email=prof.get("email"))
     return auth.public_me(prof2)
