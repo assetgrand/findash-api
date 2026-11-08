@@ -781,14 +781,14 @@ def _analyze_one(
     ticker = ticker.upper().strip()
     # BTC/USD = 7 znaków; pozwól do 16 (pary krypto)
     if not ticker or len(ticker) > 16:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
+        raise HTTPException(status_code=400, detail="Nieprawidłowy ticker")
 
     days = _horizon_days(horizon)
     horizon_label = _horizon_label(horizon)
     mode = "q" if quality else "std"
     day_key = time.strftime("%Y-%m-%d")
     # v8: izolacja od rankingu krypto / starych wpisów
-    cache_key = f"v19|{ticker}|{horizon_label}|{mode}|{day_key}|full"
+    cache_key = f"v18|{ticker}|{horizon_label}|{mode}|{day_key}|full"
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
     if hit and now - hit["ts"] < _ANALYZE_CACHE_TTL:
@@ -808,7 +808,7 @@ def _analyze_one(
 
     df = core.calculate_indicators_on_df(df)
     if df is None or getattr(df, "empty", True):
-        raise HTTPException(status_code=500, detail="Technical indicators error")
+        raise HTTPException(status_code=500, detail="Błąd wskaźników technicznych")
 
     current_price = _safe_float(df["Close"].iloc[-1])
     rsi = _safe_float(df["RSI"].iloc[-1]) if "RSI" in df.columns else None
@@ -1128,7 +1128,7 @@ def rankings(
         best = None
         best_ts = 0.0
         for prefix in (
-            f"v19|{tk}|{hz_lab}|", f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|",
+            f"v18|{tk}|{hz_lab}|", f"v17|{tk}|{hz_lab}|", f"v16|{tk}|{hz_lab}|",
             f"v11|{tk}|{hz_lab}|", f"v10|{tk}|{hz_lab}|", f"v9|{tk}|{hz_lab}|",
         ):
             for k, row in list(_ANALYZE_CACHE.items()):
@@ -2193,7 +2193,7 @@ def _require_admin(x_admin_secret: Optional[str] = Header(None, alias="X-Admin-S
     if not expected:
         raise HTTPException(
             status_code=503,
-            detail="Set ADMIN_SECRET on Render to manage plans",
+            detail="Ustaw ADMIN_SECRET na Renderze, żeby zarządzać planami",
         )
     if not x_admin_secret or x_admin_secret.strip() != expected:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
@@ -2272,7 +2272,7 @@ def set_plan_dev(
 ):
     """Tylko gdy DEV_AUTH_BYPASS=1 – ręczne ustawienie planu do testów."""
     if not auth.DEV_AUTH_BYPASS:
-        raise HTTPException(status_code=403, detail="Only available when DEV_AUTH_BYPASS=1")
+        raise HTTPException(status_code=403, detail="Tylko w trybie DEV_AUTH_BYPASS")
     auth.set_plan(prof["id"], plan)
     prof2 = auth.ensure_profile(prof["id"], email=prof.get("email"))
     return auth.public_me(prof2)
