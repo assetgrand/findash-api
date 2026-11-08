@@ -4847,6 +4847,7 @@ def init_macro_for_api():
         print("Makro init:", e)
 
 
+
 # ============================================================
 # CRYPTO TECHNICAL ENGINE (osobno od akcji – bez fundamentów equity)
 # Momentum + EMA + RSI regime; hit = ten sam sens (kierunek), inne progi vol
