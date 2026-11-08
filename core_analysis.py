@@ -3520,20 +3520,20 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
         start_i = max(start_floor_i, end - max_pts * step_val)
         return list(range(start_i, end + 1, max(1, int(step_val))))
 
-    # gęściej — więcej próbek = mniej losowych 8%/20%
+    # gęściej — więcej okien = mniej losowych 33%/42% na małej próbie
     if step is None:
-        step = 10 if is_1m else 14
+        step = 7 if is_1m else 10
 
     # wymuś sensowną liczbę okien
-    mp = max(int(max_points or 12), 12 if is_1m else 16)
+    mp = max(int(max_points or 12), 18 if is_1m else 22)
     indices = _make_indices(step, mp)
-    if len(indices) < 10:
-        step = max(6, step // 2)
-        indices = _make_indices(step, mp + 10)
-    if len(indices) < 8:
+    if len(indices) < 14:
         step = max(5, step // 2)
-        indices = _make_indices(step, mp + 16)
-    if len(indices) < 6:
+        indices = _make_indices(step, mp + 12)
+    if len(indices) < 12:
+        step = max(4, step // 2)
+        indices = _make_indices(step, mp + 18)
+    if len(indices) < 8:
         return None
 
     fa_neutral = {'combined_score': fund_score if fund_score is not None else 50}
@@ -3593,12 +3593,14 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     # Hard bywa zbyt surowy i spychał średnie z ~65% w okolice 55%.
     # Nadal TYLKO z walk-forward — bez dopisywania punktów.
     if soft_rate is not None and hard_rate is not None:
-        # lekko więcej soft (stabilniejszy, bliżej historycznych ~60–65%)
-        dir_rate = 0.60 * soft_rate + 0.40 * hard_rate
+        # soft = kierunek przy realnym ruchu rynku; hard bywa zbyt surowy
+        dir_rate = 0.65 * soft_rate + 0.35 * hard_rate
         n_sig = max(hard_n, soft_n)
-        # skrajnie niski hard przy OK soft → nie zabijaj spółki (MSFT 18% itd.)
-        if hard_rate < 30.0 and soft_rate >= 50.0:
-            dir_rate = 0.75 * soft_rate + 0.25 * hard_rate
+        # hard wyraźnie słabszy → nie zabijaj wyniku (MSFT/META itd.)
+        if hard_rate < soft_rate - 15.0:
+            dir_rate = 0.80 * soft_rate + 0.20 * hard_rate
+        if hard_rate < 30.0 and soft_rate >= 45.0:
+            dir_rate = 0.85 * soft_rate + 0.15 * hard_rate
     elif soft_rate is not None:
         dir_rate = soft_rate
         n_sig = soft_n
@@ -3608,9 +3610,9 @@ def backtest_forecast_quality(df, days_forward=21, sector='Default',
     else:
         return None
 
-    # mała próba: delikatnie do środka (w obie strony, nie tylko w dół)
-    if n_sig < 6:
-        dir_rate = 0.80 * dir_rate + 0.20 * 55.0
+    # mała próba: lekko do środka (w obie strony)
+    if n_sig < 8:
+        dir_rate = 0.85 * dir_rate + 0.15 * 52.0
 
     return {
         'hit_rate': round(float(dir_rate), 1),
@@ -3768,13 +3770,13 @@ def analyze_forecast_with_retries(
 
     # gęstszy backtest przy high-vol / 3M
     try:
-        mp = int(max_points or 14)
+        mp = int(max_points or 18)
     except Exception:
-        mp = 14
+        mp = 18
     if int(days_forward) > 30:
-        mp = max(mp, 18)
+        mp = max(mp, 24)
     if high_vol:
-        mp = max(mp, 20)
+        mp = max(mp, 26)
 
     def _run_mode(mname: str):
         modes_tried.append(mname)
@@ -3796,6 +3798,8 @@ def analyze_forecast_with_retries(
         mae = float(q.get("mae") or 99.0) if q else 99.0
         bias = q.get("bias") if q else None
         n_sig = q.get("n_significant") if q else None
+        soft_hr = q.get("soft_hit_rate") if q else None
+        hard_hr = q.get("dir_hit_rate") if q else None
         cal_chg = float(chg)
         if bias is not None:
             try:
@@ -3821,6 +3825,8 @@ def analyze_forecast_with_retries(
             "mae": mae,
             "bias": bias,
             "n_significant": n_sig,
+            "soft_hit_rate": soft_hr,
+            "dir_hit_rate": hard_hr,
             "predicted_change_pct": round(cal_chg, 2),
             "predicted_price": round(cal_price, 4),
             "direction": direction,
@@ -3896,6 +3902,11 @@ def analyze_forecast_with_retries(
         "mae": best["mae"],
         "bias": best.get("bias"),
         "n_significant": best.get("n_significant"),
+        "soft_hit_rate": best.get("soft_hit_rate"),
+        "dir_hit_rate": best.get("dir_hit_rate"),
+        "low_confidence": bool(
+            best.get("hit_rate") is not None and float(best["hit_rate"]) < 45.0
+        ),
         "analysis_mode": best["mode"],
         "modes_tried": modes_tried,
     }

@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "stable-fullmode-v1"
-PRECOMPUTE_GEN = "stable-fullmode-v1"
+API_BUILD = "dense-soft-v1"
+PRECOMPUTE_GEN = "dense-soft-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -834,7 +834,7 @@ def _analyze_one(
     analysis_mode = "default"
     modes_tried = ["default"]
     # więcej okien na 3M; 1M bez zmian
-    max_pts = 18 if days > 30 else 14
+    max_pts = 24 if days > 30 else 18
     try:
         if hasattr(core, "analyze_forecast_with_retries"):
             res = core.analyze_forecast_with_retries(
@@ -860,9 +860,11 @@ def _analyze_one(
                 data_bias = None
             analysis_mode = res.get("analysis_mode") or "default"
             modes_tried = res.get("modes_tried") or [analysis_mode]
+            soft_hr = _safe_float(res.get("soft_hit_rate"))
+            hard_hr = _safe_float(res.get("dir_hit_rate"))
             print(
                 f"[analyze] {ticker} {horizon_label}: mode={analysis_mode} "
-                f"hit={hit_rate} tried={modes_tried}"
+                f"hit={hit_rate} soft={soft_hr} hard={hard_hr} tried={len(modes_tried)}"
             )
         else:
             pred_price, direction, chg = core.predict_with_technical_influence(
@@ -911,6 +913,9 @@ def _analyze_one(
         "mae": mae,
         "bias": locals().get("data_bias"),
         "n_significant": n_sig,
+        "soft_hit_rate": locals().get("soft_hr"),
+        "dir_hit_rate": locals().get("hard_hr"),
+        "low_confidence": bool(hit_rate is not None and float(hit_rate) < 45.0),
         "analysis_mode": analysis_mode,
         "modes_tried": modes_tried,
         "engine_build": API_BUILD,
