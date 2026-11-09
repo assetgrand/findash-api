@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "bear-tilt-v1"
-PRECOMPUTE_GEN = "bear-tilt-v1"
+API_BUILD = "tech-1m-v1"
+PRECOMPUTE_GEN = "tech-1m-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov

@@ -3165,20 +3165,24 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
     fund_ret = _fundamental_expected_return_pct(fund_score, horizon, sector)
 
     base_tech = sector_tech_weight.get(sector, sector_tech_weight.get('Default', 0.50))
-    # v4: 1M more technical; 3M more fundamental + drift (fundamentals matter more over quarters)
+    # 1M: fundamenty słabo działają w ~21 sesji → mocno tech.
+    # 3M: fund zostaje istotny (kwartał / wyniki).
     if horizon == '1M':
-        tech_w = min(0.76, base_tech + 0.14)
+        tech_w = min(0.90, base_tech + 0.28)
     else:
         tech_w = max(0.26, base_tech - 0.18)
     if regime == 'HIGH_VOL':
-        tech_w *= 0.78 if horizon == '1M' else 0.72
+        # 1M: nie oddawaj głosu fundom przy szumie
+        tech_w *= 0.92 if horizon == '1M' else 0.72
     if regime == 'RANGE':
-        tech_w *= 0.88 if horizon == '1M' else 0.82
+        tech_w *= 0.94 if horizon == '1M' else 0.82
     if abs(fund_score - 50) < 5:
-        tech_w = min(0.86, tech_w + (0.07 if horizon == '1M' else 0.05))
-    # Strong fundamental extreme on 3M: allow fund more voice
+        tech_w = min(0.92, tech_w + (0.06 if horizon == '1M' else 0.05))
     if horizon == '3M' and abs(fund_score - 50) >= 15:
         tech_w = max(0.22, tech_w - 0.06)
+    # twardy sufit udziału fund na 1M (~12%)
+    if horizon == '1M':
+        tech_w = max(tech_w, 0.88)
 
     blended_ret = tech_w * tech_ret + (1.0 - tech_w) * fund_ret
     # --- tryby ALTERNATYWNE (gdy Hit < 50%) — inne reguły, nie tylko wagi ensemble ---
@@ -3189,7 +3193,10 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
         blended_ret = tech_w2 * tech_ret + (1.0 - tech_w2) * fund_ret
         blended_ret *= 1.12
     elif _mode == "more_fund":
-        tech_w2 = max(0.12, tech_w - 0.22)
+        # na 1M nie oddawaj większości fundom nawet w tym mode
+        cut = 0.10 if horizon == '1M' else 0.22
+        floor = 0.70 if horizon == '1M' else 0.12
+        tech_w2 = max(floor, tech_w - cut)
         blended_ret = tech_w2 * tech_ret + (1.0 - tech_w2) * fund_ret
     elif _mode == "shrink":
         blended_ret *= 0.50
