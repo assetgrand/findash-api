@@ -3279,6 +3279,30 @@ def predict_with_technical_influence(df, fundamental_analysis, days_forward, sec
             blended_ret += 0.20 * fund_ret
         except Exception:
             blended_ret = 0.25 * fund_ret
+    elif _mode == "bear_tilt":
+        # agresywniej łapie spadki: wykupienie, słabe mom, dystans od SMA
+        try:
+            rsi_v = float(feats.get("rsi") or feats.get("RSI") or 50.0)
+            r5 = float(feats.get("ret_5") or feats.get("ret_10") or 0.0)
+            r21 = float(feats.get("ret_21") or 0.0)
+            r63 = float(feats.get("ret_63") or 0.0)
+            dist = float(feats.get("sma_spread") or feats.get("dist_sma50") or 0.0)
+            scale = (float(days_forward) / 21.0) if days_forward else 1.0
+            blended_ret = -0.45 * r21 * scale - 0.20 * max(0.0, r63) * (float(days_forward) / 63.0)
+            if rsi_v >= 62:
+                blended_ret -= 2.2 * scale
+            elif rsi_v >= 55:
+                blended_ret -= 1.0 * scale
+            if r5 <= -2.0:
+                blended_ret -= 1.5 * scale
+            if dist > 0.04:
+                blended_ret -= 1.2 * scale
+            if rsi_v <= 35 and r21 < -5:
+                blended_ret = 0.35 * abs(r21) * scale
+            blended_ret += 0.10 * fund_ret
+            blended_ret = max(-12.0, min(6.0, blended_ret))
+        except Exception:
+            blended_ret = -1.5 * ((float(days_forward) / 21.0) if days_forward else 1.0)
     # Agreement from ensemble models already applied inside tech_ret; reinforce if vol confirms
     try:
         if float(feats.get('vol_ratio') or 1.0) >= 1.25 and float(feats.get('mom_agree') or 0) > 0:
@@ -3849,6 +3873,7 @@ def analyze_forecast_with_retries(
             "more_tech",
             "shrink",
             "flip",
+            "bear_tilt",
         ]
     else:
         modes = [
@@ -3864,6 +3889,7 @@ def analyze_forecast_with_retries(
             "more_tech",
             "shrink",
             "flip",
+            "bear_tilt",
         ]
 
     for mname in modes:
