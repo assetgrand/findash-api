@@ -3899,10 +3899,23 @@ def analyze_forecast_with_retries(
             "bear_tilt",
         ]
 
-    for mname in modes:
-        row = _run_mode(mname)
-        if row is not None:
-            results.append(row)
+    # Równolegle 3 mode'y — ten sam Hit/wybór, krótszy wall-clock (Render cold start)
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=3) as _ex:
+            _futs = [_ex.submit(_run_mode, m) for m in modes]
+            for _f in as_completed(_futs):
+                try:
+                    row = _f.result()
+                except Exception:
+                    row = None
+                if row is not None:
+                    results.append(row)
+    except Exception:
+        for mname in modes:
+            row = _run_mode(mname)
+            if row is not None:
+                results.append(row)
 
     if not results:
         pred_price, direction, chg = predict_with_technical_influence(
