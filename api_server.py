@@ -22,8 +22,8 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "tech-1m-v1"
-PRECOMPUTE_GEN = "tech-1m-v1"
+API_BUILD = "hide-hit35-v1"
+PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
@@ -1227,6 +1227,10 @@ def rankings(
             continue
         try:
             hr_f = _safe_float(d.get("hit_rate"))
+            # Hit < 35% — nie pokazuj w rankingu (Top/Bottom)
+            if hr_f is not None and float(hr_f) < 35.0:
+                print(f"[rankings] hide {tk} hit={hr_f} (<35)")
+                continue
             conf = _confidence_from_hit(hr_f)
             items.append(
                 RankingItem(
