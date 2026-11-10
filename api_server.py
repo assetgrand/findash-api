@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "fast-precompute-v1"
+API_BUILD = "sub-enforce-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -154,6 +154,11 @@ async def get_profile(
     token = authorization.split(" ", 1)[1].strip()
     cached_prof = _profile_cache_get(token)
     if cached_prof is not None:
+        # Egzekucja dat także na cache (period_end może minąć w trakcie TTL)
+        try:
+            cached_prof = auth.enforce_subscription_access(dict(cached_prof))
+        except Exception as e:
+            print("enforce cached profile", e)
         return cached_prof
     try:
         user = auth.verify_supabase_jwt(token)
@@ -166,6 +171,11 @@ async def get_profile(
             prof = auth.apply_trusted_ip(prof, _client_ip(request))
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=str(e))
+        # Subskrypcja: period_end / canceled → demo zanim wpuszczimy do API
+        try:
+            prof = auth.enforce_subscription_access(dict(prof))
+        except Exception as e:
+            print("enforce profile", e)
         _profile_cache_set(token, prof)
         return prof
     except HTTPException:
@@ -343,7 +353,7 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
 _PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # co 2h — mniej kredytów Twelve
-_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "0.6"))  # szybciej; Twelve i tak throttle
+_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "3.0"))  # pauza między tickerami
 # Serve even old forecasts (user sees last known price/prediction — never empty loading)
 _PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(7 * 24 * 3600)))  # 7 dni
 _PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "3600"))  # po 1h odśwież w tle
@@ -550,43 +560,27 @@ def _precompute_all_once() -> None:
             jobs.append((x, hz))
     print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
     done_tickers = set()
-    workers = max(1, min(int(os.environ.get("PRECOMPUTE_WORKERS", "2")), 3))
-
-    def _pc_job(t_hz):
-        t, hz = t_hz
+    for t, hz in jobs:
         try:
             if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                return t, hz, None, "cooldown"
-            data = _analyze_one(t, hz, fast=False, quality=True)
-            return t, hz, data, None
-        except Exception as e:
-            return t, hz, None, str(e)
-
-    # 2 tickery naraz — strona zapełnia się w miarę _pc_store; analiza ta sama
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_pc_job, j) for j in jobs]
-        for fut in as_completed(futs):
-            try:
-                t, hz, data, err = fut.result()
-            except Exception as e:
-                print("[precompute] worker", e)
-                continue
-            _PRECOMPUTE_STATUS["last_ticker"] = f"{t}/{hz}"
-            if err == "cooldown":
-                print(f"[precompute] cooldown — entries kept")
+                print(f"[precompute] cooldown — entries kept, stop new Twelve calls")
                 _PRECOMPUTE_STATUS["last_error"] = "twelve cooldown — partial cache kept"
-                # nie cancel innych — dokończą z cache/API
-            elif err:
-                msg = f"{t}/{hz}: {err}"
-                print("[precompute]", msg)
-                _PRECOMPUTE_STATUS["last_error"] = msg
-            elif data and data.get("current_price") is not None:
+                break
+        except Exception:
+            pass
+        _PRECOMPUTE_STATUS["last_ticker"] = f"{t}/{hz}"
+        try:
+            data = _analyze_one(t, hz, fast=False, quality=True)
+            if data and data.get("current_price") is not None:
                 _pc_store(t, hz, data)
                 print(f"[precompute] ok {t}/{hz} hit={data.get('hit_rate')} chg={data.get('predicted_change_pct')}")
-            done_tickers.add(t)
-            _PRECOMPUTE_STATUS["tickers_done"] = len(done_tickers)
-            time.sleep(_PRECOMPUTE_PAUSE)
+        except Exception as e:
+            msg = f"{t}/{hz}: {e}"
+            print("[precompute]", msg)
+            _PRECOMPUTE_STATUS["last_error"] = msg
+        done_tickers.add(t)
+        _PRECOMPUTE_STATUS["tickers_done"] = len(done_tickers)
+        time.sleep(_PRECOMPUTE_PAUSE)
 
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False

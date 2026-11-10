@@ -520,8 +520,14 @@ def _parse_period_end_ts(val: Any) -> Optional[float]:
 
 def enforce_subscription_access(prof: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Cofa plan do demo TYLKO przy wyraźnym sygnale Stripe.
-    Legacy (pro/standard bez stripe pól / status none) → NIE ruszamy.
+    Egzekucja subskrypcji przy każdym requestcie z profilem.
+
+    - canceled / unpaid / incomplete_expired → demo od razu
+    - plan_period_end minął (>1 dzień grace) + status nieaktywny → demo
+    - plan_period_end minął (>2 dni) nawet przy status=active → demo
+      (siatka bezpieczeństwa gdy webhook subscription.updated nie doszedł)
+    - Legacy admin: standard/pro BEZ stripe_subscription_id i BEZ period_end
+      i status none/pusty → nie ruszamy (ręczne pro)
     """
     if not prof:
         return prof
@@ -530,47 +536,55 @@ def enforce_subscription_access(prof: Dict[str, Any]) -> Dict[str, Any]:
         return prof
 
     status = (prof.get("subscription_status") or "").lower().strip()
-    # Brak danych subskrypcji (stare konta admin / ręczne pro) — zostaw plan
-    if status in ("", "none", "unknown", "null"):
-        return prof
+    sub_id = (prof.get("stripe_subscription_id") or "").strip()
+    end_ts = _parse_period_end_ts(prof.get("plan_period_end"))
+    now = time.time()
+    grace_inactive = 86400.0   # 1 dzień po period_end przy past_due itd.
+    grace_hard = 172800.0      # 2 dni — twarde zejście nawet przy "active"
 
-    # Wyraźne anulowanie / nieopłacone
-    if status in ("canceled", "cancelled", "unpaid", "incomplete_expired"):
+    def _demote(to_status: str) -> Dict[str, Any]:
+        nonlocal prof
         try:
-            apply_subscription_state(
-                str(prof["id"]),
-                demote_to_demo=True,
-                status=status,
-            )
-            prof = dict(prof)
-            prof["plan"] = "demo"
-            prof["subscription_status"] = status
+            uid = str(prof.get("id") or "")
+            if uid:
+                apply_subscription_state(
+                    uid,
+                    demote_to_demo=True,
+                    status=to_status,
+                )
         except Exception as e:
             print("enforce demote", e)
-            prof = dict(prof)
-            prof["plan"] = "demo"
+        out = dict(prof)
+        out["plan"] = "demo"
+        out["subscription_status"] = to_status
+        return out
+
+    # Wyraźne anulowanie / nieopłacone końcowo
+    if status in ("canceled", "cancelled", "unpaid", "incomplete_expired", "expired"):
+        return _demote(status if status != "cancelled" else "canceled")
+
+    # Konto Stripe-managed (jest sub id albo period_end albo status z Stripe)
+    stripe_managed = bool(sub_id) or end_ts is not None or status not in ("", "none", "unknown", "null")
+
+    # Legacy ręczne pro/standard bez żadnych pól Stripe — zostaw
+    if not stripe_managed:
         return prof
 
-    # Okres minął + past_due (nieudane odnowienie)
-    end_ts = _parse_period_end_ts(prof.get("plan_period_end"))
-    if (
-        end_ts is not None
-        and end_ts < time.time() - 86400
-        and status == "past_due"
-    ):
-        try:
-            apply_subscription_state(
-                str(prof["id"]),
-                demote_to_demo=True,
-                status="expired",
-            )
-            prof = dict(prof)
-            prof["plan"] = "demo"
-            prof["subscription_status"] = "expired"
-        except Exception as e:
-            print("enforce expired", e)
-            prof = dict(prof)
-            prof["plan"] = "demo"
+    # past_due / incomplete: po period_end + 1 dzień → demo
+    if status in ("past_due", "incomplete", "paused") and end_ts is not None:
+        if end_ts < now - grace_inactive:
+            return _demote("expired")
+
+    # Twardy deadline: period_end minął >2 dni temu → demo
+    # (chroni przed "active na zawsze" gdy Stripe nie przysłał update)
+    if end_ts is not None and end_ts < now - grace_hard:
+        return _demote("expired")
+
+    # Jest subskrypcja Stripe, ale nigdy nie zapisano period_end — nie blokuj od razu,
+    # ale oznacz w logu (webhook/confirm powinien zawsze ustawiać datę)
+    if sub_id and end_ts is None and status in ("active", "trialing"):
+        print(f"[enforce] warn uid={prof.get('id')} plan={plan} active bez plan_period_end")
+
     return prof
 
 
@@ -582,6 +596,7 @@ def increment_analyze(user_id: str, current_count: int) -> int:
 
 def check_analyze_quota(prof: Dict[str, Any]) -> None:
     """Rzuca HTTP-friendly dict jeśli limit Demo wyczerpany."""
+    prof = enforce_subscription_access(dict(prof) if prof else {})
     plan = (prof.get("plan") or "demo").lower()
     if plan != "demo":
         return
@@ -594,6 +609,7 @@ def check_analyze_quota(prof: Dict[str, Any]) -> None:
 
 
 def require_feature(prof: Dict[str, Any], feature: str) -> None:
+    prof = enforce_subscription_access(dict(prof) if prof else {})
     plan = (prof.get("plan") or "demo").lower()
     if not plan_allows(plan, feature):
         need = "pro" if feature in ("hybrid", "signals", "portfolio") else "standard"
