@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "sub-enforce-v1"
+API_BUILD = "billing-portal-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -1745,7 +1745,7 @@ async def create_checkout(
     try:
         import stripe
         stripe.api_key = secret
-        session = stripe.checkout.Session.create(
+        checkout_kwargs = dict(
             mode="subscription",
             line_items=[{"price": price_id, "quantity": 1}],
             success_url=success,
@@ -1763,6 +1763,15 @@ async def create_checkout(
             },
             allow_promotion_codes=True,
         )
+        # Reuse existing Stripe customer when known (portal + upgrades)
+        existing_customer = (prof.get("stripe_customer_id") or "").strip()
+        if existing_customer:
+            checkout_kwargs["customer"] = existing_customer
+        else:
+            email = (user.get("email") or prof.get("email") or "").strip()
+            if email:
+                checkout_kwargs["customer_email"] = email
+        session = stripe.checkout.Session.create(**checkout_kwargs)
     except Exception as e:
         print("[stripe] create-checkout error:", e)
         raise HTTPException(status_code=502, detail=f"Stripe error: {e}")
@@ -1774,6 +1783,65 @@ async def create_checkout(
     }
 
 
+
+
+
+
+@app.post("/billing/portal")
+def billing_portal(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Stripe Customer Portal – anulowanie odnawiania / zarządzanie subskrypcją.
+    Wymaga Bearer JWT. customer_id z profiles.stripe_customer_id (z webhooka checkout).
+    Env opcjonalnie: BILLING_PORTAL_RETURN_URL
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Login required: missing Authorization Bearer token",
+        )
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        user = auth.verify_supabase_jwt(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login required: invalid token ({e})")
+    uid = str(user.get("id") or "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Login required: no user id in token")
+
+    try:
+        prof = auth.ensure_profile(uid, email=user.get("email"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Profile error: {e}")
+
+    customer_id = (prof.get("stripe_customer_id") or "").strip()
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No Stripe customer on this account. Buy a plan first.",
+        )
+
+    secret = (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not secret or not secret.startswith("sk_"):
+        raise HTTPException(status_code=503, detail="STRIPE_SECRET_KEY not configured on server")
+
+    return_url = (os.environ.get("BILLING_PORTAL_RETURN_URL") or "").strip()
+    if not return_url:
+        return_url = "https://future-fin-scan.lovable.app/konto"
+
+    try:
+        import stripe
+        stripe.api_key = secret
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=return_url,
+        )
+    except Exception as e:
+        print("[stripe] portal error:", e)
+        raise HTTPException(status_code=502, detail=f"Stripe portal error: {e}")
+
+    return {"url": session.url}
 
 
 @app.get("/billing/confirm-session")
@@ -2795,5 +2863,8 @@ def root():
             "GET /report/{ticker}/pdf",
             "GET /report/{ticker}/xlsx",
             "POST /billing/create-checkout",
+            "POST /billing/portal",
+            "GET /billing/confirm-session",
+            "POST /billing/stripe-webhook",
         ],
     }
