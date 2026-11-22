@@ -57,6 +57,7 @@ PLAN_FEATURES: Dict[str, Set[str]] = {
         "signals",
         "portfolio",
         "ai_brief",
+        "congress_trades",
     },
 }
 

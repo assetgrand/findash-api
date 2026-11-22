@@ -22,11 +22,12 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "billing-portal-v1"
+API_BUILD = "congress-trades-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
 import gov_contracts as gov
+import congress_trades as congress
 import ai_brief
 import ai_full
 
@@ -2414,6 +2415,56 @@ def gov_contracts_company(
 
 
 
+
+
+@app.get("/congress/trades")
+def congress_trades_list(
+    ticker: Optional[str] = Query(None, description="Filter by ticker e.g. NVDA"),
+    action: Optional[str] = Query(None, description="buy | sell"),
+    chamber: Optional[str] = Query(None, description="house | senate"),
+    limit: int = Query(40, ge=1, le=100),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Latest U.S. Congress STOCK Act stock disclosures (House + Senate). Pro plan."""
+    _gate(prof, "congress_trades")
+    data = congress.search_trades(
+        ticker=ticker,
+        action=action,
+        chamber=chamber,
+        limit=limit,
+    )
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
+    return data
+
+
+@app.get("/congress/trades/ticker/{symbol}")
+def congress_trades_ticker(
+    symbol: str,
+    limit: int = Query(40, ge=1, le=100),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Congress disclosures for one ticker. Pro plan."""
+    _gate(prof, "congress_trades")
+    data = congress.trades_for_ticker(symbol, limit=limit)
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
+    return data
+
+
+@app.get("/congress/trades/latest")
+def congress_trades_latest(
+    limit: int = Query(40, ge=1, le=100),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Shortcut: newest disclosures. Pro plan."""
+    _gate(prof, "congress_trades")
+    data = congress.latest_trades(limit=limit)
+    if not data.get("ok"):
+        raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
+    return data
+
+
 # ---------------------------------------------------------------------------
 # CRYPTO – ten sam silnik, BEZ mutacji core.sector_mapping, BEZ parallel spam
 # ---------------------------------------------------------------------------
@@ -2863,6 +2914,9 @@ def root():
             "GET /report/{ticker}/pdf",
             "GET /report/{ticker}/xlsx",
             "POST /billing/create-checkout",
+            "GET /congress/trades",
+            "GET /congress/trades/latest",
+            "GET /congress/trades/ticker/{symbol}",
             "POST /billing/portal",
             "GET /billing/confirm-session",
             "POST /billing/stripe-webhook",
