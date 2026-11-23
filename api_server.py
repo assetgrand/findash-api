@@ -2464,7 +2464,6 @@ def congress_trades_latest(
         raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
     return data
 
-
 # ---------------------------------------------------------------------------
 # CRYPTO – ten sam silnik, BEZ mutacji core.sector_mapping, BEZ parallel spam
 # ---------------------------------------------------------------------------
