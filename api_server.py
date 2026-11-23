@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "congress-trades-v1"
+API_BUILD = "fast-board-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -354,7 +354,7 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
 _PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # co 2h — mniej kredytów Twelve
-_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "3.0"))  # pauza między tickerami
+_PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "0.5"))  # short gap only
 # Serve even old forecasts (user sees last known price/prediction — never empty loading)
 _PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(7 * 24 * 3600)))  # 7 dni
 _PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "3600"))  # po 1h odśwież w tle
@@ -690,7 +690,7 @@ def _ai_board_once() -> None:
         return
     tickers = _ticker_list_for_precompute()
     horizons = ("3M",)
-    pause = float(os.environ.get("AI_BOARD_PAUSE", "2"))
+    pause = float(os.environ.get("AI_BOARD_PAUSE", "0.5"))
     _AI_BOARD_STATUS["running"] = True
     _AI_BOARD_STATUS["done"] = 0
     _AI_BOARD_STATUS["total"] = len(tickers) * len(horizons)
@@ -704,6 +704,16 @@ def _ai_board_once() -> None:
                 try:
                     quant = _pc_get(t, hz)
                     if not quant:
+                        try:
+                            print(f"[ai-board] quant miss {t}/{hz} — analyze once")
+                            quant = _analyze_one(t, hz, fast=False, quality=True)
+                            if quant and quant.get("current_price") is not None:
+                                _pc_store(t, hz, quant)
+                        except Exception as e:
+                            print(f"[ai-board] quant live fail {t}/{hz}: {e}")
+                            quant = None
+                    if not quant:
+                        print(f"[ai-board] skip {t}/{hz}: no quant")
                         continue
                     fundamentals = None
                     perspective = None
@@ -737,10 +747,10 @@ def _ai_board_once() -> None:
 
 def _ai_board_worker() -> None:
     """AI dopiero po tym jak 12 spółek ma prognozy. Nie startuje razem z Twelve."""
-    time.sleep(int(os.environ.get("AI_BOARD_START_DELAY", "7200")))
-    interval = int(os.environ.get("AI_BOARD_INTERVAL", "43200"))
+    time.sleep(int(os.environ.get("AI_BOARD_START_DELAY", "30")))
+    interval = int(os.environ.get("AI_BOARD_INTERVAL", "21600"))
     while True:
-        if os.environ.get("AI_PRECOMPUTE_ENABLED", "0") != "1":
+        if os.environ.get("AI_PRECOMPUTE_ENABLED", "1") != "1":
             time.sleep(60)
             continue
         try:
@@ -2464,6 +2474,7 @@ def congress_trades_latest(
         raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
     return data
 
+
 # ---------------------------------------------------------------------------
 # CRYPTO – ten sam silnik, BEZ mutacji core.sector_mapping, BEZ parallel spam
 # ---------------------------------------------------------------------------
@@ -2674,13 +2685,13 @@ def crypto_rankings(
 def ai_full_analysis(
     ticker: str,
     horizon: str = Query("3M", description="3M or 6M only"),
-    refresh: bool = Query(False, description="ignored — AI serves post-deploy cache only"),
+    refresh: bool = Query(False, description="Rebuild AI text if cached; quant uses precompute or one live run"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
-    AI Brief: horizons 3M / 6M only.
-    Quant prices come ONLY from server precompute (Twelve at deploy/worker — not per client).
-    AI text is served from server cache filled after deploy; client cannot force Twelve.
+    AI Brief: horizons 3M / 6M.
+    Prefer server precompute for quant (saves Twelve credits).
+    If that ticker/horizon is missing, run ONE on-demand analysis, store it, then build AI.
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
@@ -2691,32 +2702,43 @@ def ai_full_analysis(
     t = ticker.upper().strip()
     hz = _ai_horizon_label(horizon)
 
-    # Quant: precompute only (no Twelve on this path)
+    quant_source = "precompute"
     quant = _pc_get(t, hz)
+    if not quant:
+        # On-demand single ticker — do not 503 while board is still filling
+        try:
+            print(f"[ai_full] precompute miss {t}/{hz} — live analyze once")
+            quant = _analyze_one(t, hz, fast=False, quality=True)
+            if quant:
+                _pc_store(t, hz, quant)
+                quant_source = "live_ondemand"
+        except Exception as e:
+            print(f"[ai_full] live analyze failed {t}/{hz}:", e)
+            quant = None
     if not quant:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"Forecast for {t}/{hz} not ready yet. "
-                "Server fills 3M/6M AI after deploy precompute — try again shortly."
+                f"Forecast for {t}/{hz} unavailable right now "
+                "(data provider busy or error). Try again in a minute."
             ),
         )
     quant = dict(quant)
-    quant["cached"] = True
+    quant["cached"] = quant_source == "precompute"
 
-    # Prefer fully cached AI row (post-deploy). Client cannot force rebuild.
-    try:
-        cached_ai = ai_full.peek_cache(t, hz)
-        if cached_ai:
-            data = dict(cached_ai)
-            data["cached"] = True
-            data["plan"] = (prof.get("plan") or "demo").lower()
-            data["mode"] = "four_agents_cached"
-            data["quant_source"] = "precompute"
-            data["client_refresh_ignored"] = True
-            return data
-    except Exception:
-        pass
+    # Prefer fully cached AI row unless refresh
+    if not refresh:
+        try:
+            cached_ai = ai_full.peek_cache(t, hz)
+            if cached_ai:
+                data = dict(cached_ai)
+                data["cached"] = True
+                data["plan"] = (prof.get("plan") or "demo").lower()
+                data["mode"] = "four_agents_cached"
+                data["quant_source"] = quant_source
+                return data
+        except Exception:
+            pass
 
     fundamentals = None
     perspective = None
@@ -2735,7 +2757,7 @@ def ai_full_analysis(
             fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
             perspective=perspective if isinstance(perspective, dict) else None,
             horizon=hz,
-            use_cache=True,  # always cache; client cannot bust Twelve
+            use_cache=not refresh,
         )
     except Exception as e:
         print("[ai_full] error", e)
@@ -2743,8 +2765,7 @@ def ai_full_analysis(
     data = dict(data)
     data["plan"] = (prof.get("plan") or "demo").lower()
     data["mode"] = "four_agents"
-    data["quant_source"] = "precompute"
-    data["client_refresh_ignored"] = True
+    data["quant_source"] = quant_source
     data["agents_used"] = data.get("agents_used") or [
         "fundamentals",
         "quant",
