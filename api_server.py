@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "fast-board-v1"
+API_BUILD = "cache-only-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -336,6 +336,54 @@ _ANALYZE_CACHE_TTL = int(os.environ.get("ANALYZE_CACHE_TTL", "3600"))  # 1h
 
 # Signals: wynik skanu trzymany na serwerze – strona tylko czyta (komercyjnie)
 # Hybrid stoi na świecach dziennych → 1h domyślnie; na produkcję można 6h/24h (SIGNALS_CACHE_TTL)
+
+_FEATURE_CACHE: Dict[str, Any] = {}  # fund|PERSP|hybrid|report keys
+_FEATURE_LOCK = threading.Lock()
+_CACHE_ONLY = os.environ.get("CACHE_ONLY", "1") == "1"  # user paths NEVER call Twelve
+
+
+def _feat_key(*parts: Any) -> str:
+    return "|".join(str(p).upper() for p in parts)
+
+
+def _feat_get(*parts: Any, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    key = _feat_key(*parts)
+    with _FEATURE_LOCK:
+        row = _FEATURE_CACHE.get(key)
+    if not row or not isinstance(row.get("data"), dict):
+        return None
+    age = time.time() - float(row.get("ts") or 0)
+    if max_age is not None and age > float(max_age):
+        return None
+    out = dict(row["data"])
+    out["cached"] = True
+    out["cache_age_sec"] = int(age)
+    return out
+
+
+def _feat_set(*parts: Any, data: Dict[str, Any]) -> Dict[str, Any]:
+    key = _feat_key(*parts)
+    payload = dict(data)
+    payload["cached"] = True
+    with _FEATURE_LOCK:
+        _FEATURE_CACHE[key] = {"ts": time.time(), "data": payload}
+        if len(_FEATURE_CACHE) > 800:
+            oldest = sorted(_FEATURE_CACHE.items(), key=lambda kv: kv[1]["ts"])[:200]
+            for k, _ in oldest:
+                _FEATURE_CACHE.pop(k, None)
+    return payload
+
+
+def _cache_miss(what: str, ticker: str = "") -> HTTPException:
+    tkr = f" for {ticker}" if ticker else ""
+    return HTTPException(
+        status_code=503,
+        detail=(
+            f"{what}{tkr} is not in server precompute cache yet. "
+            "Data is filled only by the background worker — try again shortly."
+        ),
+    )
+
 _SIGNALS_CACHE: Dict[str, Any] = {}
 _SIGNALS_LOCK = threading.Lock()
 _SIGNALS_CACHE_TTL = int(os.environ.get("SIGNALS_CACHE_TTL", "3600"))  # 1h
@@ -485,6 +533,9 @@ def _pc_age(ticker: str, horizon_label: str) -> Optional[float]:
 
 
 def _bg_refresh_ticker(ticker: str, horizon_label: str) -> None:
+    # CACHE-ONLY mode: background refresh still allowed for worker-scheduled jobs only.
+    # User request paths must not call this.
+
     """Refresh one ticker in background; keep serving old data until done."""
     key = _pc_key(ticker, horizon_label)
     with _BG_LOCK:
@@ -583,6 +634,13 @@ def _precompute_all_once() -> None:
         _PRECOMPUTE_STATUS["tickers_done"] = len(done_tickers)
         time.sleep(_PRECOMPUTE_PAUSE)
 
+    # After forecasts: modules (fund/3Y/hybrid/reports/signals/crypto/backtest)
+    try:
+        _precompute_modules_once(tickers)
+    except Exception as e:
+        print("[precompute] modules error:", e)
+        _PRECOMPUTE_STATUS["last_error"] = f"modules: {e}"
+
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
     with _PRECOMPUTE_LOCK:
@@ -592,6 +650,125 @@ def _precompute_all_once() -> None:
         _pc_disk_save()
     except Exception as e:
         print("[precompute] disk save end:", e)
+
+
+
+def _serialize_fund(fa: dict, ticker: str) -> dict:
+    out = {}
+    for k, v in (fa or {}).items():
+        if k == "company_fundamentals" and isinstance(v, dict):
+            out[k] = {kk: _safe_float(vv) if not isinstance(vv, str) else vv for kk, vv in v.items()}
+        elif k == "macro_data" and isinstance(v, dict):
+            out[k] = {kk: (vv if isinstance(vv, str) else _safe_float(vv)) for kk, vv in v.items()}
+        else:
+            try:
+                out[k] = v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+            except Exception:
+                out[k] = str(v)
+    out["ticker"] = ticker
+    return out
+
+
+def _serialize_persp(info: dict) -> dict:
+    clean = {}
+    for k, v in (info or {}).items():
+        if isinstance(v, dict):
+            clean[k] = {
+                kk: (_safe_float(vv) if not isinstance(vv, (str, bool, type(None))) else vv)
+                for kk, vv in v.items()
+            }
+        else:
+            clean[k] = _safe_float(v) if isinstance(v, (int, float)) else v
+    return clean
+
+
+def _precompute_modules_once(tickers: List[str]) -> None:
+    """Fill fund / 3Y / hybrid / reports / signals / backtest / crypto — worker only."""
+    print(f"[precompute-modules] start for {len(tickers)} tickers")
+    for t in tickers:
+        try:
+            if getattr(core, "_twelve_in_cooldown", lambda: False)():
+                print("[precompute-modules] twelve cooldown — stop modules")
+                break
+        except Exception:
+            pass
+        _PRECOMPUTE_STATUS["last_ticker"] = f"mod/{t}"
+        # fundamentals
+        try:
+            fa = core.get_comprehensive_fundamental_analysis(t)
+            if fa:
+                _feat_set("FUND", t, data=_serialize_fund(fa, t))
+        except Exception as e:
+            print("[precompute-modules] fund", t, e)
+        # 3Y
+        try:
+            score = None
+            cached_f = _feat_get("FUND", t)
+            if cached_f:
+                score = cached_f.get("combined_score")
+            info = core.get_3year_perspective(t, score)
+            if info:
+                _feat_set("PERSP3Y", t, data=_serialize_persp(info))
+        except Exception as e:
+            print("[precompute-modules] persp", t, e)
+        # hybrid 3 modes
+        for mode in ("AGGRESSIVE", "BALANCED", "CONSERVATIVE"):
+            try:
+                h = hybrid.analyze_hybrid(t, mode=mode)
+                if isinstance(h, dict):
+                    _feat_set("HYBRID", t, mode, data=h)
+            except Exception as e:
+                print("[precompute-modules] hybrid", t, mode, e)
+        # backtests
+        try:
+            key_s = _bt_cache_key("strategy", t, 10000)
+            data_s = reports.strategy_backtest(t, initial_capital=10000.0)
+            if isinstance(data_s, dict):
+                _bt_cache_set(key_s, data_s)
+        except Exception as e:
+            print("[precompute-modules] bt strategy", t, e)
+        for hz in ("1M", "3M"):
+            try:
+                key_f = _bt_cache_key("forecast", t, hz)
+                data_f = reports.forecast_quality_backtest(t, horizon=hz)
+                if isinstance(data_f, dict):
+                    _bt_cache_set(key_f, data_f)
+            except Exception as e:
+                print("[precompute-modules] bt forecast", t, hz, e)
+        # reports
+        try:
+            payload = reports.build_report_payload(t)
+            if isinstance(payload, dict):
+                _feat_set("REPORT_JSON", t, data=payload)
+        except Exception as e:
+            print("[precompute-modules] report json", t, e)
+        try:
+            pdf = reports.report_pdf_bytes(t)
+            if pdf:
+                with _FEATURE_LOCK:
+                    _FEATURE_CACHE[_feat_key("REPORT_PDF", t)] = {"ts": time.time(), "data": bytes(pdf)}
+        except Exception as e:
+            print("[precompute-modules] report pdf", t, e)
+        try:
+            xlsx = reports.report_excel_bytes(t)
+            if xlsx:
+                with _FEATURE_LOCK:
+                    _FEATURE_CACHE[_feat_key("REPORT_XLSX", t)] = {"ts": time.time(), "data": bytes(xlsx)}
+        except Exception as e:
+            print("[precompute-modules] report xlsx", t, e)
+        time.sleep(max(_PRECOMPUTE_PAUSE, 0.2))
+
+    # signals
+    try:
+        _precompute_signals_once()
+    except Exception as e:
+        print("[precompute-modules] signals", e)
+    # crypto
+    try:
+        _precompute_crypto_once()
+    except Exception as e:
+        print("[precompute-modules] crypto", e)
+    print("[precompute-modules] done")
 
 
 def _gemini_should_wait(err: BaseException) -> bool:
@@ -702,18 +879,9 @@ def _ai_board_once() -> None:
                 _AI_BOARD_STATUS["last_ticker"] = t
                 _AI_BOARD_STATUS["last_horizon"] = hz
                 try:
-                    quant = _pc_get(t, hz)
+                    quant = _pc_get(t, hz, allow_stale=True)
                     if not quant:
-                        try:
-                            print(f"[ai-board] quant miss {t}/{hz} — analyze once")
-                            quant = _analyze_one(t, hz, fast=False, quality=True)
-                            if quant and quant.get("current_price") is not None:
-                                _pc_store(t, hz, quant)
-                        except Exception as e:
-                            print(f"[ai-board] quant live fail {t}/{hz}: {e}")
-                            quant = None
-                    if not quant:
-                        print(f"[ai-board] skip {t}/{hz}: no quant")
+                        print(f"[ai-board] skip {t}/{hz}: no quant in precompute")
                         continue
                     fundamentals = None
                     perspective = None
@@ -1036,69 +1204,21 @@ def analyze(
     days = _horizon_days(horizon)
     hz = _horizon_label(horizon)
 
-    if refresh:
-        for k in list(_ANALYZE_CACHE.keys()):
-            if f"|{t}|" in k or k.startswith(f"v6|{t}|"):
-                _ANALYZE_CACHE.pop(k, None)
-        with _PRECOMPUTE_LOCK:
-            _PRECOMPUTE.pop(_pc_key(t, hz), None)
-
-    # ZAWSZE serwuj ostatnią znaną prognozę (nawet starszą cenę) — zero pustego ładowania.
-    # Odświeżenie w tle; użytkownik widzi gotowe dane od razu.
-    if not refresh:
-        cached = _pc_get(t, hz, allow_stale=True)
-        if (
-            cached
-            and cached.get("current_price") is not None
-            and cached.get("predicted_change_pct") is not None
-        ):
-            cached = dict(cached)
-            cached["cached"] = True
-            cached.pop("fast_mode", None)
-            age = _pc_age(t, hz)
-            # jeśli starsze niż próg — odśwież w tle (nie blokuj odpowiedzi)
-            if age is not None and age >= _PRECOMPUTE_STALE_REFRESH:
-                # nie odpalaj Twelve z widoku pojedynczej spółki gdy limit już padł
-                try:
-                    if not getattr(core, "_twelve_in_cooldown", lambda: False)():
-                        _bg_refresh_ticker(t, hz)
-                except Exception:
-                    pass
-            if (prof.get("plan") or "demo").lower() == "demo":
-                new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
-                prof["analyze_count"] = new_c
-            payload = {k: v for k, v in cached.items() if k in AnalyzeResponse.model_fields}
-            payload["plan"] = (prof.get("plan") or "demo").lower()
-            payload["analyze_remaining"] = auth.remaining_analyze(prof)
-            return AnalyzeResponse(**payload)
-
-    # Brak cache albo refresh=true — licz teraz, potem zapisz
-    try:
-        data = _analyze_one(t, horizon, fast=bool(fast), quality=bool(quality))
-    except Exception as e:
-        # Ostateczny fallback: cokolwiek starego z dysku
-        stale = _pc_get(t, hz, max_age=_PRECOMPUTE_SERVE_MAX_AGE, allow_stale=True)
-        if stale and stale.get("current_price") is not None:
-            stale = dict(stale)
-            stale["cached"] = True
-            if (prof.get("plan") or "demo").lower() == "demo":
-                new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
-                prof["analyze_count"] = new_c
-            payload = {k: v for k, v in stale.items() if k in AnalyzeResponse.model_fields}
-            payload["plan"] = (prof.get("plan") or "demo").lower()
-            payload["analyze_remaining"] = auth.remaining_analyze(prof)
-            return AnalyzeResponse(**payload)
-        raise
-    data.pop("fast_mode", None)
-    try:
-        if data.get("current_price") is not None:
-            _pc_store(t, hz, data)
-    except Exception:
-        pass
+    # CACHE-ONLY: user path never calls Twelve. refresh ignored for live compute.
+    cached = _pc_get(t, hz, allow_stale=True)
+    if not (
+        cached
+        and cached.get("current_price") is not None
+        and cached.get("predicted_change_pct") is not None
+    ):
+        raise _cache_miss("Forecast", t)
+    cached = dict(cached)
+    cached["cached"] = True
+    cached.pop("fast_mode", None)
     if (prof.get("plan") or "demo").lower() == "demo":
         new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
         prof["analyze_count"] = new_c
-    payload = {k: v for k, v in data.items() if k in AnalyzeResponse.model_fields}
+    payload = {k: v for k, v in cached.items() if k in AnalyzeResponse.model_fields}
     payload["plan"] = (prof.get("plan") or "demo").lower()
     payload["analyze_remaining"] = auth.remaining_analyze(prof)
     return AnalyzeResponse(**payload)
@@ -1189,56 +1309,9 @@ def rankings(
         else:
             missing.append(tk)
 
-    # 2) brakujące — policz SEKWENCYJNIE (jak wcześniej), bez równoległego dobijania Twelve
+    # 2) CACHE-ONLY — never fill from Twelve on user request
     if missing:
-        cool = False
-        try:
-            cool = bool(getattr(core, "_twelve_in_cooldown", lambda: False)())
-        except Exception:
-            cool = False
-        have = len(by_tk)
-        print(f"[rankings] {hz} have={have} missing={missing} cool={cool}")
-        # Mamy już pełną/prawie pełną tabelę z cache → NIGDY nie blokuj requestu Twelve.
-        # Słabe (TSLA itd.) odświeżaj TYLKO w tle.
-        if cool or have >= 10:
-            for tk in missing:
-                try:
-                    _bg_refresh_ticker(tk, hz)
-                except Exception as e:
-                    print("rankings bg schedule skip", tk, e)
-        else:
-            # Tabela prawie pusta — dociągaj synchronicznie max kilka
-            to_sync = list(missing)[:8]
-            print(f"[rankings] {hz} emergency sync={to_sync}")
-            for tk in to_sync:
-                if getattr(core, "_twelve_in_cooldown", lambda: False)():
-                    print("[rankings] cooldown — stop sync fill")
-                    break
-                try:
-                    d = _analyze_one(tk, hz, fast=False, quality=True)
-                    if d and d.get("current_price") is not None:
-                        _pc_store(tk, hz, d)
-                        by_tk[tk] = d
-                        print(
-                            f"[rankings] sync filled {tk} hit={d.get('hit_rate')} "
-                            f"mode={d.get('analysis_mode')}"
-                        )
-                except Exception as e:
-                    print("rankings sync fill skip", tk, e)
-                try:
-                    missing.remove(tk)
-                except ValueError:
-                    pass
-                time.sleep(0.5)
-            try:
-                _pc_disk_save()
-            except Exception:
-                pass
-            for tk in missing:
-                try:
-                    _bg_refresh_ticker(tk, hz)
-                except Exception as e:
-                    print("rankings bg schedule skip", tk, e)
+        print(f"[rankings] {hz} cache-only missing={missing} (worker will fill)")
 
     missing_rows = []
     for tk in tick_list:
@@ -1298,56 +1371,20 @@ def rankings(
 def fundamentals(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     _gate(prof, "fundamentals")
     ticker = ticker.upper().strip()
-    try:
-        fa = core.get_comprehensive_fundamental_analysis(ticker)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not fa:
-        raise HTTPException(status_code=404, detail="No fundamental data")
-    # JSON-serializable
-    out = {}
-    for k, v in fa.items():
-        if k == "company_fundamentals" and isinstance(v, dict):
-            out[k] = {kk: _safe_float(vv) if not isinstance(vv, str) else vv for kk, vv in v.items()}
-        elif k == "macro_data" and isinstance(v, dict):
-            out[k] = {kk: (vv if isinstance(vv, str) else _safe_float(vv)) for kk, vv in v.items()}
-        else:
-            try:
-                out[k] = v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
-            except Exception:
-                out[k] = str(v)
-    out["ticker"] = ticker
-    return out
+    cached = _feat_get("FUND", ticker, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
+    if not cached:
+        raise _cache_miss("Fundamentals", ticker)
+    return cached
 
 
 @app.get("/perspective-3y/{ticker}")
 def perspective_3y(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     _gate(prof, "perspective_3y")
     ticker = ticker.upper().strip()
-    score = None
-    try:
-        fa = core.get_comprehensive_fundamental_analysis(ticker)
-        if fa:
-            score = fa.get("combined_score")
-    except Exception:
-        pass
-    try:
-        info = core.get_3year_perspective(ticker, score)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not info:
-        raise HTTPException(status_code=404, detail="No 3Y perspective data")
-    # uprość zagnieżdżenia
-    clean = {}
-    for k, v in info.items():
-        if isinstance(v, dict):
-            clean[k] = {
-                kk: (_safe_float(vv) if not isinstance(vv, (str, bool, type(None))) else vv)
-                for kk, vv in v.items()
-            }
-        else:
-            clean[k] = _safe_float(v) if isinstance(v, (int, float)) else v
-    return clean
+    cached = _feat_get("PERSP3Y", ticker, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
+    if not cached:
+        raise _cache_miss("3-year outlook", ticker)
+    return cached
 
 
 
@@ -1437,19 +1474,10 @@ def forecast_backtest(
     t = ticker.upper().strip()
     hz = "3M" if _horizon_days(horizon) > 30 else "1M"
     key = _bt_cache_key("forecast", t, hz)
-    if not refresh:
-        hit = _bt_cache_get(key)
-        if hit is not None:
-            return hit
-    try:
-        data = reports.forecast_quality_backtest(t, horizon=hz)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if isinstance(data, dict):
-        return _bt_cache_set(key, data)
-    return data
+    hit = _bt_cache_get(key)
+    if hit is not None:
+        return hit
+    raise _cache_miss("Forecast backtest", t)
 
 
 @app.get("/backtest/strategy/{ticker}")
@@ -1467,56 +1495,60 @@ def strategy_backtest(
     t = ticker.upper().strip()
     cap = int(round(float(capital)))
     key = _bt_cache_key("strategy", t, cap)
-    if not refresh:
-        hit = _bt_cache_get(key)
-        if hit is not None:
-            return hit
-    try:
-        data = reports.strategy_backtest(t, initial_capital=float(cap))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if isinstance(data, dict):
-        return _bt_cache_set(key, data)
-    return data
+    hit = _bt_cache_get(key)
+    if hit is not None:
+        return hit
+    raise _cache_miss("Strategy backtest", t)
 
 
 @app.get("/report/{ticker}")
 def report_json(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
-    """Pelny raport jako JSON (pod UI / eksport)."""
+    """Pelny raport jako JSON — tylko z precompute."""
     _gate(prof, "report")
-    try:
-        return reports.build_report_payload(ticker)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    t = ticker.upper().strip()
+    cached = _feat_get("REPORT_JSON", t, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
+    if not cached:
+        raise _cache_miss("Report", t)
+    return cached
 
 
 @app.get("/report/{ticker}/pdf")
 def report_pdf(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     _gate(prof, "report")
-    try:
-        data = reports.report_pdf_bytes(ticker)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    t = ticker.upper().strip()
+    with _FEATURE_LOCK:
+        row = _FEATURE_CACHE.get(_feat_key("REPORT_PDF", t))
+    if not row or not row.get("data"):
+        raise _cache_miss("Report PDF", t)
+    data = row["data"]
+    if isinstance(data, dict) and "bytes" in data:
+        data = data["bytes"]
+    if not isinstance(data, (bytes, bytearray)):
+        raise _cache_miss("Report PDF", t)
     return Response(
-        content=data,
+        content=bytes(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="findash_{ticker.upper()}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="findash_{t}.pdf"'},
     )
 
 
 @app.get("/report/{ticker}/xlsx")
 def report_xlsx(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
     _gate(prof, "report")
-    try:
-        data = reports.report_excel_bytes(ticker)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    t = ticker.upper().strip()
+    with _FEATURE_LOCK:
+        row = _FEATURE_CACHE.get(_feat_key("REPORT_XLSX", t))
+    if not row or not row.get("data"):
+        raise _cache_miss("Report Excel", t)
+    data = row["data"]
+    if isinstance(data, dict) and "bytes" in data:
+        data = data["bytes"]
+    if not isinstance(data, (bytes, bytearray)):
+        raise _cache_miss("Report Excel", t)
     return Response(
-        content=data,
+        content=bytes(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="findash_{ticker.upper()}.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="findash_{t}.xlsx"'},
     )
 
 
@@ -1526,14 +1558,20 @@ def hybrid_analyze(
     mode: str = Query("BALANCED", description="AGGRESSIVE | BALANCED | CONSERVATIVE"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
-    """Hybrid Analyzer – score, threshold, BUY/SELL signal (Pro plan)."""
+    """Hybrid Analyzer – from precompute cache only (Pro)."""
     _gate(prof, "hybrid")
-    try:
-        return hybrid.analyze_hybrid(ticker, mode=mode)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    t = ticker.upper().strip()
+    m = (mode or "BALANCED").strip().upper()
+    if m in ("ZROWNOwAZONY", "ZRÓWNOWAŻONY", "BALANCED"):
+        m = "BALANCED"
+    elif m in ("AGRESYWNY", "AGGRESSIVE"):
+        m = "AGGRESSIVE"
+    elif m in ("BEZPIECZNY", "CONSERVATIVE"):
+        m = "CONSERVATIVE"
+    cached = _feat_get("HYBRID", t, m, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
+    if not cached:
+        raise _cache_miss(f"Hybrid ({m})", t)
+    return cached
 
 
 def _signals_cache_key(mode: str, limit: int) -> str:
@@ -1591,20 +1629,22 @@ def signals(
     key = _signals_cache_key(mode, limit)
     now = time.time()
 
-    if not refresh:
-        with _SIGNALS_LOCK:
-            row = _SIGNALS_CACHE.get(key)
-            if row and (now - float(row["ts"])) < _SIGNALS_CACHE_TTL:
-                out = dict(row["data"])
-                out["cached"] = True
-                out["age_sec"] = int(now - float(row["ts"]))
-                return out
-
-    # Brak cache / wygasł / refresh=1 → policz raz i zapisz
-    payload = _build_signals_payload(mode, limit)
+    # CACHE-ONLY: never scan hybrid on user request
     with _SIGNALS_LOCK:
-        _SIGNALS_CACHE[key] = {"ts": now, "data": dict(payload)}
-    return payload
+        row = _SIGNALS_CACHE.get(key)
+        if row and row.get("data"):
+            out = dict(row["data"])
+            out["cached"] = True
+            out["age_sec"] = int(now - float(row["ts"]))
+            return out
+        # accept any age if present
+        for k, row2 in list(_SIGNALS_CACHE.items()):
+            if str(k).startswith(f"signals|{mode}|") and row2.get("data"):
+                out = dict(row2["data"])
+                out["cached"] = True
+                out["age_sec"] = int(now - float(row2["ts"]))
+                return out
+    raise _cache_miss("Signals")
 
 
 
@@ -2599,33 +2639,15 @@ def crypto_analyze(
             if pair in k or pair.replace("/", "") in k.replace("/", ""):
                 _ANALYZE_CACHE.pop(k, None)
 
-    # Tylko cache z precompute (jak akcje). Live Twelve tylko przy refresh=1 albo zimnym starcie.
+    # CACHE-ONLY crypto
     cache_key = _crypto_cache_key(pair, hz)
     now = time.time()
     hit = _ANALYZE_CACHE.get(cache_key)
-    if hit and now - float(hit["ts"]) < _ANALYZE_CACHE_TTL and not refresh:
-        data = dict(hit["data"])
-        data["cached"] = True
-    elif refresh:
-        raw = core.analyze_crypto_pair(pair, days_forward=days)
-        if not raw or raw.get("current_price") is None:
-            raise HTTPException(status_code=404, detail=f"No crypto data for {pair}")
-        data = _crypto_payload_from_raw(pair, hz, days, raw)
-        _ANALYZE_CACHE[cache_key] = {"ts": now, "data": dict(data)}
-        data = dict(data)
-        data["cached"] = False
-    else:
-        # Brak cache – jednorazowe wyliczenie + zapis (kolejni userzy biorą z cache)
-        raw = core.analyze_crypto_pair(pair, days_forward=days)
-        if not raw or raw.get("current_price") is None:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Crypto {pair} not precomputed yet. Retry in a minute.",
-            )
-        data = _crypto_payload_from_raw(pair, hz, days, raw)
-        _ANALYZE_CACHE[cache_key] = {"ts": now, "data": dict(data)}
-        data = dict(data)
-        data["cached"] = False
+    if not hit or not hit.get("data"):
+        # any-age fallback same day key prefix
+        raise _cache_miss("Crypto forecast", pair)
+    data = dict(hit["data"])
+    data["cached"] = True
 
     if (prof.get("plan") or "demo").lower() == "demo":
         new_c = auth.increment_analyze(prof["id"], int(prof.get("analyze_count") or 0))
@@ -2702,77 +2724,24 @@ def ai_full_analysis(
     t = ticker.upper().strip()
     hz = _ai_horizon_label(horizon)
 
-    quant_source = "precompute"
-    quant = _pc_get(t, hz)
+    quant = _pc_get(t, hz, allow_stale=True)
+    if not quant and hz == "6M":
+        quant = _pc_get(t, "3M", allow_stale=True)
     if not quant:
-        # On-demand single ticker — do not 503 while board is still filling
-        try:
-            print(f"[ai_full] precompute miss {t}/{hz} — live analyze once")
-            quant = _analyze_one(t, hz, fast=False, quality=True)
-            if quant:
-                _pc_store(t, hz, quant)
-                quant_source = "live_ondemand"
-        except Exception as e:
-            print(f"[ai_full] live analyze failed {t}/{hz}:", e)
-            quant = None
-    if not quant:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Forecast for {t}/{hz} unavailable right now "
-                "(data provider busy or error). Try again in a minute."
-            ),
-        )
-    quant = dict(quant)
-    quant["cached"] = quant_source == "precompute"
+        raise _cache_miss("AI quant/forecast", t)
 
-    # Prefer fully cached AI row unless refresh
-    if not refresh:
-        try:
-            cached_ai = ai_full.peek_cache(t, hz)
-            if cached_ai:
-                data = dict(cached_ai)
-                data["cached"] = True
-                data["plan"] = (prof.get("plan") or "demo").lower()
-                data["mode"] = "four_agents_cached"
-                data["quant_source"] = quant_source
-                return data
-        except Exception:
-            pass
-
-    fundamentals = None
-    perspective = None
     try:
-        fundamentals = core.get_comprehensive_fundamental_analysis(t)
-    except Exception as e:
-        print("[ai_full] fundamentals", e)
-    try:
-        perspective = core.get_3year_perspective(t, None)
-    except Exception as e:
-        print("[ai_full] perspective", e)
-    try:
-        data = ai_full.build_full(
-            t,
-            quant,
-            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
-            perspective=perspective if isinstance(perspective, dict) else None,
-            horizon=hz,
-            use_cache=not refresh,
-        )
-    except Exception as e:
-        print("[ai_full] error", e)
-        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
-    data = dict(data)
-    data["plan"] = (prof.get("plan") or "demo").lower()
-    data["mode"] = "four_agents"
-    data["quant_source"] = quant_source
-    data["agents_used"] = data.get("agents_used") or [
-        "fundamentals",
-        "quant",
-        "world_news",
-        "editor",
-    ]
-    return data
+        cached_ai = ai_full.peek_cache(t, hz)
+        if cached_ai:
+            data = dict(cached_ai)
+            data["cached"] = True
+            data["plan"] = (prof.get("plan") or "demo").lower()
+            data["mode"] = "four_agents_cached"
+            data["quant_source"] = "precompute"
+            return data
+    except Exception:
+        pass
+    raise _cache_miss("AI Brief", t)
 
 
 
