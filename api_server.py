@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "cache-only-v1"
+API_BUILD = "cache-only-v2"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -2707,13 +2707,13 @@ def crypto_rankings(
 def ai_full_analysis(
     ticker: str,
     horizon: str = Query("3M", description="3M or 6M only"),
-    refresh: bool = Query(False, description="Rebuild AI text if cached; quant uses precompute or one live run"),
+    refresh: bool = Query(False, description="Rebuild AI text if cached; quant always from precompute"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """
     AI Brief: horizons 3M / 6M.
-    Prefer server precompute for quant (saves Twelve credits).
-    If that ticker/horizon is missing, run ONE on-demand analysis, store it, then build AI.
+    Quant/fundamentals/3Y ONLY from precompute cache (no Twelve on this path).
+    AI text: serve cache, or build once via Gemini and store (still no Twelve).
     """
     _gate(prof, "ai_brief")
     if not ai_full.configured():
@@ -2730,18 +2730,46 @@ def ai_full_analysis(
     if not quant:
         raise _cache_miss("AI quant/forecast", t)
 
+    if not refresh:
+        try:
+            cached_ai = ai_full.peek_cache(t, hz)
+            if cached_ai:
+                data = dict(cached_ai)
+                data["cached"] = True
+                data["plan"] = (prof.get("plan") or "demo").lower()
+                data["mode"] = "four_agents_cached"
+                data["quant_source"] = "precompute"
+                return data
+        except Exception:
+            pass
+
+    # Build AI text from cached quant + cached fund/3Y only (Gemini, never Twelve)
+    fundamentals = _feat_get("FUND", t, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
+    perspective = _feat_get("PERSP3Y", t, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
     try:
-        cached_ai = ai_full.peek_cache(t, hz)
-        if cached_ai:
-            data = dict(cached_ai)
-            data["cached"] = True
-            data["plan"] = (prof.get("plan") or "demo").lower()
-            data["mode"] = "four_agents_cached"
-            data["quant_source"] = "precompute"
-            return data
-    except Exception:
-        pass
-    raise _cache_miss("AI Brief", t)
+        data = ai_full.build_full(
+            t,
+            quant,
+            fundamentals=fundamentals if isinstance(fundamentals, dict) else None,
+            perspective=perspective if isinstance(perspective, dict) else None,
+            horizon=hz,
+            use_cache=not refresh,
+        )
+    except Exception as e:
+        print("[ai_full] error", e)
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
+    data = dict(data)
+    data["plan"] = (prof.get("plan") or "demo").lower()
+    data["mode"] = "four_agents"
+    data["quant_source"] = "precompute"
+    data["cached"] = False
+    data["agents_used"] = data.get("agents_used") or [
+        "fundamentals",
+        "quant",
+        "world_news",
+        "editor",
+    ]
+    return data
 
 
 
