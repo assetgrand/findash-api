@@ -362,3 +362,205 @@ def report_excel_bytes(ticker: str) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def build_report_from_ai(ai: Dict[str, Any]) -> Dict[str, Any]:
+    """Build formal report payload exclusively from an AI Brief /ai/full result."""
+    if not isinstance(ai, dict):
+        raise ValueError("AI payload required")
+    t = str(ai.get("ticker") or "").upper().strip()
+    if not t:
+        raise ValueError("AI payload missing ticker")
+    q = ai.get("quant") if isinstance(ai.get("quant"), dict) else {}
+    fund = ai.get("fundamentals_pack") if isinstance(ai.get("fundamentals_pack"), dict) else {}
+    if not fund and isinstance(ai.get("fundamentals"), dict):
+        fund = ai.get("fundamentals") or {}
+    pers = ai.get("perspective_3y") if isinstance(ai.get("perspective_3y"), dict) else {}
+    hz = str(ai.get("horizon") or q.get("horizon") or "3M").upper()
+
+    out: Dict[str, Any] = {
+        "ticker": t,
+        "source": "ai_brief",
+        "horizon": hz,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "sector": q.get("sector") or fund.get("sector") or ai.get("sector"),
+        "current_price": _sf(q.get("current_price") or ai.get("current_price")),
+        "rsi": _sf(q.get("rsi")),
+        "fundamental_rating": q.get("fundamental_rating") or fund.get("fundamental_rating"),
+        "combined_score": _sf(q.get("combined_score") or fund.get("combined_score")),
+        "predicted_price": _sf(ai.get("predicted_price") or q.get("predicted_price")),
+        "predicted_change_pct": _sf(ai.get("predicted_change_pct") or q.get("predicted_change_pct")),
+        "direction": ai.get("direction") or q.get("direction"),
+        "hit_rate": _sf(q.get("hit_rate")),
+        "mae": _sf(q.get("mae")),
+        "model_predicted_change_pct": _sf(ai.get("model_predicted_change_pct") or q.get("model_predicted_change_pct")),
+        "agent_adjustment_pct": _sf(ai.get("agent_adjustment_pct") or q.get("agent_adjustment_pct")),
+        "adjustment_reason": ai.get("adjustment_reason") or q.get("adjustment_reason"),
+        "executive_summary": ai.get("executive_summary"),
+        "situation_assessment": ai.get("situation_assessment"),
+        "fundamentals_verdict": ai.get("fundamentals_verdict"),
+        "fundamentals_summary": ai.get("fundamentals_summary"),
+        "quant_summary": ai.get("quant_summary"),
+        "news_summary": ai.get("news_summary"),
+        "strengths": ai.get("strengths") or [],
+        "weaknesses": ai.get("weaknesses") or [],
+        "watchpoints": ai.get("watchpoints") or [],
+        "sentiment": ai.get("sentiment"),
+        "confidence": ai.get("confidence"),
+        "breakthrough_news": ai.get("breakthrough_news") or [],
+        "perspective_3y": pers,
+        "headlines": ai.get("headlines") or [],
+        "disclaimer": (
+            "AssetCore AI research report. Built from the AI Brief desk synthesis "
+            "(model quant + multi-agent narrative). Analytical software only — not investment advice."
+        ),
+    }
+    # Keep 1M/3M slots for PDF layout compatibility
+    fc = {
+        "predicted_price": out.get("predicted_price"),
+        "predicted_change_pct": out.get("predicted_change_pct"),
+        "direction": out.get("direction"),
+        "hit_rate": out.get("hit_rate"),
+        "mae": out.get("mae"),
+    }
+    if hz.startswith("1"):
+        out["forecast_1m"] = fc
+        out["forecast_3m"] = {}
+    else:
+        out["forecast_3m"] = fc
+        out["forecast_1m"] = {}
+    return out
+
+
+def _pdf_from_payload(data: Dict[str, Any]) -> bytes:
+    try:
+        from fpdf import FPDF
+    except ImportError as e:
+        raise RuntimeError("Install fpdf2") from e
+
+    ticker = str(data.get("ticker") or "?")
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "AssetCore Alpha - AI Research Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, f"Ticker: {ticker}  |  Horizon: {data.get('horizon') or '-'}", ln=True, align="C")
+    pdf.cell(0, 6, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC", ln=True, align="C")
+    pdf.ln(4)
+
+    def line(label: str, value: Any):
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(55, 6, str(label)[:40], border=0)
+        pdf.set_font("Helvetica", "", 10)
+        s = str(value) if value is not None else "-"
+        # strip non-latin1 for Helvetica
+        s = s.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.multi_cell(0, 6, s[:2000])
+
+    def block(title: str, body: Any):
+        if not body:
+            return
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, str(title)[:80], ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        text = body if isinstance(body, str) else str(body)
+        text = text.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.multi_cell(0, 5, text[:4000])
+
+    line("Sector", data.get("sector"))
+    line("Price", data.get("current_price"))
+    line("Direction", data.get("direction"))
+    line("Predicted %", data.get("predicted_change_pct"))
+    line("Predicted price", data.get("predicted_price"))
+    line("Model base %", data.get("model_predicted_change_pct"))
+    line("Agent tilt %", data.get("agent_adjustment_pct"))
+    line("Hit%", data.get("hit_rate"))
+    line("MAE", data.get("mae"))
+    line("RSI", data.get("rsi"))
+    line("Rating", data.get("fundamental_rating"))
+    line("Score", data.get("combined_score"))
+    line("Sentiment", data.get("sentiment"))
+    line("Confidence", data.get("confidence"))
+
+    block("Executive summary", data.get("executive_summary"))
+    block("Situation", data.get("situation_assessment"))
+    block("Fundamentals verdict", data.get("fundamentals_verdict"))
+    block("Fundamentals summary", data.get("fundamentals_summary"))
+    block("Quant summary", data.get("quant_summary"))
+    block("News summary", data.get("news_summary"))
+    block("Adjustment reason", data.get("adjustment_reason"))
+
+    strengths = data.get("strengths") or []
+    if strengths:
+        block("Strengths", "\n".join(f"- {x}" for x in strengths[:8]))
+    weaknesses = data.get("weaknesses") or []
+    if weaknesses:
+        block("Weaknesses", "\n".join(f"- {x}" for x in weaknesses[:8]))
+    watch = data.get("watchpoints") or []
+    if watch:
+        block("Watchpoints", "\n".join(f"- {x}" for x in watch[:8]))
+
+    p3 = data.get("perspective_3y") or {}
+    if isinstance(p3, dict) and p3:
+        line("3Y trend", p3.get("trend_3y") or p3.get("trend"))
+        line("Crash risk", p3.get("crash_risk_score"))
+        line("Risk of drop %", p3.get("risk_of_drop_pct"))
+        line("Upside potential %", p3.get("upside_potential_pct"))
+
+    pdf.ln(6)
+    pdf.set_font("Helvetica", "I", 8)
+    disc = str(data.get("disclaimer") or "")
+    pdf.multi_cell(0, 5, disc.encode("latin-1", errors="replace").decode("latin-1"))
+
+    raw = pdf.output(dest="S")
+    if isinstance(raw, str):
+        return raw.encode("latin-1", errors="replace")
+    return bytes(raw)
+
+
+def _excel_from_payload(data: Dict[str, Any]) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as e:
+        raise RuntimeError("Install openpyxl") from e
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "AI Report"
+    ws.append(["Field", "Value"])
+    ws["A1"].font = Font(bold=True)
+    ws["B1"].font = Font(bold=True)
+
+    def add(k, v):
+        if isinstance(v, (list, dict)):
+            v = str(v)
+        ws.append([k, v])
+
+    for k in (
+        "ticker", "horizon", "sector", "current_price", "direction",
+        "predicted_change_pct", "predicted_price", "model_predicted_change_pct",
+        "agent_adjustment_pct", "hit_rate", "mae", "rsi", "fundamental_rating",
+        "combined_score", "sentiment", "confidence", "executive_summary",
+        "situation_assessment", "fundamentals_verdict", "fundamentals_summary",
+        "quant_summary", "news_summary", "adjustment_reason", "disclaimer",
+    ):
+        add(k, data.get(k))
+    add("strengths", data.get("strengths"))
+    add("weaknesses", data.get("weaknesses"))
+    add("watchpoints", data.get("watchpoints"))
+    add("perspective_3y", data.get("perspective_3y"))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def report_pdf_bytes_from_ai(ai: Dict[str, Any]) -> bytes:
+    return _pdf_from_payload(build_report_from_ai(ai))
+
+
+def report_excel_bytes_from_ai(ai: Dict[str, Any]) -> bytes:
+    return _excel_from_payload(build_report_from_ai(ai))

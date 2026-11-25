@@ -735,27 +735,7 @@ def _precompute_modules_once(tickers: List[str]) -> None:
                     _bt_cache_set(key_f, data_f)
             except Exception as e:
                 print("[precompute-modules] bt forecast", t, hz, e)
-        # reports
-        try:
-            payload = reports.build_report_payload(t)
-            if isinstance(payload, dict):
-                _feat_set("REPORT_JSON", t, data=payload)
-        except Exception as e:
-            print("[precompute-modules] report json", t, e)
-        try:
-            pdf = reports.report_pdf_bytes(t)
-            if pdf:
-                with _FEATURE_LOCK:
-                    _FEATURE_CACHE[_feat_key("REPORT_PDF", t)] = {"ts": time.time(), "data": bytes(pdf)}
-        except Exception as e:
-            print("[precompute-modules] report pdf", t, e)
-        try:
-            xlsx = reports.report_excel_bytes(t)
-            if xlsx:
-                with _FEATURE_LOCK:
-                    _FEATURE_CACHE[_feat_key("REPORT_XLSX", t)] = {"ts": time.time(), "data": bytes(xlsx)}
-        except Exception as e:
-            print("[precompute-modules] report xlsx", t, e)
+        # Reports are generated from AI Brief on demand — do not precompute via Twelve here.
         time.sleep(max(_PRECOMPUTE_PAUSE, 0.2))
 
     # signals
@@ -1502,53 +1482,102 @@ def strategy_backtest(
 
 
 @app.get("/report/{ticker}")
-def report_json(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
-    """Pelny raport jako JSON — tylko z precompute."""
+def report_json(
+    ticker: str,
+    horizon: str = Query("3M"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """JSON report built from AI Brief cache."""
     _gate(prof, "report")
     t = ticker.upper().strip()
-    cached = _feat_get("REPORT_JSON", t, max_age=_PRECOMPUTE_SERVE_MAX_AGE)
-    if not cached:
-        raise _cache_miss("Report", t)
-    return cached
+    hz = _ai_horizon_label(horizon)
+    ai = None
+    try:
+        ai = ai_full.peek_cache(t, hz)
+        if not ai and hz == "6M":
+            ai = ai_full.peek_cache(t, "3M")
+    except Exception:
+        ai = None
+    if not ai:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Run AI Brief for {t}/{hz} first. Reports are generated from AI Brief.",
+        )
+    try:
+        return reports.build_report_from_ai(ai)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/report/{ticker}/pdf")
-def report_pdf(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+def report_pdf(
+    ticker: str,
+    horizon: str = Query("3M", description="Must match AI Brief horizon (3M/6M)"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """PDF built from AI Brief payload only (no live Twelve). Run AI Brief first."""
     _gate(prof, "report")
     t = ticker.upper().strip()
-    with _FEATURE_LOCK:
-        row = _FEATURE_CACHE.get(_feat_key("REPORT_PDF", t))
-    if not row or not row.get("data"):
-        raise _cache_miss("Report PDF", t)
-    data = row["data"]
-    if isinstance(data, dict) and "bytes" in data:
-        data = data["bytes"]
-    if not isinstance(data, (bytes, bytearray)):
-        raise _cache_miss("Report PDF", t)
+    hz = _ai_horizon_label(horizon)
+    ai = None
+    try:
+        ai = ai_full.peek_cache(t, hz)
+        if not ai and hz == "6M":
+            ai = ai_full.peek_cache(t, "3M")
+    except Exception:
+        ai = None
+    if not ai:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Run AI Brief for {t}/{hz} first. "
+                "Reports are generated from the AI Brief result, not a separate data pull."
+            ),
+        )
+    try:
+        data = reports.report_pdf_bytes_from_ai(ai)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report PDF failed: {e}")
     return Response(
         content=bytes(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="findash_{t}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="assetcore_{t}_{hz}_ai_report.pdf"'},
     )
 
 
 @app.get("/report/{ticker}/xlsx")
-def report_xlsx(ticker: str, prof: Dict[str, Any] = Depends(get_profile)):
+def report_xlsx(
+    ticker: str,
+    horizon: str = Query("3M", description="Must match AI Brief horizon (3M/6M)"),
+    prof: Dict[str, Any] = Depends(get_profile),
+):
+    """Excel built from AI Brief payload only (no live Twelve). Run AI Brief first."""
     _gate(prof, "report")
     t = ticker.upper().strip()
-    with _FEATURE_LOCK:
-        row = _FEATURE_CACHE.get(_feat_key("REPORT_XLSX", t))
-    if not row or not row.get("data"):
-        raise _cache_miss("Report Excel", t)
-    data = row["data"]
-    if isinstance(data, dict) and "bytes" in data:
-        data = data["bytes"]
-    if not isinstance(data, (bytes, bytearray)):
-        raise _cache_miss("Report Excel", t)
+    hz = _ai_horizon_label(horizon)
+    ai = None
+    try:
+        ai = ai_full.peek_cache(t, hz)
+        if not ai and hz == "6M":
+            ai = ai_full.peek_cache(t, "3M")
+    except Exception:
+        ai = None
+    if not ai:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Run AI Brief for {t}/{hz} first. "
+                "Reports are generated from the AI Brief result, not a separate data pull."
+            ),
+        )
+    try:
+        data = reports.report_excel_bytes_from_ai(ai)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report Excel failed: {e}")
     return Response(
         content=bytes(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="findash_{t}.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="assetcore_{t}_{hz}_ai_report.xlsx"'},
     )
 
 
