@@ -34,14 +34,30 @@ import requests
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-# Prefer models that actually answer quickly; override with GEMINI_MODEL on Render if needed
-GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+# Current Google AI models (2026). Override with GEMINI_MODEL on Render if needed.
+# Dead IDs (1.5-flash-latest, 2.0-flash, etc.) return HTTP 404.
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip()
 CACHE_MINUTES = float(os.environ.get("AI_BRIEF_CACHE_MINUTES") or "180")
 MAX_HEADLINES = int(os.environ.get("AI_BRIEF_MAX_HEADLINES") or "16")
 
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
-_BUILD = "ai-brief-v1"
+_BUILD = "ai-brief-v2-models-2026"
+
+# Known-retired model IDs — skip even if set as GEMINI_MODEL
+_DEAD_MODELS = {
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro",
+    "gemini-1.5-pro-latest",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-001",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-pro",
+}
 
 _DISCLAIMER = (
     "AI-assisted news context only. Not investment advice. "
@@ -191,17 +207,24 @@ def _model_candidates() -> List[str]:
         for x in (os.environ.get("GEMINI_FALLBACK_MODELS") or "").split(",")
         if x.strip()
     ]
+    # Active models as of late 2026 (Google AI / Generative Language API)
     defaults = [
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-flash-latest",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
     ]
     out: List[str] = []
     for m in [primary] + extras + defaults:
-        if m and m not in out:
-            out.append(m)
+        if not m or m in out:
+            continue
+        if m in _DEAD_MODELS:
+            print(f"[ai_brief] skip dead model id: {m}")
+            continue
+        out.append(m)
+    if not out:
+        out = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     return out[:6]
 
 
