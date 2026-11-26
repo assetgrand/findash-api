@@ -62,6 +62,63 @@ def _normalize_action(raw: Any) -> str:
     return s or "unknown"
 
 
+def _num(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def trade_importance(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Importance 1–3 for congress trades. Recency is NOT used.
+    Any single strong signal can yield ★★★ (no need to meet all conditions).
+    Signals: dollar size, BUY with ticker, large bracket mid-point.
+    """
+    lo = _num(row.get("amount_low"))
+    hi = _num(row.get("amount_high"))
+    # use high end when present, else low, else mid
+    size = hi if hi is not None else lo
+    if size is None and lo is not None and hi is not None:
+        size = (lo + hi) / 2.0
+    size = float(size or 0.0)
+
+    action = str(row.get("action") or "").lower()
+    has_ticker = bool(row.get("ticker"))
+
+    pts = 0
+    reasons = []
+    if size >= 500_000:
+        pts += 3
+        reasons.append("size>=$500k")
+    elif size >= 100_000:
+        pts += 2
+        reasons.append("size>=$100k")
+    elif size >= 15_000:
+        pts += 1
+        reasons.append("size>=$15k")
+
+    if action == "buy" and has_ticker:
+        pts += 1
+        reasons.append("buy_with_ticker")
+
+    if pts >= 3 or size >= 250_000:
+        stars = 3
+    elif pts >= 1 or size >= 15_000:
+        stars = 2
+    else:
+        stars = 1
+
+    return {
+        "importance": stars,
+        "importance_stars": stars,
+        "importance_points": pts,
+        "importance_reasons": reasons,
+    }
+
+
 def _normalize_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     action = _normalize_action(t.get("action"))
     ticker = (t.get("ticker") or "").strip().upper()
@@ -72,7 +129,7 @@ def _normalize_trade(t: Dict[str, Any]) -> Dict[str, Any]:
         lo, hi = t.get("amountLow"), t.get("amountHigh")
         if lo is not None or hi is not None:
             amount_bracket = f"${lo or '?'} – ${hi or '?'}"
-    return {
+    row = {
         "id": t.get("eventId") or t.get("id"),
         "member": t.get("filerName") or t.get("member") or "Unknown",
         "chamber": str(t.get("chamber") or "").lower() or None,
@@ -90,6 +147,8 @@ def _normalize_trade(t: Dict[str, Any]) -> Dict[str, Any]:
         "source_url": t.get("sourceUrl") or t.get("source_url"),
         "partial_sale": bool(t.get("partialSale") or False),
     }
+    row.update(trade_importance(row))
+    return row
 
 
 def _fetch_trades(
@@ -98,13 +157,15 @@ def _fetch_trades(
     ticker: Optional[str] = None,
     action: Optional[str] = None,
     chamber: Optional[str] = None,
+    min_stars: int = 1,
 ) -> Dict[str, Any]:
     limit = max(1, min(int(limit), 100))
+    min_stars = max(1, min(3, int(min_stars or 1)))
     params: Dict[str, Any] = {"limit": min(limit * 3, 150)}  # over-fetch then filter
     if ticker:
         params["ticker"] = ticker.strip().upper()
 
-    cache_key = f"trades|{params.get('ticker','')}|{action or ''}|{chamber or ''}|{limit}"
+    cache_key = f"trades|{params.get('ticker','')}|{action or ''}|{chamber or ''}|{limit}|{min_stars}"
     cached = _cache_get(cache_key)
     if cached is not None:
         out = dict(cached)
@@ -161,6 +222,16 @@ def _fetch_trades(
         tk = ticker.strip().upper()
         rows = [x for x in rows if (x.get("ticker") or "").upper() == tk]
 
+    if min_stars > 1:
+        rows = [x for x in rows if int(x.get("importance") or 1) >= min_stars]
+
+    rows.sort(
+        key=lambda r: (
+            int(r.get("importance") or 0),
+            float(r.get("amount_high") or r.get("amount_low") or 0),
+        ),
+        reverse=True,
+    )
     rows = rows[:limit]
     out = {
         "ok": True,
@@ -168,14 +239,11 @@ def _fetch_trades(
         "count": len(rows),
         "results": rows,
         "cached": False,
+        "filters": {"min_stars": min_stars, "action": action, "chamber": chamber, "ticker": ticker},
         "disclaimer": DISCLAIMER,
     }
     _cache_set(cache_key, {k: v for k, v in out.items() if k != "cached"})
     return out
-
-
-def latest_trades(limit: int = 40) -> Dict[str, Any]:
-    return _fetch_trades(limit=limit)
 
 
 def search_trades(
@@ -184,17 +252,23 @@ def search_trades(
     action: Optional[str] = None,
     chamber: Optional[str] = None,
     limit: int = 40,
+    min_stars: int = 1,
 ) -> Dict[str, Any]:
     return _fetch_trades(
         limit=limit,
         ticker=ticker,
         action=action,
         chamber=chamber,
+        min_stars=min_stars,
     )
 
 
-def trades_for_ticker(ticker: str, limit: int = 40) -> Dict[str, Any]:
+def trades_for_ticker(ticker: str, limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
     t = (ticker or "").strip().upper()
     if not t:
         return {"ok": False, "error": "ticker required", "results": [], "count": 0}
-    return _fetch_trades(limit=limit, ticker=t)
+    return _fetch_trades(limit=limit, ticker=t, min_stars=min_stars)
+
+
+def latest_trades(limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
+    return _fetch_trades(limit=limit, min_stars=min_stars)

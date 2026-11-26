@@ -2447,6 +2447,7 @@ def gov_contracts(
     limit: int = Query(25, ge=1, le=100),
     page: int = Query(1, ge=1, le=50),
     min_amount: Optional[float] = Query(None, ge=0, description="Minimalna kwota kontraktu USD"),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
     sort: str = Query("Start Date", description="Start Date | Award Amount | End Date"),
     order: str = Query("desc", description="desc = najnowsze / największe pierwsze"),
 ):
@@ -2459,6 +2460,7 @@ def gov_contracts(
         limit=limit,
         page=page,
         min_amount=min_amount,
+        min_stars=min_stars,
         sort_by=sort,
         order=order,
     )
@@ -2471,9 +2473,10 @@ def gov_contracts(
 def gov_contracts_latest(
     days: int = Query(30, ge=1, le=365, description="Ile dni wstecz"),
     limit: int = Query(40, ge=1, le=100),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
 ):
     """Najnowsze przyznane kontrakty federalne (lista pod zakładkę Kontrakty USA)."""
-    data = gov.latest_awarded_contracts(days=days, limit=limit)
+    data = gov.latest_awarded_contracts(days=days, limit=limit, min_stars=min_stars)
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
     return data
@@ -2484,9 +2487,10 @@ def gov_contracts_company(
     name: str,
     days: int = Query(365, ge=1, le=1825),
     limit: int = Query(25, ge=1, le=100),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
 ):
     """Kontrakty przyznane firmie (po nazwie recipient)."""
-    data = gov.search_by_company_name(name, days=days, limit=limit)
+    data = gov.search_by_company_name(name, days=days, limit=limit, min_stars=min_stars)
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "USASpending error")
     return data
@@ -2502,6 +2506,7 @@ def congress_trades_list(
     action: Optional[str] = Query(None, description="buy | sell"),
     chamber: Optional[str] = Query(None, description="house | senate"),
     limit: int = Query(40, ge=1, le=100),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Latest U.S. Congress STOCK Act stock disclosures (House + Senate). Pro plan."""
@@ -2511,6 +2516,7 @@ def congress_trades_list(
         action=action,
         chamber=chamber,
         limit=limit,
+        min_stars=min_stars,
     )
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
@@ -2521,11 +2527,12 @@ def congress_trades_list(
 def congress_trades_ticker(
     symbol: str,
     limit: int = Query(40, ge=1, le=100),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Congress disclosures for one ticker. Pro plan."""
     _gate(prof, "congress_trades")
-    data = congress.trades_for_ticker(symbol, limit=limit)
+    data = congress.trades_for_ticker(symbol, limit=limit, min_stars=min_stars)
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
     return data
@@ -2534,11 +2541,12 @@ def congress_trades_ticker(
 @app.get("/congress/trades/latest")
 def congress_trades_latest(
     limit: int = Query(40, ge=1, le=100),
+    min_stars: int = Query(1, ge=1, le=3, description="Min importance stars 1-3"),
     prof: Dict[str, Any] = Depends(get_profile),
 ):
     """Shortcut: newest disclosures. Pro plan."""
     _gate(prof, "congress_trades")
-    data = congress.latest_trades(limit=limit)
+    data = congress.latest_trades(limit=limit, min_stars=min_stars)
     if not data.get("ok"):
         raise HTTPException(status_code=502, detail=data.get("error") or "Congress trades upstream error")
     return data

@@ -59,6 +59,121 @@ def _cache_set(key: str, data: Any) -> None:
             _CACHE.pop(k, None)
 
 
+
+# Priority federal agencies (higher strategic weight)
+_PRIORITY_AGENCIES = (
+    "department of defense",
+    "department of energy",
+    "department of homeland security",
+    "department of veterans affairs",
+    "national aeronautics",
+    "nasa",
+    "department of health",
+    "general services administration",
+    "department of justice",
+    "department of state",
+    "department of the treasury",
+    "department of commerce",
+    "department of transportation",
+    "department of the interior",
+    "department of agriculture",
+    "environmental protection",
+    "cybersecurity",
+)
+
+
+def _parse_date(s: Any) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def contract_importance(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Importance 1–3 stars. Recency is NOT used.
+    Any single strong signal can push to 3 stars (no need to meet all conditions).
+    Signals: award amount, contract duration, priority agency.
+    """
+    amount = 0.0
+    try:
+        amount = float(row.get("amount") or 0)
+    except Exception:
+        amount = 0.0
+
+    start = _parse_date(row.get("start_date"))
+    end = _parse_date(row.get("end_date"))
+    years = 0.0
+    if start and end and end > start:
+        years = (end - start).days / 365.25
+
+    agency = str(row.get("agency") or row.get("sub_agency") or "").lower()
+    priority = any(p in agency for p in _PRIORITY_AGENCIES)
+
+    # Independent points (OR-friendly stacking, not AND-gate)
+    pts = 0
+    reasons = []
+    if amount >= 100_000_000:
+        pts += 3
+        reasons.append("amount>=$100M")
+    elif amount >= 25_000_000:
+        pts += 2
+        reasons.append("amount>=$25M")
+    elif amount >= 5_000_000:
+        pts += 1
+        reasons.append("amount>=$5M")
+
+    if years >= 4:
+        pts += 2
+        reasons.append("duration>=4y")
+    elif years >= 2:
+        pts += 1
+        reasons.append("duration>=2y")
+
+    if priority:
+        pts += 1
+        reasons.append("priority_agency")
+
+    # Map points → stars (one strong signal enough for ★★★)
+    if pts >= 3 or amount >= 50_000_000:
+        stars = 3
+    elif pts >= 1 or amount >= 1_000_000:
+        stars = 2
+    else:
+        stars = 1
+
+    return {
+        "importance": stars,
+        "importance_stars": stars,
+        "importance_points": pts,
+        "importance_reasons": reasons,
+    }
+
+
+def _attach_importance(results: List[Dict[str, Any]], min_stars: int = 1) -> List[Dict[str, Any]]:
+    out = []
+    min_stars = max(1, min(3, int(min_stars or 1)))
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        meta = contract_importance(row)
+        merged = dict(row)
+        merged.update(meta)
+        if int(merged.get("importance") or 1) >= min_stars:
+            out.append(merged)
+    # Higher importance first, then amount
+    out.sort(
+        key=lambda r: (
+            int(r.get("importance") or 0),
+            float(r.get("amount") or 0),
+        ),
+        reverse=True,
+    )
+    return out
+
+
 def _date_range(days: int) -> List[Dict[str, str]]:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=max(1, min(days, 3650)))
@@ -73,6 +188,7 @@ def search_awarded_contracts(
     limit: int = 25,
     page: int = 1,
     min_amount: Optional[float] = None,
+    min_stars: int = 1,
     sort_by: str = "Start Date",
     order: str = "desc",
 ) -> Dict[str, Any]:
@@ -80,12 +196,14 @@ def search_awarded_contracts(
     Szuka przyznanych kontraktów (nie grantów).
     keywords – frazy w opisie/nazwie (API keywords filter)
     recipient_name – filtr po nazwie odbiorcy (recipient_search_text)
+    min_stars – filter importance 1–3
     """
     limit = max(1, min(int(limit), 100))
     page = max(1, int(page))
     days = max(1, min(int(days), 365 * 5))
+    min_stars = max(1, min(3, int(min_stars or 1)))
 
-    cache_key = f"aw|{keywords}|{recipient_name}|{days}|{limit}|{page}|{min_amount}"
+    cache_key = f"aw|{keywords}|{recipient_name}|{days}|{limit}|{page}|{min_amount}|{min_stars}"
     cached = _cache_get(cache_key)
     if cached is not None:
         out = dict(cached)
@@ -190,6 +308,7 @@ def search_awarded_contracts(
             }
         )
 
+    results = _attach_importance(results, min_stars=min_stars)
     out = {
         "ok": True,
         "source": "usaspending.gov",
@@ -200,30 +319,32 @@ def search_awarded_contracts(
             "keywords": keywords,
             "recipient_name": recipient_name,
             "min_amount": min_amount,
+            "min_stars": min_stars,
         },
         "count": len(results),
         "results": results,
         "cached": False,
         "disclaimer": (
-            "Dane oficjalne USASpending.gov (przyznane kontrakty federalne). "
-            "Nie stanowią rekomendacji inwestycyjnej."
+            "Official USASpending.gov awarded federal contracts. "
+            "Importance stars (1-3) reflect size, duration and agency weight — not investment advice."
         ),
     }
     _cache_set(cache_key, out)
     return out
 
 
-def search_by_company_name(name: str, days: int = 365, limit: int = 25) -> Dict[str, Any]:
+def search_by_company_name(name: str, days: int = 365, limit: int = 25, min_stars: int = 1) -> Dict[str, Any]:
     """Skrót: kontrakty dla firmy po nazwie (np. 'Lockheed', 'Microsoft')."""
     return search_awarded_contracts(
         recipient_name=name,
         days=days,
         limit=limit,
         page=1,
+        min_stars=min_stars,
     )
 
 
-def latest_awarded_contracts(days: int = 30, limit: int = 40) -> Dict[str, Any]:
+def latest_awarded_contracts(days: int = 30, limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
     """Lista najnowszych przyznanych kontraktów federalnych (bez filtra słowa kluczowego)."""
     return search_awarded_contracts(
         keywords=None,
@@ -231,6 +352,7 @@ def latest_awarded_contracts(days: int = 30, limit: int = 40) -> Dict[str, Any]:
         days=days,
         limit=limit,
         page=1,
+        min_stars=min_stars,
         sort_by="Start Date",
         order="desc",
     )
