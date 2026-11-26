@@ -343,7 +343,6 @@ def search_by_company_name(name: str, days: int = 365, limit: int = 25, min_star
         min_stars=min_stars,
     )
 
-
 def latest_awarded_contracts(days: int = 30, limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
     """Lista najnowszych przyznanych kontraktów federalnych (bez filtra słowa kluczowego)."""
     return search_awarded_contracts(

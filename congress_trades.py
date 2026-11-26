@@ -262,7 +262,6 @@ def search_trades(
         min_stars=min_stars,
     )
 
-
 def trades_for_ticker(ticker: str, limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
     t = (ticker or "").strip().upper()
     if not t:
