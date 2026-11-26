@@ -161,7 +161,7 @@ def _fetch_trades(
 ) -> Dict[str, Any]:
     limit = max(1, min(int(limit), 100))
     min_stars = max(1, min(3, int(min_stars or 1)))
-    params: Dict[str, Any] = {"limit": min(limit * 3, 150)}  # over-fetch then filter
+    params: Dict[str, Any] = {"limit": int(max(1, min(int(limit) * 3, 100)))}  # upstream max 100
     if ticker:
         params["ticker"] = ticker.strip().upper()
 
@@ -261,6 +261,7 @@ def search_trades(
         chamber=chamber,
         min_stars=min_stars,
     )
+
 
 def trades_for_ticker(ticker: str, limit: int = 40, min_stars: int = 1) -> Dict[str, Any]:
     t = (ticker or "").strip().upper()
