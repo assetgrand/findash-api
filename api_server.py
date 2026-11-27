@@ -22,7 +22,7 @@ import auth_plans as auth
 # --- import logiki analitycznej (bez GUI) ---
 import core_analysis as core
 
-API_BUILD = "importance-stars-v1"
+API_BUILD = "daily-atomic-precompute-v1"
 PRECOMPUTE_GEN = "hide-hit35-v1"
 import hybrid_engine as hybrid
 import report_engine as reports
@@ -401,12 +401,15 @@ _BACKTEST_CACHE_TTL = int(os.environ.get("BACKTEST_CACHE_TTL", "3600"))  # 1h
 # i trzyma wyniki gotowe dla Lovable.
 # ============================================================
 _PRECOMPUTE_ENABLED = os.environ.get("PRECOMPUTE_ENABLED", "1") == "1"
-_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "7200"))  # co 2h — mniej kredytów Twelve
+# Daily refresh by default (override with PRECOMPUTE_INTERVAL seconds)
+_PRECOMPUTE_INTERVAL = int(os.environ.get("PRECOMPUTE_INTERVAL", "86400"))  # 24h
 _PRECOMPUTE_PAUSE = float(os.environ.get("PRECOMPUTE_PAUSE", "0.5"))  # short gap only
 # Serve even old forecasts (user sees last known price/prediction — never empty loading)
-_PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(7 * 24 * 3600)))  # 7 dni
-_PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "3600"))  # po 1h odśwież w tle
-_PRECOMPUTE: Dict[str, Any] = {}  # "NVDA|1M" -> {"ts": float, "data": dict}
+_PRECOMPUTE_SERVE_MAX_AGE = float(os.environ.get("PRECOMPUTE_SERVE_MAX_AGE", str(14 * 24 * 3600)))  # 14 dni
+_PRECOMPUTE_STALE_REFRESH = float(os.environ.get("PRECOMPUTE_STALE_REFRESH", "86400"))  # daily
+_PRECOMPUTE: Dict[str, Any] = {}  # LIVE cache served to users
+_PRECOMPUTE_BUILD: Dict[str, Any] = {}  # staging — not served until full swap
+_PRECOMPUTE_BUILDING = False  # when True, _pc_store writes to BUILD only
 _PRECOMPUTE_LOCK = threading.Lock()
 _PRECOMPUTE_DISK = os.path.join(os.path.dirname(__file__), "precompute_cache.json")
 _PRECOMPUTE_DISK_LOADED = False
@@ -420,6 +423,9 @@ _PRECOMPUTE_STATUS: Dict[str, Any] = {
     "tickers_done": 0,
     "tickers_total": 0,
     "started_ts": None,
+    "swap_mode": "daily-atomic",
+    "last_swap_ts": None,
+    "last_build_entries": 0,
 }
 
 
@@ -480,18 +486,61 @@ def _pc_disk_save() -> None:
 
 
 def _pc_store(ticker: str, horizon_label: str, data: Dict[str, Any]) -> None:
+    """Store forecast. During daily rebuild writes only to BUILD (users still see LIVE)."""
+    global _PRECOMPUTE_BUILDING
     _pc_disk_load()
+    entry = {
+        "ts": time.time(),
+        "gen": PRECOMPUTE_GEN,
+        "data": dict(data),
+    }
+    key = _pc_key(ticker, horizon_label)
     with _PRECOMPUTE_LOCK:
-        _PRECOMPUTE[_pc_key(ticker, horizon_label)] = {
-            "ts": time.time(),
-            "gen": PRECOMPUTE_GEN,
-            "data": dict(data),
-        }
-    # persist async-ish (cheap enough)
+        if _PRECOMPUTE_BUILDING:
+            _PRECOMPUTE_BUILD[key] = entry
+            # Do NOT touch live _PRECOMPUTE and do NOT disk-save partial build
+            return
+        _PRECOMPUTE[key] = entry
+    # Live path only: persist so restart still has data
     try:
         _pc_disk_save()
     except Exception:
         pass
+
+
+def _pc_swap_build_to_live(*, min_ratio: float = 0.85) -> bool:
+    """
+    Atomically publish BUILD → LIVE only when enough entries were rebuilt.
+    Returns True if swap happened. On failure LIVE is unchanged (no empty UI).
+    """
+    global _PRECOMPUTE_BUILDING
+    with _PRECOMPUTE_LOCK:
+        build = dict(_PRECOMPUTE_BUILD)
+        n_build = len(build)
+        # Expected: all tickers × 1M+3M (and any other keys already in build)
+        expected = max(len(_ticker_list_for_precompute()) * 2, 1)
+        ok = n_build >= int(expected * min_ratio)
+        if not ok:
+            print(
+                f"[precompute] NO SWAP — build incomplete {n_build}/{expected} "
+                f"(users keep previous forecasts)"
+            )
+            _PRECOMPUTE_STATUS["last_error"] = (
+                f"build incomplete {n_build}/{expected} — live cache kept"
+            )
+            _PRECOMPUTE_STATUS["last_build_entries"] = n_build
+            return False
+        # Atomic publish: overlay build onto live (keys not in build stay as old fallback)
+        for k, v in build.items():
+            _PRECOMPUTE[k] = v
+        _PRECOMPUTE_STATUS["last_swap_ts"] = time.time()
+        _PRECOMPUTE_STATUS["last_build_entries"] = n_build
+        print(f"[precompute] SWAP live ← build entries={n_build} (atomic publish)")
+    try:
+        _pc_disk_save()
+    except Exception as e:
+        print("[precompute] disk save after swap:", e)
+    return True
 
 
 def _pc_get(
@@ -570,7 +619,8 @@ def _ticker_list_for_precompute() -> List[str]:
 
 
 def _precompute_all_once() -> None:
-    """Jedna pełna runda: najpierw krypto (szybkie), potem akcje 1M+3M."""
+    """Jedna pełna runda dzienna: liczy do BUILD, użytkownicy widzą stare LIVE aż do SWAP."""
+    global _PRECOMPUTE_BUILDING
     # Rate-limit: nie dobijaj Twelve; stary cache zostaje widoczny dla userów
     try:
         if getattr(core, "_twelve_in_cooldown", lambda: False)():
@@ -586,31 +636,22 @@ def _precompute_all_once() -> None:
     _PRECOMPUTE_STATUS["tickers_total"] = len(tickers)
     _PRECOMPUTE_STATUS["tickers_done"] = 0
     _PRECOMPUTE_STATUS["last_error"] = None
-    if _PRECOMPUTE_STATUS.get("started_ts") is None:
-        _PRECOMPUTE_STATUS["started_ts"] = time.time()
+    _PRECOMPUTE_STATUS["started_ts"] = time.time()
+    # Staging buffer — LIVE untouched until successful swap
+    with _PRECOMPUTE_LOCK:
+        _PRECOMPUTE_BUILD.clear()
+    _PRECOMPUTE_BUILDING = True
+    print("[precompute] BUILD start (live cache still served)")
     # Akcje 1M+3M NAJPIERW. Krypto / backtest / AI NIE startują w tej samej rundzie —
     # one dobijały Twelve zanim reszta oryginalnych 12 zdążyła się policzyć.
     # Najpierw 1M dla WSZYSTKICH 12 (ranking miesięczny), potem 3M.
     # Brakujące najpierw — żeby nie utknąć na jednej NVDA.
+    # Daily full rebuild into BUILD: always all tickers × 1M+3M (LIVE stays until swap)
     jobs = []
     for hz in ("1M", "3M"):
-        missing = [x for x in tickers if _pc_get(x, hz, allow_stale=True) is None]
-        # Hit < 50% NIE wymusza przeliczenia (to skakało w weekend).
-        # Odśwież tylko brak cache, stary gen albo wiek >= 24h.
-        due = []
         for x in tickers:
-            if x in missing:
-                continue
-            age = _pc_age(x, hz)
-            gen = ""
-            with _PRECOMPUTE_LOCK:
-                row = _PRECOMPUTE.get(_pc_key(x, hz)) or {}
-                gen = str(row.get("gen") or "")
-            if gen != str(PRECOMPUTE_GEN) or age is None or age >= 86400.0:
-                due.append(x)
-        for x in missing + due:
             jobs.append((x, hz))
-    print(f"[precompute] jobs={len(jobs)} (missing first, 1M then 3M)")
+    print(f"[precompute] jobs={len(jobs)} daily full rebuild → BUILD (1M then 3M)")
     done_tickers = set()
     for t, hz in jobs:
         try:
@@ -641,15 +682,20 @@ def _precompute_all_once() -> None:
         print("[precompute] modules error:", e)
         _PRECOMPUTE_STATUS["last_error"] = f"modules: {e}"
 
+    # Publish BUILD → LIVE only if rebuild is complete enough; else keep old live
+    _PRECOMPUTE_BUILDING = False
+    swapped = False
+    try:
+        swapped = _pc_swap_build_to_live(min_ratio=0.85)
+    except Exception as e:
+        print("[precompute] swap error:", e)
+        _PRECOMPUTE_STATUS["last_error"] = f"swap: {e}"
+    with _PRECOMPUTE_LOCK:
+        _PRECOMPUTE_BUILD.clear()
+        n = len(_PRECOMPUTE)
     _PRECOMPUTE_STATUS["last_full_run_ts"] = time.time()
     _PRECOMPUTE_STATUS["running"] = False
-    with _PRECOMPUTE_LOCK:
-        n = len(_PRECOMPUTE)
-    print(f"[precompute] done, entries={n}")
-    try:
-        _pc_disk_save()
-    except Exception as e:
-        print("[precompute] disk save end:", e)
+    print(f"[precompute] done live_entries={n} swapped={swapped}")
 
 
 
